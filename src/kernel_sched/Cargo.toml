@@ -1,0 +1,10 @@
+[package]
+name = "kernel_sched"
+version = "0.1.0"
+edition = "2024"
+description = "Arch-independent schedulers for NOMAD: simple round-robin implementing LocalSchedullerInterface"
+
+[dependencies]
+kernel_base = { path = "../kernel_base" }
+spin = "0.12.3"
+heapless = "0.9.3"

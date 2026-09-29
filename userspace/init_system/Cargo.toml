@@ -1,0 +1,7 @@
+[package]
+name = "init_system"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cintos-user = {path = "../cintos_user"}

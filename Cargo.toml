@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "userspace/cintos_user",
+    "src/kernel_base",
+    "src/kernel_exec",
+    "src/kernel_limine",
+    "src/kernel_sched",
+    "src/kernel_x86",
+    "src/syscall_macros", "userspace/init_system",
+]
+resolver = "3"
+
+# Ядро — no_std: unwind-паники не поддерживаются, весь профиль — abort.
+# Пользовательский `panic_handler` kernel_limine при этом сохраняется.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

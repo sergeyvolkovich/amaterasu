@@ -1,0 +1,16 @@
+[package]
+name = "kernel_base"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+attachable-slab-allocator = "0.1.0"
+bitflags = "2.13.2"
+heapless = "0.9.3"
+intrusive-collections = "0.10.3"
+llfree = { git = "https://github.com/luhsra/llfree-rs.git" }
+spin = "0.12.3"
+
+
+syscall-macros = {path  = "../syscall_macros" }
+uuid = { version = "1.26.1", default-features = false }

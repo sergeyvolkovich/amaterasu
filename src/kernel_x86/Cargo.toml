@@ -1,0 +1,24 @@
+[package]
+name = "kernel_x86"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernel_base = { path = "../kernel_base" }
+# Limine-протокол нужен arch-бэкенду для SMP-подъёма (логика поднятия AP
+# живёт здесь — см. smp.rs; фронтенд kernel_limine передаёт только ответ
+# SMP-запроса и хук политики).
+limine = { path = "../../third_party/limine-rs" }
+
+# Форматы/регистры/страничные walkers Intel VT-d и AMD-Vi (CC0/public domain).
+intel-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs" }
+amd-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs" }
+
+# Типизированные MSR/CR/инструкции x86_64 (no_std).
+x86_64 = "0.15"
+
+bitflags = "2.13.2"
+syscall-macros = { path = "../syscall_macros" }
+heapless = "0.9.3"
+attachable-slab-allocator = "0.1.0"
+spin = "0.12.3"

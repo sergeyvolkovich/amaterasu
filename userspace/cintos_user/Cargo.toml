@@ -1,0 +1,101 @@
+[package]
+name = "cintos-user"
+version = "0.1.0"
+edition = "2024"
+description = "NOMAD userspace library: syscall ABI wrappers, crt0, mini-FlatBuffers, L4-IPC bindings, C ABI (capi + cintos.h)"
+build = "build.rs"
+
+# lib собирается И как rlib (Rust-бинарники), И как staticlib
+# (libcintos_user.a — C-совместимость юзерспейса, см. capi.rs/cintos.h).
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+heapless = "0.9.3"
+
+# init — первый системный сервер (запускается ядром из boot-модулей).
+# Bare-metal ET_EXEC (OSABI 0xC1 ставит постпроцессор ISO-сборки):
+# тест-харнесс для него не существует.
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+test = false
+doctest = false
+bench = false
+
+# mt_test / mt_waker — испытатели кооперативной многозадачности
+# (yield-карусель, блокировка/пробуждение, возобновление кадра,
+# self-exit; сценарий — в шапках исходников).
+[[bin]]
+name = "mt_test"
+path = "src/bin/mt_test.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "mt_waker"
+path = "src/bin/mt_waker.rs"
+test = false
+doctest = false
+bench = false
+
+# ipc_sender / ipc_receiver — демо L4-IPC (FlatBuffers-сериализация в
+# юзерспейсе, пересылка capability map items, rendezvous ping-pong).
+[[bin]]
+name = "ipc_sender"
+path = "src/bin/ipc_sender.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "ipc_receiver"
+path = "src/bin/ipc_receiver.rs"
+test = false
+doctest = false
+bench = false
+
+# timer_server — юзерспейсный таймер-сервис (L4-модель: тик — WaitIrq
+# линии 0, uptime/статистика — TASK_STATS; ядро только доставляет тик).
+[[bin]]
+name = "timer_server"
+path = "src/bin/timer_server.rs"
+test = false
+doctest = false
+bench = false
+
+# shm_sender / shm_receiver — длинные IPC через разделяемую память:
+# датапуть в общих страницах МИМО ядра, ядро переносит только короткие
+# «дверные» IPC (CAP_CREATE_SHARED + MOUNT_CAP_REGION + SPSC-кольцо).
+[[bin]]
+name = "shm_sender"
+path = "src/bin/shm_sender.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "shm_receiver"
+path = "src/bin/shm_receiver.rs"
+test = false
+doctest = false
+bench = false
+
+# fault_keeper / fault_child — демон фолт-эндпоинтов (seL4/KeyKOS):
+# keeper принимает фолты peer-задачи (#UD на ud2) и возобновляет её
+# со следующей инструкции (FAULT_REPLY c new_rip = ip + 2); выживание
+# после двух фолтов — свидетельство в serial-логе.
+[[bin]]
+name = "fault_keeper"
+path = "src/bin/fault_keeper.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "fault_child"
+path = "src/bin/fault_child.rs"
+test = false
+doctest = false
+bench = false

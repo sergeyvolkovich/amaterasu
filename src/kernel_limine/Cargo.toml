@@ -1,0 +1,27 @@
+[package]
+name = "kernel_limine"
+version = "0.1.0"
+edition = "2024"
+description = "NOMAD x86_64 boot frontend: Limine protocol entry, boot-info wiring, SMP bring-up"
+
+[[bin]]
+name = "cintos_kernel"
+path = "src/main.rs"
+# Ядро — no_std c собственным panic_handler: тест-харнесс (std) для него
+# не собирается (duplicate lang item `panic_impl`). Юнит-тесты живут в
+# kernel_base/kernel_x86 и запускаются на хосте:
+#   cargo test --target x86_64-unknown-linux-gnu
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+kernel_base = { path = "../kernel_base" }
+kernel_x86 = { path = "../kernel_x86" }
+kernel_exec = { path = "../kernel_exec" }
+kernel_sched = { path = "../kernel_sched" }
+spin = "0.12.3"
+heapless = "0.9.3"
+# Vendored из https://github.com/limine-bootloader/limine-rust (no_std);
+# git-dep недоступен из текущей сети — см. third_party/limine-rs.
+limine = { path = "../../third_party/limine-rs" }

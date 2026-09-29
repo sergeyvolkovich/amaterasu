@@ -1,0 +1,13 @@
+[package]
+name = "kernel_exec"
+version = "0.1.0"
+edition = "2024"
+description = "Arch-independent executable image subsystem for NOMAD: pluggable formats, ELF (custom OS ABI), image loading, initial stack, boot server spawning"
+
+[dependencies]
+kernel_base = { path = "../kernel_base" }
+xmas-elf = "0.10.0"
+heapless = "0.9.3"
+spin = "0.12.3"
+attachable-slab-allocator = "0.1.0"
+syscall-macros = { path = "../syscall_macros" }
