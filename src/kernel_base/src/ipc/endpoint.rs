@@ -398,6 +398,23 @@ pub fn consume_ready(endpoint_idx: usize) {
         }
 }
 
+/// Снимает готовность получателя БЕЗ доставки (таймаут IPC_WAIT,
+/// переполнение реестра дедлайнов): слот готовности не должен переживать
+/// пробуждение — следующий отправитель доставил бы сообщение задаче,
+/// которая уже не ждёт. Возвращает true, если слот был снят.
+pub fn unregister_ready(receiver_task_cap: u64) -> bool {
+    let mut reg = REGISTRY.lock();
+    for slot in reg.endpoints.iter_mut() {
+        if let Some(EndpointState::Ready(ep)) = *slot
+            && ep.receiver_task_cap == receiver_task_cap
+        {
+            *slot = None;
+            return true;
+        }
+    }
+    false
+}
+
 // ─── SEND: медленный путь ───────────────────────────────────────────────────
 
 /// Кладёт сообщение в почтовый ящик (получатель не ждёт). Отправителя

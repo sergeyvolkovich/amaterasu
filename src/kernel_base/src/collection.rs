@@ -276,6 +276,29 @@ impl<K: Ord + Clone, V, const ATOMIC: bool> RBSlabIO<K, V, ATOMIC> {
             }
         }
     }
+
+    /// Итерация по парам (ключ, значение) в порядке ключей — для поиска
+    /// по ДИАПАЗОНУ, когда ключ записи не выведем из самой записи
+    /// (umap::find_containing: реестр аллокаций ключован virt_base,
+    /// а запись базу не хранит).
+    pub fn for_each_kv<F: FnMut(&K, &V)>(&self, mut f: F) {
+        match &self.inner {
+            RBSlabIOInner::NonAtomic { rbtree, .. } => {
+                let mut cursor = rbtree.front();
+                while let Some(entry) = cursor.get() {
+                    f(&entry.key, &entry.value);
+                    cursor.move_next();
+                }
+            }
+            RBSlabIOInner::Atomic { rbtree, .. } => {
+                let mut cursor = rbtree.front();
+                while let Some(entry) = cursor.get() {
+                    f(&entry.key, &entry.value);
+                    cursor.move_next();
+                }
+            }
+        }
+    }
 }
 // ПРИМЕЧАНИЕ о get_mut: интрузивное дерево принципиально не даёт
 // &mut V через &self-доступ (узлы разделяются курсорами), а &mut self

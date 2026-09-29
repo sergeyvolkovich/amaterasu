@@ -13,9 +13,11 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod apic;
 pub mod boot;
 pub mod cswitch;
 pub mod fault;
+pub mod ioapic;
 pub mod iommu;
 pub mod irq;
 pub mod paging;
@@ -89,6 +91,11 @@ impl ArchImplementation for X86Backend {
     type IRQContext = X86IrqContext;
     type Iommu = IommuUnitHandle;
 
+    /// Чип прерываний платформы: IO-APIC + LAPIC + MSI (см. irq::X86IrqChip).
+    /// Инициализируется `irq::init_from_boot` из MADT; до этого — None
+    /// (IRQ-сисколлы отвечают E_INTERNAL — «подсистема не поднята»).
+    type IrqChip = crate::irq::X86IrqChip;
+
     fn init_base_state() -> Self {
         X86Backend
     }
@@ -146,6 +153,10 @@ impl ArchImplementation for X86Backend {
 
     fn iommu() -> Option<&'static Self::Iommu> {
         IOMMU_UNIT.get()
+    }
+
+    fn irq_chip() -> Option<&'static Self::IrqChip> {
+        crate::irq::chip()
     }
 
     /// Umap = UserspaceMap для x86 (один тип).

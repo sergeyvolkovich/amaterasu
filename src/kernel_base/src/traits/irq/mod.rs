@@ -116,3 +116,109 @@ pub enum RegisterError {
     OutOfRange,
     AlreadyRegistered,
 }
+
+// ─── Переносимая подсистема прерываний (v2: IO-APIC/MSI/GIC-нейтрально) ─────
+//
+// Контракт v2: линия прерывания — ЛОГИЧЕСКИЙ номер u32, семантику
+// перечисления задаёт порт (x86: GSI из MADT для проводных линий +
+// выделенный диапазон для MSI; ARM64: INTID GIC; RISC-V: source id
+// APLIC/PLIC). Ядро НЕ знает ни про «255 векторов», ни про «16 legacy
+// линий» — векторы/дескрипторы доставки (IDT slot, LPI, claim id) —
+// собственность порта, спрятанная за [IrqChip].
+//
+// Границы: трейт вызывается ТОЛЬКО из syscall-слоя (slow path). Диспет-
+// черизация срабатываний идёт мимо трейта: порт сам мапит вектор→линию
+// и зовёт kernel_base::task::irq_wait::on_irq_fired + собственные хуки.
+
+/// Режим срабатывания линии.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerMode {
+    /// Фронт: одно событие на переход 0→1 (MSI, ISA-таймер, PCIe).
+    Edge,
+    /// Уровень: события, пока линия активна (PCIe INTx, shared-линии).
+    Level,
+}
+
+impl TriggerMode {
+    /// Провожу ABI-число (0/1) в режим; None — некорректный аргумент.
+    pub fn from_abi(bits: u64) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Edge),
+            1 => Some(Self::Level),
+            _ => None,
+        }
+    }
+
+    /// Обратное преобразование для ABI-массивов (MSI-аллокация).
+    pub fn to_abi(self) -> u64 {
+        match self {
+            Self::Edge => 0,
+            Self::Level => 1,
+        }
+    }
+}
+
+/// MSI-сообщение (message-signalled interrupt) в переносимой форме:
+/// устройство выполняет ОДНУ запись `data` по физическому адресу
+/// `address`, контроллер прерываний платформы трактует пару как
+/// «поднять линию». Формат пары — собственность порта (x86: address
+/// 0xFEExxxxx + dest APIC id, data = вектор; ARM64 GICv3: doorbell ITS;
+/// RISC-V: IMSIC). Драйвер только копирует пару в BAR устройства.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsiMessage {
+    /// Физический адрес, по которому устройство пишет `data`.
+    pub address: u64,
+    /// Полезная нагрузка записи.
+    pub data: u32,
+}
+
+/// Ошибка аппаратной операции над линией (уходит в коды сисколлов).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqHwError {
+    /// Линия вне пространства, известного чипу.
+    OutOfRange,
+    /// Операция не поддерживается (например, MSI на платформе без
+    /// message-backed контроллера).
+    Unsupported,
+    /// Контроллер аппаратно недоступен.
+    Hardware,
+}
+
+/// Бэкенд контроллеров прерываний платформы (x86: IO-APIC+LAPIC; ARM64:
+/// GICv3; RISC-V: APLIC+IMSIC). Реализует ПОРТ; общему слою доступны
+/// только переносимые операции над ЛОГИЧЕСКИМИ линиями.
+///
+/// ИНВАРИАНТЫ:
+///   - линий два класса: проводные `0..wired_line_count()` и
+///     message-backed `msi_line_base()..msi_line_base()+msi_capacity()`;
+///     диапазоны не пересекаются (проверяется тестом порта);
+///   - после успешного `unmask` линия доставляет прерывания; после
+///     `mask` — нет (программная истина: при старте порт маскирует всё);
+///   - все операции неблокирующие и короткие (MMIO-записи), вызываются
+///     под permission-локом сисколлов — нельзя звать планировщик.
+pub trait IrqChip: Sync {
+    /// Число проводных линий (пространство 0..N).
+    fn wired_line_count(&self) -> u32;
+
+    /// Начало MSI-пространства логических линий.
+    fn msi_line_base(&self) -> u32;
+
+    /// Ёмкость MSI-пространства (0 — MSI не поддержан).
+    fn msi_capacity(&self) -> u32;
+
+    /// Текущий режим срабатывания линии (программная истина чипа).
+    fn trigger_mode(&self, line: u32) -> TriggerMode;
+
+    /// Установить режим срабатывания (программирование контроллера).
+    fn set_trigger(&self, line: u32, mode: TriggerMode) -> Result<(), IrqHwError>;
+
+    /// Замаскировать линию (прерывания не доставляются).
+    fn mask(&self, line: u32) -> Result<(), IrqHwError>;
+
+    /// Размаскировать линию.
+    fn unmask(&self, line: u32) -> Result<(), IrqHwError>;
+
+    /// MSI-сообщение для линии MSI-пространства. Стабильно для жизни
+    /// линии (пара не меняется между alloc и release).
+    fn msi_message(&self, line: u32) -> Result<MsiMessage, IrqHwError>;
+}

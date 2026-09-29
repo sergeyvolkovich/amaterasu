@@ -36,6 +36,7 @@ use kernel_base::bootinfo::{BootInfo, BootInfoBuilder, BootModule};
 use kernel_base::frame_manager::phys_frame_manager::FrameManager;
 use kernel_base::frame_manager::{MemoryMarker, UsableMemoryRegion};
 use kernel_base::kernel_log;
+use kernel_base::traits::irq::IrqChip as _;
 use kernel_base::traits::memory::MemoryInterfaceUserspace as _;
 use kernel_base::traits::scheduller::TaskExecStatus;
 use kernel_base::{KernelCTL, traits::ArchImplementation};
@@ -503,10 +504,25 @@ fn iommu_early_init(boot_info: &BootInfo, fm: &'static FrameManager) {
     acpi_guard_register(boot_info);
     // SAFETY: RSDP от загрузчика (замаплен HHDM), структуры ACPI валидны.
     match unsafe { BootBackend::detect(boot_info.hw_model()) } {
-        Ok(backend) => match X86Backend::init_iommu_from_boot(&backend, fm) {
-            Ok(()) => kernel_log!("iommu: инициализирован по boot-таблицам\n"),
-            Err(e) => kernel_log!("iommu: не инициализирован: {:?}\n", e),
-        },
+        Ok(backend) => {
+            match X86Backend::init_iommu_from_boot(&backend, fm) {
+                Ok(()) => kernel_log!("iommu: инициализирован по boot-таблицам\n"),
+                Err(e) => kernel_log!("iommu: не инициализирован: {:?}\n", e),
+            }
+            // IRQ-подсистема: MADT -> IO-APIC-пул + LAPIC (EOI/MSI).
+            // Идемпотентно (Once); без MADT чип останется legacy-PIC.
+            // SAFETY: тот же контракт, что у BootBackend::detect выше.
+            if unsafe { kernel_x86::irq::init_from_boot(&backend) } {
+                kernel_log!(
+                    "irq: чип готов — проводных линий {}, MSI-базис {}, ёмкость {}\n",
+                    kernel_x86::ioapic::wired_line_count(),
+                    kernel_x86::irq::chip().map(|c| c.msi_line_base()).unwrap_or(0),
+                    kernel_x86::irq::chip().map(|c| c.msi_capacity()).unwrap_or(0)
+                );
+            } else {
+                kernel_log!("irq: fallback legacy-PIC (16 линий)\n");
+            }
+        }
         Err(e) => kernel_log!("boot: ACPI-детект не удался: {:?}\n", e),
     }
 }

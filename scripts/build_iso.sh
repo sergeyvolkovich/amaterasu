@@ -25,7 +25,7 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/home/z/qemu-pkg/prefix/usr/lib/x86_6
 
 cd "$ROOT"
 # shellcheck disable=SC1091
-source "$HOME/.cargo/env"
+. "$HOME/.cargo/env"
 
 echo "==> [1/5] cargo build ($TARGET, $PROFILE)"
 cargo build --target "$TARGET"

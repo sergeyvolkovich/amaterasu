@@ -12,6 +12,7 @@ use crate::{
     traits::memory::MemoryInterfaceUserspace,
 };
 
+pub mod deadline;
 pub mod irq_wait;
 pub mod stats;
 pub mod tcb;

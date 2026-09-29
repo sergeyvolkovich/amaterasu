@@ -65,11 +65,16 @@ struct PhysRange {
     end: usize,
 }
 
-#[derive(Default)]
 struct GuardState {
     ram: [Option<PhysRange>; MAX_RANGES],
     forbidden: [Option<PhysRange>; MAX_RANGES],
     acpi: [Option<PhysRange>; ACPI_MAX_RANGES],
+}
+
+// РУЧНАЯ реализация Default (не derive): массивы >32 элементов не
+// реализуют Default в core — derive падаёт на хост-компиляции тестов.
+impl core::default::Default for GuardState {
+    fn default() -> Self { Self::new() }
 }
 
 static GUARD: IrqSafeSpinMutex<GuardState> = IrqSafeSpinMutex::new(GuardState::new());

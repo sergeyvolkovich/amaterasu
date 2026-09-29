@@ -23,9 +23,16 @@ pub enum CapabilityObject<UMAP: MemoryInterfaceUserspace> {
         region_origin: usize,
         region_page_count: usize,
     },
-    IRQAcc {
-        cpu_id: usize,
-        vector: u16,
+    /// Капабилити ЛОГИЧЕСКОЙ линии прерывания платформы (v2): GSI/INTID/
+    /// source id — семантику перечисления задаёт порт (см. traits::irq::
+    /// IrqChip — x86: GSI из MADT + выделенный MSI-диапазон). Ядро НЕ
+    /// хранит в капе векторов доставки (IDT slot / LPI) — те целиком
+    /// собственность порта. Инвокации: WAIT (в составе списка кап-слотов),
+    /// RELEASE (владелец — вернуть линию платформе). Право ждать на линии
+    /// — через капу; неймспейс-право IRQ_BIND — второй барьер (потолок).
+    IrqLine {
+        /// Логический номер линии (u32 — не x86-вектор).
+        line: u32,
     },
     TaskTCB {
         task_data: NonNull<GTcb<UMAP>>,
@@ -135,7 +142,7 @@ impl<UMAP: MemoryInterfaceUserspace> CapabilityObject<UMAP> {
             // Пул памяти под IPC-буферы — оперирование обычной памятью.
             CapabilityObject::MemoryIPCPool { .. } => NamespaceRights::MEMORY_ALLOC,
             CapabilityObject::MemoryMMIORegion { .. } => NamespaceRights::MMIO_MAP,
-            CapabilityObject::IRQAcc { .. } => NamespaceRights::IRQ_BIND,
+            CapabilityObject::IrqLine { .. } => NamespaceRights::IRQ_BIND,
             // TaskTCB — право управлять задачами группы (создавать и т.п.).
             CapabilityObject::TaskTCB { .. } => NamespaceRights::TASK_CREATE,
             CapabilityObject::TaskGroupNamespace { .. } => NamespaceRights::CAP_MANAGE,
@@ -525,7 +532,7 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
     /// RBSlabIO::get даёт только &, мутации/копии консистентны лишь под
     /// внешним локом).
     fn body(&self) -> RecordBody<UMAP> {
-        unsafe { *self.body.get() }
+        unsafe { core::ptr::read(self.body.get()) }
     }
 
     /// Жив ли слот (не затумбстоунен). Живой записи tombstone не полагается
@@ -661,11 +668,11 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
     /// Единственный легальный путь добраться до объекта — никакой
     /// другой код не матчит target/membrane напрямую.
     pub fn resolve(&self) -> Result<(&CapabilityObject<UMAP>, DirectCapabilityRights), CapFault> {
-        let (z, gen, rights) = self.walk()?;
+        let (z, gen_, rights) = self.walk()?;
         let zygote = unsafe { z.as_ref() };
         // walk() только что проверил generation и живость объекта; между
         // ними гонки нет (код под permission_backend-локом).
-        debug_assert_eq!(zygote.generation(), gen);
+        debug_assert_eq!(zygote.generation(), gen_);
         let object = zygote.object().ok_or(CapFault::Revoked)?;
         Ok((object, rights))
     }
@@ -723,8 +730,8 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
         if new_rights != requested {
             return Err(CapFault::RightsExceeded);
         }
-        let (zygote, gen, _) = self.walk()?;
-        Ok(Self::new_root_at(zygote, gen, membrane, new_rights))
+        let (zygote, gen_, _) = self.walk()?;
+        Ok(Self::new_root_at(zygote, gen_, membrane, new_rights))
     }
 
     /// Прямое клонирование в пределах ТОЙ ЖЕ capspace: права и потолок
@@ -761,8 +768,8 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
             return Err(CapFault::RightsExceeded);
         }
         let new_rights = self.body().acc & my_rights;
-        let (zygote, gen, _) = self.walk()?;
-        Ok(Self::new_root_at(zygote, gen, membrane, new_rights))
+        let (zygote, gen_, _) = self.walk()?;
+        Ok(Self::new_root_at(zygote, gen_, membrane, new_rights))
     }
 
     /// Проверка права на передачу через IPC. Сама пересылка (запись в
@@ -802,8 +809,8 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
         if new_rights != requested {
             return Err(CapFault::RightsExceeded);
         }
-        let (zygote, gen, _) = self.walk()?;
-        Ok(Self::new_root_at(zygote, gen, membrane, new_rights))
+        let (zygote, gen_, _) = self.walk()?;
+        Ok(Self::new_root_at(zygote, gen_, membrane, new_rights))
     }
 }
 
@@ -888,19 +895,19 @@ mod tests {
 
         let child_membrane = leaked(CapabilityMembrane::new_root(DirectCapabilityRights::all()));
         let child = leaked(
-            root.mint(DirectCapabilityRights::all(), child_membrane)
+            unsafe { root.as_ref() }.mint(DirectCapabilityRights::all(), child_membrane)
                 .expect("mint"),
         );
 
         // Пока родитель жив — ребёнок резолвится в тот же объект.
-        let (obj, _) = child.resolve().expect("живая цепочка");
+        let (obj, _) = unsafe { child.as_ref() }.resolve().expect("живая цепочка");
         assert_mmio_origin(obj, 0x1000);
 
         // take_slot-семантика: tombstone на месте (remove запрещён).
-        root.tombstone();
-        assert!(matches!(child.resolve(), Err(CapFault::Revoked)));
+        unsafe { root.as_ref() }.tombstone();
+        assert!(matches!(unsafe { child.as_ref() }.resolve(), Err(CapFault::Revoked)));
         // Снятая запись сама тоже перестаёт резолвиться.
-        assert!(matches!(root.resolve(), Err(CapFault::Revoked)));
+        assert!(matches!(unsafe { root.as_ref() }.resolve(), Err(CapFault::Revoked)));
     }
 
     /// ABA-эскалация: слот переустановлен в ТОТ ЖЕ адрес под ДРУГОЙ объект.
@@ -919,20 +926,19 @@ mod tests {
 
         let child_membrane = leaked(CapabilityMembrane::new_root(DirectCapabilityRights::all()));
         let child = leaked(
-            parent
-                .mint(DirectCapabilityRights::all(), child_membrane)
+            unsafe { parent.as_ref() }.mint(DirectCapabilityRights::all(), child_membrane)
                 .expect("mint"),
         );
-        assert!(child.resolve().is_ok());
+        assert!(unsafe { child.as_ref() }.resolve().is_ok());
 
         // destroy слота + повторная установка в тот же номер (recycle):
         // адрес записи тот же, generation и объект — другие.
-        parent.tombstone();
+        unsafe { parent.as_ref() }.tombstone();
         let zygote_b = leaked(CapabilityZygote::new(mmio_object(0xB000)));
-        parent.recycle_as_root(zygote_b, membrane, DirectCapabilityRights::all());
+        unsafe { parent.as_ref() }.recycle_as_root(zygote_b, membrane, DirectCapabilityRights::all());
 
         // Прежний потомок НЕ резолвится в чужой 0xB000.
-        assert!(matches!(child.resolve(), Err(CapFault::Revoked)));
+        assert!(matches!(unsafe { child.as_ref() }.resolve(), Err(CapFault::Revoked)));
     }
 
     /// Flatten-копия переживает tombstone ИСТОЧНИКА (ссылается прямо на
@@ -950,18 +956,17 @@ mod tests {
 
         let recv_membrane = leaked(CapabilityMembrane::new_root(DirectCapabilityRights::all()));
         let copy = leaked(
-            source
-                .mint_flattened(DirectCapabilityRights::all(), recv_membrane)
+            unsafe { source.as_ref() }.mint_flattened(DirectCapabilityRights::all(), recv_membrane)
                 .expect("flatten mint"),
         );
 
-        source.tombstone();
-        let (obj, _) = copy.resolve().expect("flatten-копия переживает источник");
+        unsafe { source.as_ref() }.tombstone();
+        let (obj, _) = unsafe { copy.as_ref() }.resolve().expect("flatten-копия переживает источник");
         assert_mmio_origin(obj, 0xC000);
 
         // Уничтожение объекта (tombstone зиготы) убивает flatten-копию.
-        unsafe { zygote.as_ref() }.tombstone();
-        assert!(matches!(copy.resolve(), Err(CapFault::Revoked)));
+        unsafe { zygote.as_ref().tombstone() };
+        assert!(matches!(unsafe { copy.as_ref() }.resolve(), Err(CapFault::Revoked)));
     }
 
     /// Lazy revocation мембраны убивает и корень, и производные цепочки.
@@ -977,14 +982,14 @@ mod tests {
 
         let child_membrane = leaked(CapabilityMembrane::new_root(DirectCapabilityRights::all()));
         let child = leaked(
-            root.mint(DirectCapabilityRights::all(), child_membrane)
+            unsafe { root.as_ref() }.mint(DirectCapabilityRights::all(), child_membrane)
                 .expect("mint"),
         );
-        assert!(child.resolve().is_ok());
+        assert!(unsafe { child.as_ref() }.resolve().is_ok());
 
         unsafe { root_membrane.as_ref() }.revoke();
-        assert!(matches!(root.resolve(), Err(CapFault::Revoked)));
-        assert!(matches!(child.resolve(), Err(CapFault::Revoked)));
+        assert!(matches!(unsafe { root.as_ref() }.resolve(), Err(CapFault::Revoked)));
+        assert!(matches!(unsafe { child.as_ref() }.resolve(), Err(CapFault::Revoked)));
     }
 
     /// Глубина цепочки ограничена: юзерспейс не может ни переполнить
@@ -1006,17 +1011,17 @@ mod tests {
         ));
         // После цикла node — запись глубины MAX_CHAIN_DEPTH (за пределом).
         for _ in 0..LinkedRecord::<FakeUmap>::MAX_CHAIN_DEPTH {
-            let next = node
+            let next = unsafe { node.as_ref() }
                 .mint(DirectCapabilityRights::all(), membrane)
                 .expect("mint в пределах глубины");
             node = leaked(next);
         }
         assert!(
-            matches!(node.resolve(), Err(CapFault::Revoked)),
+            matches!(unsafe { node.as_ref() }.resolve(), Err(CapFault::Revoked)),
             "глубина обязана ограничиваться"
         );
         // Запись жива (не затумбстоунена) — отказ именно по глубине.
-        assert!(node.is_live());
-        assert_eq!(node.generation(), 0);
+        assert!(unsafe { node.as_ref() }.is_live());
+        assert_eq!(unsafe { node.as_ref() }.generation(), 0);
     }
 }

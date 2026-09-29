@@ -74,6 +74,9 @@ fn alloc_result(r: Result<crate::umap::VmapHandle, crate::umap::VmapError>) -> u
         Err(crate::umap::VmapError::Quota(_)) => res::E_QUOTA,
         Err(crate::umap::VmapError::QuotaMissing) => res::E_INTERNAL,
         Err(crate::umap::VmapError::Slab(_)) => res::E_SLAB,
+        // Не возникает на alloc-путях (пин есть только у free), но матч
+        // обязан быть исчерпывающим.
+        Err(crate::umap::VmapError::DmaPinned) => res::E_INTERNAL,
     }
 }
 
@@ -82,6 +85,8 @@ fn free_result(r: Result<(), crate::umap::VmapError>) -> u64 {
         Ok(()) => res::OK,
         Err(crate::umap::VmapError::NotTracked) => res::E_NOT_FOUND,
         Err(crate::umap::VmapError::ExternalMismatch) => res::E_INVALID_ARG,
+        // Регион под DMA-привязкой (MapDmaVa): сначала UnmapDma.
+        Err(crate::umap::VmapError::DmaPinned) => res::E_BUSY,
         Err(e) => alloc_result(Err(e)),
     }
 }
@@ -213,8 +218,14 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainMemory<A, SyscallM
         // чужие/отозванные регионы по угадываемым последовательным id.
         let region = {
             let caps = gtcb.capspace().lock();
-            let record = caps.get(&args.cap_slot).ok_or(res::E_SLOT_EMPTY)?;
-            let (object, _) = record.resolve().map_err(|_| res::E_CAP_REVOKED)?;
+            let record = match caps.get(&args.cap_slot) {
+                Some(r) => r,
+                None => return res::E_SLOT_EMPTY,
+            };
+            let (object, _) = match record.resolve() {
+                Ok(v) => v,
+                Err(_) => return res::E_CAP_REVOKED,
+            };
             match object {
                 crate::access::capability::CapabilityObject::MemoryMMIORegion {
                     region_origin,

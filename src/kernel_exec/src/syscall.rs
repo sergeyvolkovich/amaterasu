@@ -262,7 +262,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainTaskSpawn<A, Sysca
 
         // ── Транзакция спавна (общий хвост TASK_CREATE/FROM_MEM) ─────
         let mut tasks = self.0.task_manager().lock();
-        let tx = match transaction_tail(
+        let tx = match transaction_tail::<A>(
             &mut tasks,
             &mut access,
             caller,
@@ -323,7 +323,14 @@ fn bootstrap_child<A: ArchImplementation + 'static>(
     };
     // SAFETY: под permission_backend-локом уничтожение невозможно.
     let child = unsafe { child_ptr.as_ref() };
-    let child_ns = access.task_namespace(task_cap_id);
+    // BUILD-COPY HACK: &'static-подобный доступ через NonNull, чтобы
+    // заимствование не пересекалось с create_new_object(&mut access).
+    // Слэб-записи Namespace бессмертны (tombstone-на-месте) — контракт
+    // тот же, что у NonNull-кэшей капабилити.
+    let child_ns_ptr = access
+        .task_namespace(task_cap_id)
+        .map(core::ptr::NonNull::from);
+    let child_ns = || child_ns_ptr.map(|p| unsafe { p.as_ref() });
 
     // Слот 0: self-TaskTCB.
     let Some(self_zygote) = access.get_zygote(task_cap_id) else {
@@ -334,7 +341,7 @@ fn bootstrap_child<A: ArchImplementation + 'static>(
         BOOT_SLOT_SELF,
         self_zygote,
         DirectCapabilityRights::all(),
-        child_ns,
+        child_ns(),
     )
     .map_err(capspace_error_code)?;
 
@@ -354,7 +361,7 @@ fn bootstrap_child<A: ArchImplementation + 'static>(
         BOOT_SLOT_NAMESPACE,
         ns_zygote,
         DirectCapabilityRights::all(),
-        child_ns,
+        child_ns(),
     ) {
         let _ = access.destroy_object(ns_cap_id);
         return Err(capspace_error_code(e));
@@ -370,7 +377,7 @@ fn bootstrap_child<A: ArchImplementation + 'static>(
         BOOT_SLOT_PARENT,
         parent_zygote,
         DirectCapabilityRights::all(),
-        child_ns,
+        child_ns(),
     )
     .map_err(capspace_error_code)?;
 
@@ -413,7 +420,7 @@ fn transaction_tail<A: ArchImplementation + 'static>(
     };
 
     // ── Bootstrap-капабилити ребёнка: 0=self, 1=неймспейс, 2=родитель
-    let ns_cap_id = match bootstrap_child(access, caller_cap_id, task_cap_id, namespace_id) {
+    let ns_cap_id = match bootstrap_child::<A>(access, caller_cap_id, task_cap_id, namespace_id) {
         Ok(id) => id,
         Err(code) => {
             rollback(tasks, access);
@@ -626,7 +633,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainTaskSpawn<A, Sysca
 
         // ── Транзакция спавна (общий хвост TASK_CREATE/FROM_MEM) ─────
         let mut tasks = self.0.task_manager().lock();
-        let tx = match transaction_tail(
+        let tx = match transaction_tail::<A>(
             &mut tasks,
             &mut access,
             caller,

@@ -34,6 +34,7 @@ use crate::{
         namespace::NamespaceRights,
     },
     task::tcb::GTcb,
+    traits::irq::IrqChip as _,
     traits::{ArchImplementation, syscall::SyscallDomain, syscall::syscall_result as res},
 };
 
@@ -103,13 +104,20 @@ pub struct SyscallCapCreateShared {
     dst_slot: u64,
 }
 
-/// Создание capability на IRQ (ядро CPU + вектор).
+/// Создание capability на ЛОГИЧЕСКУЮ линию прерывания платформы (v2):
+/// валидация по чипу (диапазон/занятость), занятие в реестре (см.
+/// crate::irq), программирование режима срабатывания. Линия остаётся
+/// ЗАМАСКИРОВАННОЙ до первого WAIT (semantics «disable_irq → handler
+/// → enable» — уровневые линии не спамят между ожиданиями).
 #[derive(SyscallArguments)]
 pub struct SyscallCapCreateIrq {
+    /// Задача-владелец будущей capability (капабилити кладётся в её cspace).
     owner_task_cap: u64,
     dst_slot: u64,
-    cpu_id: u64,
-    vector: u64,
+    /// Логический номер линии (GSI/INTID/MSI — см. traits::irq::IrqChip).
+    line: u64,
+    /// Режим срабатывания: 0 = Edge, 1 = Level (TriggerMode::from_abi).
+    trigger: u64,
 }
 
 /// Создание фолт-эндпоинта (seL4 fault endpoint / KeyKOS keeper):
@@ -315,7 +323,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 /// Все три типа объектов — чистые дескрипторы: фреймы не выделяются,
 /// IRQ не настраивается, MMIO не мапится. Реальные операции — забота
 /// домена memory/драйверов, которые обязаны сверять capability.
-fn create_descriptor_capability<A: ArchImplementation>(
+pub(crate) fn create_descriptor_capability<A: ArchImplementation>(
     access: &mut AccessManager<A::Umap>,
     owner: &GTcb<A::Umap>,
     owner_task_cap: u64,
@@ -529,10 +537,13 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
             return res::E_NO_CURRENT_TASK;
         };
 
-        // Вектор IRQ — 16-битное пространство (x86) / число линий (generic).
-        if args.vector > u16::MAX as u64 {
+        // Линия — u32-пространство (переносимое, см. traits::irq).
+        if args.line > u32::MAX as u64 {
             return res::E_INVALID_ARG;
         }
+        let Some(trigger) = crate::traits::irq::TriggerMode::from_abi(args.trigger) else {
+            return res::E_INVALID_ARG;
+        };
 
         let mut access = self.0.permission_backend.lock();
 
@@ -554,16 +565,63 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         }
         let owner = unsafe { owner_ptr.as_ref() };
 
-        create_descriptor_capability::<A>(
+        // Валидация по чипу: линия обязана лежать в проводном пространстве
+        // ИЛИ в MSI-пространстве (семантику перечисления задаёт порт).
+        let Some(chip) = A::irq_chip() else {
+            return res::E_INTERNAL; // подсистема не инициализирована портом
+        };
+        let line = args.line as u32;
+        let in_wired = line < chip.wired_line_count();
+        let in_msi = chip.msi_capacity() > 0
+            && line >= chip.msi_line_base()
+            && line < chip.msi_line_base() + chip.msi_capacity();
+        if !in_wired && !in_msi {
+            return res::E_INVALID_ARG;
+        }
+
+        // 1. Реестр: занять линию (Busy → E_BUSY).
+        match crate::irq::claim_line(
+            line,
+            crate::irq::LineEntry {
+                owner_task: args.owner_task_cap,
+                trigger,
+                wired: in_wired,
+            },
+        ) {
+            Ok(()) => {}
+            Err(crate::irq::LineError::Busy) => return res::E_BUSY,
+            Err(crate::irq::LineError::Slab) => return res::E_SLAB,
+            Err(crate::irq::LineError::NotFound) => unreachable!("claim не даёт NotFound"),
+        }
+
+        // 2. Режим срабатывания (линия пока замаскирована — RTE уже
+        //    программировался бут-инициализацией порта с битом маски).
+        if let Err(e) = chip.set_trigger(line, trigger) {
+            let _ = crate::irq::release_line(line);
+            return hw_result_code(e);
+        }
+
+        // 3. Корневая капа в cspace владельца (сбой — откат реестра).
+        let cap_id = create_descriptor_capability::<A>(
             &mut access,
             owner,
             args.owner_task_cap,
             args.dst_slot,
-            CapabilityObject::IRQAcc {
-                cpu_id: args.cpu_id as usize,
-                vector: args.vector as u16,
-            },
-        )
+            CapabilityObject::IrqLine { line },
+        );
+        if res::is_error(cap_id) {
+            let _ = crate::irq::release_line(line);
+        }
+        cap_id
+    }
+}
+
+/// Маппинг аппаратной ошибки чипа в код сисколла (для NR 19/51).
+fn hw_result_code(e: crate::traits::irq::IrqHwError) -> u64 {
+    match e {
+        crate::traits::irq::IrqHwError::OutOfRange => res::E_INVALID_ARG,
+        crate::traits::irq::IrqHwError::Unsupported => res::E_NOT_IMPLEMENTED,
+        crate::traits::irq::IrqHwError::Hardware => res::E_INTERNAL,
     }
 }
 
@@ -836,6 +894,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         // install_root/put через recycle (generation протухает потомков).
         let taken = capspace::take_slot(task, args.slot);
         match &taken {
+            Err(capspace::CapspaceError::Quota) => res::E_QUOTA,
             Ok(_) => res::OK,
             Err(capspace::CapspaceError::SlotOccupied) => res::E_SLOT_OCCUPIED,
             Err(capspace::CapspaceError::SlotEmpty) => res::E_SLOT_EMPTY,
@@ -852,7 +911,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 /// угадываемым последовательным task_cap_id (индексы зигот — маленькие
 /// числа, перебор тривиален).
 /// Вызывать под permission_backend-локом.
-fn caller_controls<A: ArchImplementation>(
+pub(crate) fn caller_controls<A: ArchImplementation>(
     access: &AccessManager<A::Umap>,
     current: u64,
     target_task_cap: u64,

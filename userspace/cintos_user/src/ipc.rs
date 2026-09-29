@@ -184,17 +184,31 @@ pub fn wait<'a>(
     recv: RecvWindow,
     buf: &'a mut [u8],
 ) -> Result<Received<'a>, SyscallError> {
+    wait_deadline(from, recv, buf, 0)
+}
+
+/// IPC_WAIT с дедлайном: deadline — абсолютный тик ядра
+/// (TASK_STATS даёт global ticks + tick_hz); 0 — ждать вечно.
+/// По истечении — E_TIMEOUT; сообщение, доставленное в тот же тик,
+/// старше таймаута (доставка побеждает).
+pub fn wait_deadline<'a>(
+    from: u64,
+    recv: RecvWindow,
+    buf: &'a mut [u8],
+    deadline: u64,
+) -> Result<Received<'a>, SyscallError> {
     if buf.len() < HEADER_WORDS * 8 {
         return Err(SyscallError::Kernel(abi::result::E_INVALID_ARG));
     }
     let code = unsafe {
-        syscall::syscall5(
+        syscall::syscall6(
             abi::nr::IPC_WAIT,
             from,
             buf.as_ptr() as u64,
             buf.len() as u64,
             recv.base,
             recv.count,
+            deadline,
         )
     };
     syscall::check(code)?;

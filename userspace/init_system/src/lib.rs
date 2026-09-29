@@ -1,4 +1,5 @@
 //! init_system — каркас init-сервера NOMAD (workspace-заглушка).
+#![no_std]
 //!
 //! Крейт держит место под будущий init-сервер: bootstrap userland
 //! (спавн boot-модулей через TASK_CREATE, раздача capability,

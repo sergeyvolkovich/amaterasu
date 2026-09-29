@@ -55,6 +55,13 @@ pub mod syscall_result {
     /// убивает ВСЁ ядро (и все задачи) из-за одного вызова userspace.
     pub const E_NOT_IMPLEMENTED: u64 = SYSCALL_ERROR_FLAG | 13;
 
+    /// Ресурс занят DMA-привязкой: FREE_PAGES на регион, который активно
+    /// замаплен в IOMMU-домен (снять привязку — UnmapDma, потом free).
+    pub const E_BUSY: u64 = SYSCALL_ERROR_FLAG | 14;
+
+    /// Истёк дедлайн блокирующей операции (IPC_WAIT с deadline > 0).
+    pub const E_TIMEOUT: u64 = SYSCALL_ERROR_FLAG | 15;
+
     /// Успех/ошибка по старшему бит (зеркало abi.rs::is_error).
     #[inline]
     pub const fn is_error(code: u64) -> bool {

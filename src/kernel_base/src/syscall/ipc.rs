@@ -71,6 +71,11 @@ pub struct SyscallIPCWait {
     recv_base: u64,
     /// Размер приёмного окна в слотах (0 — capability не принимать).
     recv_count: u64,
+    /// Абсолютный дедлайн в тиках stats::global_ticks (0 — ждать
+    /// вечно). По истечении WAIT возвращает E_TIMEOUT; сообщение,
+    /// доставленное в тот же тик, старше таймаута. Дедлайн в БУДУЩЕМ
+    /// обязателен: прошедший — мгновенный E_TIMEOUT.
+    deadline: u64,
 }
 
 pub struct IPCSyscallDomain<A: ArchImplementation + 'static, D>(
@@ -704,6 +709,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
                 }
                 None => {
                     handle_dropped(self.0, &dropped, lctl);
+                    // Дедлайн уже прошёл (вернулись сюда после пробуждения
+                    // по таймауту, сообщения нет) — спать больше нельзя.
+                    if args.deadline > 0 && crate::task::stats::global_ticks() >= args.deadline {
+                        return res::E_TIMEOUT;
+                    }
                     // Медленный путь: готовность + сон получателя.
                     match endpoint::register_ready(
                         current,
@@ -715,10 +725,27 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
                         recv_count,
                     ) {
                         Ok(ep_idx) => {
-                            let _ = lctl.scheduler_block_on_object(
-                                endpoint::endpoint_wait_object(ep_idx),
-                                WaitModel::OneShot,
-                            );
+                            let wait_obj = endpoint::endpoint_wait_object(ep_idx);
+                            if args.deadline > 0
+                                && crate::task::deadline::register(current, wait_obj, args.deadline)
+                                    .is_err()
+                            {
+                                // Реестр дедлайнов полон: готовность снять,
+                                // чтобы не висел над спящей-не-уснувшей задачей.
+                                endpoint::unregister_ready(current);
+                                return res::E_SLAB;
+                            }
+                            let _ = lctl.scheduler_block_on_object(wait_obj, WaitModel::OneShot);
+                            // Пробуждение: либо доставка (буфер уже заполнен
+                            // отправителем), либо дедлайн. cancel снимает слот
+                            // в ЛЮБОМ случае — иначе тик выстрелит повторно.
+                            if args.deadline > 0 && crate::task::deadline::cancel(current) {
+                                // Сообщение могло прийти в тот же тик, что и
+                                // срок: цикл перепроверит pending — доставка
+                                // старше таймаута; без сообщения верх медленного
+                                // пути вернёт E_TIMEOUT (ticks >= deadline).
+                                continue;
+                            }
                             return res::OK;
                             // Доставка — в IPC_SEND отправителя (быстрый
                             // путь): буфер заполнится, RAX уже OK.

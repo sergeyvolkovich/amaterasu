@@ -92,6 +92,10 @@ pub enum VmapError {
     QuotaMissing,
     /// Ошибка slab-аллокатора при записи в реестр.
     Slab(SlabError),
+    /// Регион активно замаплен в IOMMU-домен (dma_pins > 0): free
+    /// вернёт фреймы в пул под DMA-двигателем — use-after-free.
+    /// Сначала UnmapDma по всем привязкам, потом free.
+    DmaPinned,
 }
 
 /// Трекинговая запись одной аллокации виртуальных страниц.
@@ -109,6 +113,9 @@ pub struct VmapEntry {
     /// Внешний маппинг (MMIO): фреймы НЕ принадлежат задаче — free()
     /// запрещён, только unmap_external().
     pub external: bool,
+    /// Число активных DMA-привязок региона (MapDmaVa). Пока > 0,
+    /// free() запрещён — фреймы читает/пишет устройство.
+    pub dma_pins: u32,
 }
 
 /// Снимок состояния трекера — то, что интересно учёту и отладке.
@@ -163,9 +170,54 @@ impl VirtualPageTracker {
         }
     }
 
-    /// Просмотр записи аллокации без снятия её с учёта.
+    /// Просмотр записи аллокации без снятия с учёта.
     pub fn lookup(&self, virt_base: usize) -> Option<VmapEntry> {
         self.allocations.get(&virt_base).copied()
+    }
+
+    /// Поиск аллокации, целиком содержащей [va, va + pages*PAGE_SIZE).
+    /// Реестр ключован virt_base, а записи базу не хранят — обходим
+    /// дерево (for_each_kv): аллокаций у задачи десятки, не тысячи.
+    pub fn find_containing(&self, va: usize, pages: usize) -> Option<(usize, VmapEntry)> {
+        let end = va.checked_add(pages.checked_mul(PAGE_SIZE)?)?;
+        let mut found: Option<(usize, VmapEntry)> = None;
+        self.allocations.for_each_kv(|base, entry| {
+            if found.is_some() {
+                return;
+            }
+            let Some(region_end) = base.checked_add(entry.pages.saturating_mul(PAGE_SIZE)) else {
+                return;
+            };
+            if va >= *base && end <= region_end {
+                found = Some((*base, *entry));
+            }
+        });
+        found
+    }
+
+    /// Наращивает счётчик DMA-привязок (насыщение u32).
+    pub fn pin_dma(&mut self, virt_base: usize) -> Result<u32, VmapError> {
+        // Сами счётчики — в записи; запись Copy, поэтому правка идёт
+        // через remove+insert (интрузивное дерево &mut V не даёт).
+        let mut entry = self.allocations.remove(&virt_base).ok_or(VmapError::NotTracked)?.1;
+        entry.dma_pins = entry.dma_pins.saturating_add(1);
+        let pins = entry.dma_pins;
+        self.allocations
+            .insert(virt_base, entry)
+            .map_err(VmapError::Slab)?;
+        Ok(pins)
+    }
+
+    /// Снимает одну DMA-привязку. Unpin несуществующей записи — ошибка
+    /// (рассинхрон доменной привязки и umap), но запись не портим.
+    pub fn unpin_dma(&mut self, virt_base: usize) -> Result<u32, VmapError> {
+        let mut entry = self.allocations.remove(&virt_base).ok_or(VmapError::NotTracked)?.1;
+        entry.dma_pins = entry.dma_pins.saturating_sub(1);
+        let pins = entry.dma_pins;
+        self.allocations
+            .insert(virt_base, entry)
+            .map_err(VmapError::Slab)?;
+        Ok(pins)
     }
 
     /// Резервирует `pages` виртуальных страниц, возвращает виртуальный
@@ -312,6 +364,7 @@ impl VmapRegion {
             phys_base: mapped.phys_base(),
             quota_bytes: quota_bytes.unwrap_or(0),
             external: false,
+            dma_pins: 0,
         };
         if let Err(e) = tracker.track(virt, entry) {
             let _ = umap.unmap_memory_region(frames, mapped, virt);
@@ -342,6 +395,12 @@ impl VmapRegion {
         let entry = {
             let mut tracker = self.tracker.lock();
             let entry = tracker.release(handle.virt_base())?;
+            if entry.dma_pins > 0 {
+                // Вернуть запись на место: откат free без side-эффектов —
+                // release() уже снял счётчики, восстанавливаем.
+                let _ = tracker.track(handle.virt_base(), entry);
+                return Err(VmapError::DmaPinned);
+            }
             if entry.external {
                 // MMIO нельзя вернуть в пул фреймов — только unmap_external.
                 let _ = tracker.track(handle.virt_base(), entry);
@@ -370,6 +429,25 @@ impl VmapRegion {
         self.tracker.lock().lookup(virt_base)
     }
 
+    /// Поиск аллокации, целиком содержащей [va, va + pages*PAGE_SIZE).
+    /// Возвращает (virt_base записи, запись) — основа MapDmaVa:
+    /// физика региона = phys_base + (va - virt_base).
+    pub fn find_containing(&self, va: usize, pages: usize) -> Option<(usize, VmapEntry)> {
+        self.tracker.lock().find_containing(va, pages)
+    }
+
+    /// Наращивает счётчик DMA-привязок региона. Возвращает новое
+    /// значение (насыщение u32 — анти-переполнение при повторных
+    /// маппингах одного региона).
+    pub fn pin_dma(&self, virt_base: usize) -> Result<u32, VmapError> {
+        self.tracker.lock().pin_dma(virt_base)
+    }
+
+    /// Снимает одну DMA-привязку (парная к pin_dma, зовёт UnmapDma).
+    pub fn unpin_dma(&self, virt_base: usize) -> Result<u32, VmapError> {
+        self.tracker.lock().unpin_dma(virt_base)
+    }
+
     /// Маппинг ВНЕШНЕГО (MMIO) физического региона в свежезарезервированное
     /// окно задачи: фреймы НЕ выделяются и НЕ возвращаются в пул — только
     /// отображение + учёт. Освобождение — парным [`unmap_external`].
@@ -394,6 +472,7 @@ impl VmapRegion {
             phys_base: mapped.phys_base(),
             quota_bytes: 0,
             external: true,
+            dma_pins: 0,
         };
         if let Err(e) = tracker.track(virt, entry) {
             let _ = umap.unmap_memory_region(frames, mapped, virt);
@@ -433,5 +512,75 @@ impl VmapRegion {
     /// Границы виртуального окна (base, pages).
     pub fn window(&self) -> (usize, usize) {
         self.tracker.lock().window()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::memory::{init_hooks, set_hhdm_offset, MemoryFlags, PAGE_SIZE};
+
+    static std_once: std::sync::Once = std::sync::Once::new();
+    fn ensure_slab() {
+        std_once.call_once(|| {
+            let mem = unsafe {
+                // Странично выровненный leaks-буфер под HHDM + slab-страницы
+                // (тот же приём, что в idalloc::tests).
+                let layout =
+                    std::alloc::Layout::from_size_align(16 * 1024 * 1024, PAGE_SIZE)
+                        .expect("layout");
+                let ptr = std::alloc::alloc_zeroed(layout);
+                assert!(!ptr.is_null(), "oom");
+                core::slice::from_raw_parts_mut(ptr, 16 * 1024 * 1024 / PAGE_SIZE)
+            };
+            set_hhdm_offset(mem.as_ptr() as usize);
+            struct TestFrames;
+            impl crate::traits::memory::FrameAllocator for TestFrames {
+                fn allocate_pages(
+                    &self,
+                    _count: usize,
+                ) -> Option<crate::traits::memory::MemoryPTR> {
+                    None
+                }
+                fn deallocate_pages(&self, _ptr: crate::traits::memory::MemoryPTR) {}
+            }
+            init_hooks::init_allocator(&TestFrames);
+        });
+    }
+
+    #[test]
+    fn dma_pin_find_and_gate() {
+        ensure_slab();
+        let mut tracker = VirtualPageTracker::new(0x0000_0001_0000_0000, 64).expect("tracker");
+        let virt = tracker.reserve(4).expect("reserve");
+        tracker
+            .track(
+                virt,
+                VmapEntry {
+                    pages: 4,
+                    flags: MemoryFlags::empty(),
+                    phys_base: 0x0000_0002_0000_0000,
+                    quota_bytes: 0,
+                    external: false,
+                    dma_pins: 0,
+                },
+            )
+            .expect("track");
+
+        // find_containing: внутри / со сдвигом / за границей / мимо.
+        assert_eq!(tracker.find_containing(virt, 4).map(|(b, _)| b), Some(virt));
+        assert_eq!(
+            tracker.find_containing(virt + PAGE_SIZE, 3).map(|(b, _)| b),
+            Some(virt)
+        );
+        assert!(tracker.find_containing(virt, 5).is_none());
+        assert!(tracker.find_containing(virt + 4 * PAGE_SIZE, 1).is_none());
+
+        // pin/unpin: счётчик, парность, отказ на неотслеживаемом.
+        assert_eq!(tracker.pin_dma(virt).unwrap(), 1);
+        assert_eq!(tracker.pin_dma(virt).unwrap(), 2);
+        assert_eq!(tracker.unpin_dma(virt).unwrap(), 1);
+        assert_eq!(tracker.unpin_dma(virt).unwrap(), 0);
+        assert!(tracker.unpin_dma(virt + 8 * PAGE_SIZE).is_err());
     }
 }

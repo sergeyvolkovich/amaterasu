@@ -29,9 +29,13 @@ pub fn init_syscalls<A: ArchImplementation + crate::traits::iommu::IommuTokenLay
     A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCSend>::new(kctl));
     A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCWait>::new(kctl));
 
-    // Домен IRQ: сон задачи до срабатывания линии + маска сработавших
-    // в userspace-массиве (ABI в syscall::irq / task::irq_wait).
-    A::register_syscalls(DomainIrq::<_, SyscallWaitIrq>::new(kctl));
+    // Домен IRQ (v2): сон до срабатывания линий (по КАПАМ линий — per-line
+    // authority), MSI-аллокация, возврат линии владельцем. ABI в
+    // syscall::irq / task::irq_wait; аппаратный контекст — traits::irq::IrqChip
+    // порта (x86: IO-APIC+LAPIC+MSI, ARM64: GIC, RISC-V: APLIC/IMSIC).
+    A::register_syscalls(DomainIrq::<_, SyscallIrqWait>::new(kctl));
+    A::register_syscalls(DomainIrq::<_, SyscallIrqMsiAlloc>::new(kctl));
+    A::register_syscalls(DomainIrq::<_, SyscallIrqRelease>::new(kctl));
 
     // Домен Debug: чтение лога ядра userspace (init-сервер dumping в FB)
     // и запись строк задачи в лог (наблюдаемость userspace).

@@ -35,16 +35,39 @@ pub extern "C" fn main(
     _argv: *const *const u8,
     _envp: *const *const u8,
 ) -> i32 {
-    dlog::log("timer_server: старт, жду тики линии 0 (100 Гц)\n".as_bytes());
-
     let self_cap = crt0::auxv_get(cintos_user::abi::auxv::AT_CINTOS_SELF_CAP).unwrap_or(u64::MAX);
 
-    let mut wait = timer::tick_wait_buf();
+    // Линия тика — от ядра (TASK_STATS: слово [10]); на IO-APIC-платформе
+    // это GSI из MADT override (обычно 2), не «IRQ0».
     let mut sbuf = stats::stats_buf();
+    let timer_line = stats::task_stats(self_cap, &mut sbuf)
+        .map(|s| s.timer_line)
+        .unwrap_or(timer::FALLBACK_TIMER_LINE);
+    match timer::claim_tick_line(self_cap, timer_line) {
+        Ok(()) => {
+            let mut l = Line::new();
+            l.str("timer_server: линия тика занята капой (GSI ".as_bytes());
+            l.u64(timer_line);
+            l.str("), 100 Гц\n".as_bytes());
+            dlog::log(l.as_bytes());
+        }
+        Err(e) => {
+            let mut l = Line::new();
+            l.str("timer_server: claim линии тика err ".as_bytes());
+            l.u64(code_of(e));
+            l.nl();
+            dlog::log(l.as_bytes());
+            // Без капы WAIT вернёт отказ — но сервер продолжит цикл
+            // (yield), чтобы не зависнуть наглухо в диагностике.
+        }
+    }
+
+    let mut wait = timer::tick_wait_buf();
+    let caps = timer::tick_caps_buf();
     let mut ticks: u64 = 0;
 
     loop {
-        match timer::wait_tick(&mut wait) {
+        match timer::wait_tick(&mut wait, &caps) {
             Ok(_line) => {
                 ticks += 1;
                 if ticks.is_multiple_of(REPORT_EVERY) {

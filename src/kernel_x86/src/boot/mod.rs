@@ -6,6 +6,7 @@
 //! вопрос отдельного arch-крейта (aarch64), а не подмешивания DTB сюда.
 
 pub mod acpi;
+pub mod madt;
 
 use kernel_base::bootinfo::BootHWModel;
 

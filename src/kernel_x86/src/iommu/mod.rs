@@ -324,6 +324,20 @@ pub struct DomainEntry {
     /// Сериализация аппаратных мутаций домена (attach/detach/map/unmap):
     /// один домен — друг за другом, разные домены — параллельно.
     pub hw: SpinMutex<()>,
+    /// DMA-привязки MapDmaVa (DMA-buf): iova -> {owner, virt_base источника}.
+    /// UnmapDma по записи снимает pin с umap владельца (FREE_PAGES под
+    /// пином запрещён — E_BUSY). Дерево ленивое (slab-хуки поднимаются
+    /// позже), под собственным локом — как users у PasidEntry.
+    pub dma_pins: SpinMutex<Option<RBSlabIO<u64, DmaPin, false>>>,
+}
+
+/// Запись привязки DMA-buf (MapDmaVa): чей регион и какая его аллокация
+/// стоит под этим iova. virt_base — ключ pin-счётчика в VmapRegion
+/// владельца (unpin_dma(virt_base)).
+#[derive(Debug, Clone, Copy)]
+pub struct DmaPin {
+    pub owner: u64,
+    pub virt_base: u64,
 }
 
 /// Реестр PASID-пространств: токен -> пространство first-stage.
@@ -469,6 +483,7 @@ pub fn create_domain_token(unit: &IommuUnitHandle, owner_task: u64) -> Result<u6
         attached: AtomicU32::new(0),
         live: AtomicBool::new(true),
         hw: SpinMutex::new(()),
+        dma_pins: SpinMutex::new(None),
     };
     if tree.lock().insert(token, entry).is_err() {
         // Slab OOM при вставке — домен не регистрируется, ресурс назад.
@@ -1073,6 +1088,46 @@ impl IommuTokenLayer for crate::X86Backend {
         // SAFETY: запись бессмертна; hw-лок сериализует мутации таблиц.
         let _guard = unsafe { entry.as_ref() }.hw.lock();
         domain.unmap_pages(iova, pages)
+    }
+
+    fn record_dma_pin(
+        &self,
+        token: u64,
+        iova: usize,
+        owner: u64,
+        virt_base: usize,
+    ) -> Result<(), TokenError> {
+        let (_, entry) = resolve_domain(token).map_err(TokenError::from)?;
+        // SAFETY: запись бессмертна (tombstone-на-месте, см. resolve_domain).
+        let entry_ref = unsafe { entry.as_ref() };
+        let mut pins = entry_ref.dma_pins.lock();
+        let tree = match pins.as_mut() {
+            Some(t) => t,
+            None => {
+                // Ленивая инициализация (slab-хуки могли ещё не подняться
+                // на момент создания домена).
+                let t = RBSlabIO::new().map_err(|_| TokenError::Full)?;
+                *pins = Some(t);
+                pins.as_mut().expect("дерево только что записано")
+            }
+        };
+        // Один живой MapDmaVa на (домен, iova): повторный маппинг того же
+        // iova сломал бы парность pin/unpin — требует UnmapDma сначала.
+        if tree.contains_key(&(iova as u64)) {
+            return Err(TokenError::Occupied);
+        }
+        tree.insert(iova as u64, DmaPin { owner, virt_base: virt_base as u64 })
+            .map_err(|_| TokenError::Full)
+    }
+
+    fn take_dma_pin(&self, token: u64, iova: usize) -> Option<(u64, usize)> {
+        let (_, entry) = resolve_domain(token).ok()?;
+        // SAFETY: запись бессмертна.
+        let entry_ref = unsafe { entry.as_ref() };
+        let mut pins = entry_ref.dma_pins.lock();
+        let tree = pins.as_mut()?;
+        let (_, pin) = tree.remove(&(iova as u64))?;
+        Some((pin.owner, pin.virt_base as usize))
     }
 
     fn create_pasid_space(

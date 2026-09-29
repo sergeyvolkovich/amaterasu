@@ -16,7 +16,7 @@
 //! снапшот, чтобы юзерспейс мог переводить тики в секунды без знания
 //! о платформе.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::lctl::LocalKernelCTL;
 use crate::traits::memory::MemoryInterfaceUserspace;
@@ -36,6 +36,21 @@ static GLOBAL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Частота тика (Гц), объявленная портом при старте таймера
 /// (0 — порт без таймера; юзерспейс видит это в снапшоте).
 static TICK_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Линия тика таймера (GSI платформы; u32::MAX — порт не поднял таймер).
+/// Юзерспейс-таймер-сервер читает её из TASK_STATS: без знания линии
+/// сервер не сможет занять её капой (IrqLine) и ждать тик.
+static TIMER_LINE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Порт объявляет линию тика при запуске таймера.
+pub fn set_timer_line(line: u32) {
+    TIMER_LINE.store(line, Ordering::Release);
+}
+
+/// Линия тика (u32::MAX — таймер не поднят портом).
+pub fn timer_line() -> u32 {
+    TIMER_LINE.load(Ordering::Acquire)
+}
 
 /// Порт объявляет частоту тика при запуске таймера.
 pub fn set_tick_hz(hz: u64) {
@@ -198,6 +213,7 @@ impl TaskStatsSnapshot {
         w[7] = self.blocks;
         w[8] = global_ticks();
         w[9] = tick_hz();
+        w[10] = timer_line() as u64;
         w
     }
 }

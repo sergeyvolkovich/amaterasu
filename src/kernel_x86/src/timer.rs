@@ -1,16 +1,21 @@
-//! Системный тик: PIT (Intel 8253/8254, канал 0) на линии IRQ0.
+//! Системный тик: PIT (Intel 8253/8254, канал 0) → IO-APIC (GSI из
+//! override для ISA 0, обычно GSI 2) → хук ядра.
 //!
 //! РАСПРЕДЕЛЕНИЕ ОТВЕТСТВЕННОСТИ (L4-философия «таймер — юзерспейсный
 //! сервис», ядро — только транспорт и учёт):
-//!   - АРХ-БЕКЕНД (этот модуль): программирует PIT/PIC, держит хук
-//!     линии 0. Сам НЕ ведёт время как сервис.
+//!   - АРХ-БЕКЕНД (этот модуль): программирует PIT, маршрут GSI в
+//!     IO-APIC, регистрирует хук линии. Сам НЕ ведёт время как сервис.
 //!   - ЯДРО (kernel_base::task::stats): на каждый тик учитывает квант
-//!     текущей задаче (cpu_ticks) и глобальный uptime — это единственное,
+//!     текущей задаче (cpu_ticks) и глобальный uptime — единственное,
 //!     что ядру нужно от времени (статистика/учёт).
-//!   - ЮЗЕРСПЕЙС: таймер-сервер спит на WaitIrq(линия 0), ведёт uptime,
-//!     раздаёт тайм-ауты/сны через IPC — сервисная политика вне ядра.
-//!     (Пропущенные сервером тики не теряются для отчётности: глобальный
-//!     счётчик тиков читается сисколлом TASK_STATS.)
+//!   - ЮЗЕРСПЕЙС: таймер-сервер ждёт линию таймера через WAIT по капе
+//!     (IrqLine GSI), ведёт uptime, раздаёт тайм-ауты/сны через IPC.
+//!
+//! ЛИНИЯ ТАЙМЕРА: GSI из MADT override ISA 0 (PC-платформа: GSI 2,
+//! edge/high); без override — конформинг (GSI 0). Юзерспейс узнаёт
+//! линию из лога ядра на буте (запись ниже) — v2 beta.
+//!
+//! Если MADT/IO-APIC недоступны — legacy-PIC fallback (линия 0).
 //!
 //! EOI шлёт диспетчер (irq::irq_vector_dispatch) ПОСЛЕ хука — по
 //! стандартному контракту «подтверждать после обработки».
@@ -19,11 +24,16 @@ use kernel_base::kernel_log;
 use kernel_base::lctl::LocalKernelCTL;
 use kernel_base::task::stats;
 
+use crate::irq;
 use crate::paging::X86Umap;
 use crate::pic;
 
-/// Линия таймера (PIT → IRQ0 → вектор 32).
-pub const TIMER_LINE: u32 = 0;
+/// Линия таймера в legacy-режиме (PIT → IRQ0 → вектор 32).
+pub const LEGACY_TIMER_LINE: u32 = 0;
+
+/// GSI линии таймера (заполняется start_periodic_tick; для диагностики
+/// и будущего bootinfo-расширения).
+pub static TIMER_GSI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Частота входного генератора PIT (Гц).
 const PIT_INPUT_HZ: u32 = 1_193_182;
@@ -35,19 +45,18 @@ const PIT_MODE_CMD: u16 = 0x43;
 const PIT_MODE3_LOHI: u8 = 0b0011_0110;
 
 /// Запускает периодический тик: ремап+маска PIC, программирование PIT
-/// канала 0, регистрация хука линии 0 (учёт статистики + пробуждение
-/// ждущих юзерспейс-задач), размаскировка IRQ0.
+/// канала 0, маршрут GSI таймера в IO-APIC (или размаска PIC в legacy),
+/// регистрация хука линии (учёт статистики + доставка ждущим), занятие
+/// линии в реестре kernel_base (owner 0 = ядро: юзерспейс не перехватит).
 ///
 /// Прерывания НЕ включает: STI делает фронтенд (boot) после полной
 /// инициализации — старт источника и его «слышимость» разделены.
-///
-/// Частота объявляется статистике (юзерспейс переводит тики в секунды
-/// по снапшоту TASK_STATS — архитектурная деталь не утекает в API).
 pub fn start_periodic_tick(hz: u32) {
     let divisor = (PIT_INPUT_HZ / hz.max(1)).clamp(2, 0xFFFF) as u16;
 
-    // 1. PIC: ремап на векторы 32..47 + маска всего (размаскируем только
-    //    линию таймера — чужие устройства молчат до своего владельца).
+    // 1. PIC: ремап на векторы 32..47 + маска всего. В IO-APIC-режиме PIC
+    //    остаётся замаскированным НАВСЕГДА (только ремап против
+    //    спуриков на исключениях); в legacy — владелец линии размаскирует.
     pic::remap_and_mask_all();
 
     // 2. PIT: канал 0, режим 3, делитель.
@@ -59,16 +68,42 @@ pub fn start_periodic_tick(hz: u32) {
         ch0.write((divisor >> 8) as u8);
     }
 
-    // 3. Хук линии таймера: учёт (kernel_base, нейтрально) + доставка
-    //    ждущим юзерспейс-задачам (on_irq_fired будит WaitIrq-спящих).
-    crate::irq::register_irq_line_handler(TIMER_LINE, timer_tick_hook)
-        .expect("таймер: линия 0 свободна (первая регистрация)");
+    // 3. Линия таймера: GSI из override либо конформинг 0.
+    let (gsi, active_low, level) = match irq::isa_override(0) {
+        Some(iso) => (iso.gsi, iso.active_low, iso.level_triggered),
+        None => (LEGACY_TIMER_LINE, false, false),
+    };
+    TIMER_GSI.store(gsi, core::sync::atomic::Ordering::Relaxed);
 
-    // 4. Размаскировка линии и объявление частоты статистике.
-    pic::unmask(TIMER_LINE as u8);
+    // 4. Хук линии (учёт + доставка ждущим) — до размаскивания.
+    crate::irq::register_line_hook(gsi, timer_tick_hook)
+        .expect("таймер: слот хука линии свободен (первая регистрация)");
+
+    // 5. Объявляем линию статистике (юзерспейс-таймер-сервер возьмёт её
+    //    капой через CAP_CREATE_IRQ и будет ждать тик — L4-модель).
+    //    Хук ядра (шаг 4) от реестра владения НЕ зависит: учёт квантов
+    //    и дедлайнов работает независимо от того, кто держит линию.
+
+    // 6. Маршрут: IO-APIC RTE (маскированный) + размаска; legacy — PIC.
+    let ioapic_mode = irq::chip().is_some_and(|c| !c.legacy());
+    if ioapic_mode {
+        crate::ioapic::program_route(gsi, active_low, level, false);
+        crate::ioapic::unmask_gsi(gsi);
+        kernel_log!(
+            "timer: PIT {} Гц (делитель {}), GSI {} (edge/{}), вектор {}\n",
+            hz,
+            divisor,
+            gsi,
+            if level { "level" } else { "high" },
+            32 + gsi
+        );
+    } else {
+        pic::unmask(LEGACY_TIMER_LINE as u8);
+        kernel_log!("timer: PIT {} Гц (делитель {}), legacy IRQ0\n", hz, divisor);
+    }
+
     stats::set_tick_hz(hz as u64);
-
-    kernel_log!("timer: PIT запущен, {} Гц (делитель {})\n", hz, divisor);
+    stats::set_timer_line(gsi);
 }
 
 /// Хук тика (вызывается из IDT-диспетчера с погашенными прерываниями):
@@ -79,4 +114,7 @@ pub fn start_periodic_tick(hz: u32) {
 fn timer_tick_hook(line: u32, lctl: &mut LocalKernelCTL<X86Umap>) {
     stats::on_tick(lctl);
     kernel_base::task::irq_wait::on_irq_fired(lctl, line);
+    // Дедлайны IPC_WAIT: будим всех, чей срок вышел (E_TIMEOUT хендлер
+    // вернёт сам после пробуждения; сообщение в тот же тик старше).
+    kernel_base::task::deadline::on_tick(lctl, kernel_base::task::stats::global_ticks());
 }

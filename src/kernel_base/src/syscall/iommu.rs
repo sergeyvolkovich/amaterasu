@@ -8,8 +8,11 @@
 //! свободна):
 //!   32 CreateDomain      — домен second-stage + корневая capability.
 //!   33 AttachDevice      — устройство в домен (без PASID).
-//!   34 MapDma            — IOVA -> физика в домене.
-//!   35 UnmapDma          — снятие IOVA-маппинга.
+//!   34 MapDma            — IOVA -> физика в домене (сырая физика).
+//!   35 UnmapDma          — снятие IOVA-маппинга (+ pin-учёт MapDmaVa).
+//!   50 MapDmaVa          — DMA-buf: маппинг ИЗ ПАМЯТИ ВЫЗЫВАЮЩЕГО
+//!                          (VA -> физика резолвит ядро, регион пинится,
+//!                          FREE_PAGES под пином — E_BUSY).
 //!   36 CreatePasidSpace  — пространство first-stage (SVA: root = CR3 владельца).
 //!   37 AllocPasid        — PASID-капабилити с потолком пользователей (v2).
 //!   38 FreePasid         — уничтожение PASID (снятие всех привязок).
@@ -459,8 +462,113 @@ impl<A: IommuTokenLayer> SyscallDomain for DomainIommu<A, SyscallCapIommuUnmapDm
             Err(code) => return code,
         };
         self.0.arch_backend().unmap_dma(token, args.iova as usize, args.pages as usize)
-            .map(|()| res::OK)
+            .map(|()| {
+                // Pin-учёт (MapDmaVa): маппинг снят — снимаем привязку
+                // источника, FREE_PAGES снова разрешён. Владелец мог
+                // умереть (umap удалён вместе с задачей) — пинить
+                // нечего; запись в домене снята в любом случае.
+                if let Some((owner, virt_base)) =
+                    self.0.arch_backend().take_dma_pin(token, args.iova as usize)
+                {
+                    if let Some(owner_ptr) = access.get_task_tcb(owner) {
+                        // SAFETY: под permission_backend-локом.
+                        let owner_gtcb = unsafe { owner_ptr.as_ref() };
+                        let _ = owner_gtcb.vmap().unpin_dma(virt_base);
+                    }
+                }
+                res::OK
+            })
             .unwrap_or_else(iommu_error_code)
+    }
+}
+
+/// DMA-маппинг ИЗ ПАМЯТИ ВЫЗЫВАЮЩЕГО (NR 50; DMA-buf примитив).
+///
+/// Ключевое отличие от MapDma (34): источник физики — не сырой phys от
+/// ring3, а регион В АДРЕСНОМ ПРОСТРАНСТВЕ ВЫЗЫВАЮЩЕГО: ядро резолвит
+/// VA -> физика через VmapRegion (find_containing), пинит регион
+/// (FREE_PAGES на пиннутый — E_BUSY) и записывает привязку в домен
+/// (UnmapDma снимет pin). Драйвер легально получает DMA на СВОИ буферы
+/// и буферы, полученные по IPC, не зная физику и не имея шанса
+/// смаппить чужую/системную память.
+#[derive(SyscallArguments)]
+pub struct SyscallCapIommuMapDmaVa {
+    pub task_cap: u64,
+    pub cap_slot: u64,
+    pub iova: u64,
+    /// VA источника в пространстве ВЫЗЫВАЮЩЕГО (page-aligned); диапазон
+    /// обязан целиком лежать в ОДНОЙ аллокации (физика непрерывна).
+    pub va: u64,
+    pub pages: u64,
+    pub prot_mask: u64,
+}
+
+impl<A: IommuTokenLayer> SyscallDomain for DomainIommu<A, SyscallCapIommuMapDmaVa> {
+    const SYSCALL_ID: usize = 50;
+    type Args = SyscallCapIommuMapDmaVa;
+    type Umap = A::Umap;
+
+    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+        let prot = IommuProtection::from_bits_truncate(args.prot_mask as u8);
+        if prot.is_empty() || args.pages == 0 {
+            return res::E_INVALID_ARG;
+        }
+        if args.iova % crate::traits::memory::PAGE_SIZE as u64 != 0
+            || args.va % crate::traits::memory::PAGE_SIZE as u64 != 0
+        {
+            return res::E_INVALID_ARG;
+        }
+        let access = self.0.permission_backend().lock();
+        if check_dma_rights::<A>(&access, current).is_err() {
+            return res::E_RIGHTS_DENIED;
+        }
+        let token = match resolve_domain_cap::<A>(&access, current, args.task_cap, args.cap_slot) {
+            Ok(token) => token,
+            Err(code) => return code,
+        };
+        // Источник — только СВОЯ память: VA резолвится в umap ВЫЗЫВАЮЩЕГО.
+        let Some(gtcb_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом уничтожение невозможно.
+        let gtcb = unsafe { gtcb_ptr.as_ref() };
+        let Some((virt_base, entry)) =
+            gtcb.vmap().find_containing(args.va as usize, args.pages as usize)
+        else {
+            return res::E_INVALID_ARG;
+        };
+        if entry.external {
+            // MMIO-монты (окна устройств) DMA не отдаём — dma_allowed-
+            // политика сырого MapDma: двигатель ходит только по RAM.
+            return res::E_INVALID_ARG;
+        }
+        let page = crate::traits::memory::PAGE_SIZE as u64;
+        let phys = entry.phys_base as u64 + ((args.va - virt_base as u64) / page) * page;
+        // Pin ДО маппинга; при срыве map — откат.
+        if gtcb.vmap().pin_dma(virt_base).is_err() {
+            return res::E_INTERNAL;
+        }
+        if let Err(e) = self.0.arch_backend().map_dma(
+            token,
+            args.iova as usize,
+            phys as usize,
+            args.pages as usize,
+            prot,
+        ) {
+            let _ = gtcb.vmap().unpin_dma(virt_base);
+            return iommu_error_code(e);
+        }
+        // Привязка в домене: UnmapDma найдёт, чей pin снимать. Срыв —
+        // полный откат (маппинг + pin), привязка не остаётся "наполовину".
+        if self.0.arch_backend().record_dma_pin(token, args.iova as usize, current, virt_base).is_err() {
+            let _ = self.0.arch_backend().unmap_dma(token, args.iova as usize, args.pages as usize);
+            let _ = gtcb.vmap().unpin_dma(virt_base);
+            return res::E_SLAB;
+        }
+        res::OK
     }
 }
 
@@ -852,6 +960,7 @@ pub fn init_iommu_syscalls<A: IommuTokenLayer>(kctl: &'static KernelCTL<A>) {
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuDetachDevice>::new(kctl));
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuMapDma>::new(kctl));
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuUnmapDma>::new(kctl));
+    A::register_syscalls(DomainIommu::<A, SyscallCapIommuMapDmaVa>::new(kctl));
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuCreatePasidSpace>::new(kctl));
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuAllocPasid>::new(kctl));
     A::register_syscalls(DomainIommu::<A, SyscallCapIommuFreePasid>::new(kctl));

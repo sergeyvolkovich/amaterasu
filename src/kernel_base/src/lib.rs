@@ -29,6 +29,7 @@ pub mod collection;
 pub mod frame_manager;
 pub mod idalloc;
 pub mod ipc;
+pub mod irq;
 pub mod irqsafe;
 pub mod lctl;
 pub mod log;
@@ -37,6 +38,15 @@ pub mod syscall;
 pub mod task;
 pub mod traits;
 pub mod umap;
+
+/// Сериализация тестов: kernel_base-тесты меняют глобальные статики
+/// (HHDM-offset, slab-хуки) — параллельный запуск cargo test их
+/// перемешивает. Гарант берётся тестом на весь тест.
+#[cfg(test)]
+pub mod test_guard {
+    use spin::mutex::SpinMutex;
+    pub static GLOBAL: SpinMutex<()> = SpinMutex::new(());
+}
 
 const MAX_CORES: usize = 255;
 

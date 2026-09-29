@@ -518,8 +518,8 @@ pub(crate) struct IntFrame {
     pub(crate) ss: u64,
 }
 
-/// Число информирующих векторов (0..31 — исключения; 32..96 — линии
-/// IRQ с реестром обработчиков; 96..256 молчат).
+/// Число информирующих векторов (0..31 — исключения; 32..255 —
+/// линии IRQ/MSI через irq::irq_vector_dispatch; 255 молчит — спурьё).
 const EXCEPTION_VECTORS: usize = 32;
 
 #[repr(align(16))]
@@ -528,10 +528,9 @@ static mut IDT: IdtTable = IdtTable([0; 512]);
 static mut IDT_PTR: DtablePtr = DtablePtr { limit: 0, base: 0 };
 
 /// Строит и загружает IDT: векторы 0..31 — информирующие стабы (печать
-/// регистров + halt), 32..95 — линии IRQ (реестр обработчиков
-/// irq::LINE_HOOKS, дефолт — пробуждение WaitIrq-ждущих), 96..256 —
-/// тихая заглушка (немаскируемых источников нет, но случайный вектор
-/// не должен убивать систему).
+/// регистров + halt), 32..254 — линии IRQ + MSI-пул (диспетчер
+/// irq::irq_vector_dispatch: хуки порта + пробуждение irq_wait-ждущих),
+/// 255 — спурьё LAPIC: тихая заглушка.
 pub fn load_idt() {
     // Указатели на стабы через fn-типы (прямой cast fn-item -> usize
     // даёт warning fn_to_numeric_cast).
@@ -542,7 +541,9 @@ pub fn load_idt() {
         stub16, stub17, stub18, stub19, stub20, stub21, stub22, stub23,
         stub24, stub25, stub26, stub27, stub28, stub29, stub30, stub31,
     ];
-    let irq_stubs: [StubFn; 64] = [
+    // Стабы векторов 32..=254 (линии + MSI-пул); 255 — спурьё LAPIC,
+    // молчит (stub_ignore).
+    let irq_stubs: [StubFn; 223] = [
         irq32, irq33, irq34, irq35, irq36, irq37, irq38, irq39,
         irq40, irq41, irq42, irq43, irq44, irq45, irq46, irq47,
         irq48, irq49, irq50, irq51, irq52, irq53, irq54, irq55,
@@ -551,15 +552,35 @@ pub fn load_idt() {
         irq72, irq73, irq74, irq75, irq76, irq77, irq78, irq79,
         irq80, irq81, irq82, irq83, irq84, irq85, irq86, irq87,
         irq88, irq89, irq90, irq91, irq92, irq93, irq94, irq95,
+        irq96, irq97, irq98, irq99, irq100, irq101, irq102, irq103,
+        irq104, irq105, irq106, irq107, irq108, irq109, irq110, irq111,
+        irq112, irq113, irq114, irq115, irq116, irq117, irq118, irq119,
+        irq120, irq121, irq122, irq123, irq124, irq125, irq126, irq127,
+        irq128, irq129, irq130, irq131, irq132, irq133, irq134, irq135,
+        irq136, irq137, irq138, irq139, irq140, irq141, irq142, irq143,
+        irq144, irq145, irq146, irq147, irq148, irq149, irq150, irq151,
+        irq152, irq153, irq154, irq155, irq156, irq157, irq158, irq159,
+        irq160, irq161, irq162, irq163, irq164, irq165, irq166, irq167,
+        irq168, irq169, irq170, irq171, irq172, irq173, irq174, irq175,
+        irq176, irq177, irq178, irq179, irq180, irq181, irq182, irq183,
+        irq184, irq185, irq186, irq187, irq188, irq189, irq190, irq191,
+        irq192, irq193, irq194, irq195, irq196, irq197, irq198, irq199,
+        irq200, irq201, irq202, irq203, irq204, irq205, irq206, irq207,
+        irq208, irq209, irq210, irq211, irq212, irq213, irq214, irq215,
+        irq216, irq217, irq218, irq219, irq220, irq221, irq222, irq223,
+        irq224, irq225, irq226, irq227, irq228, irq229, irq230, irq231,
+        irq232, irq233, irq234, irq235, irq236, irq237, irq238, irq239,
+        irq240, irq241, irq242, irq243, irq244, irq245, irq246, irq247,
+        irq248, irq249, irq250, irq251, irq252, irq253, irq254,
     ];
     let ignore: StubFn = stub_ignore;
     for i in 0..256 {
         let handler: usize = if i < EXCEPTION_VECTORS {
             stubs[i] as usize
-        } else if i < 96 {
+        } else if i < 255 {
             irq_stubs[i - 32] as usize
         } else {
-            ignore as usize
+            ignore as usize // 255 — спурьё LAPIC: молча
         };
         // Запись: off_lo:16 | sel:16 | ist:8 | type:8 | off_mid:16 | off_hi:32 | rsv:32
         let h = handler as u64;
@@ -930,6 +951,46 @@ irq_stub!(irq80, 80); irq_stub!(irq81, 81); irq_stub!(irq82, 82); irq_stub!(irq8
 irq_stub!(irq84, 84); irq_stub!(irq85, 85); irq_stub!(irq86, 86); irq_stub!(irq87, 87);
 irq_stub!(irq88, 88); irq_stub!(irq89, 89); irq_stub!(irq90, 90); irq_stub!(irq91, 91);
 irq_stub!(irq92, 92); irq_stub!(irq93, 93); irq_stub!(irq94, 94); irq_stub!(irq95, 95);
+irq_stub!(irq96, 96);irq_stub!(irq97, 97);irq_stub!(irq98, 98);irq_stub!(irq99, 99);
+irq_stub!(irq100, 100);irq_stub!(irq101, 101);irq_stub!(irq102, 102);irq_stub!(irq103, 103);
+irq_stub!(irq104, 104);irq_stub!(irq105, 105);irq_stub!(irq106, 106);irq_stub!(irq107, 107);
+irq_stub!(irq108, 108);irq_stub!(irq109, 109);irq_stub!(irq110, 110);irq_stub!(irq111, 111);
+irq_stub!(irq112, 112);irq_stub!(irq113, 113);irq_stub!(irq114, 114);irq_stub!(irq115, 115);
+irq_stub!(irq116, 116);irq_stub!(irq117, 117);irq_stub!(irq118, 118);irq_stub!(irq119, 119);
+irq_stub!(irq120, 120);irq_stub!(irq121, 121);irq_stub!(irq122, 122);irq_stub!(irq123, 123);
+irq_stub!(irq124, 124);irq_stub!(irq125, 125);irq_stub!(irq126, 126);irq_stub!(irq127, 127);
+irq_stub!(irq128, 128);irq_stub!(irq129, 129);irq_stub!(irq130, 130);irq_stub!(irq131, 131);
+irq_stub!(irq132, 132);irq_stub!(irq133, 133);irq_stub!(irq134, 134);irq_stub!(irq135, 135);
+irq_stub!(irq136, 136);irq_stub!(irq137, 137);irq_stub!(irq138, 138);irq_stub!(irq139, 139);
+irq_stub!(irq140, 140);irq_stub!(irq141, 141);irq_stub!(irq142, 142);irq_stub!(irq143, 143);
+irq_stub!(irq144, 144);irq_stub!(irq145, 145);irq_stub!(irq146, 146);irq_stub!(irq147, 147);
+irq_stub!(irq148, 148);irq_stub!(irq149, 149);irq_stub!(irq150, 150);irq_stub!(irq151, 151);
+irq_stub!(irq152, 152);irq_stub!(irq153, 153);irq_stub!(irq154, 154);irq_stub!(irq155, 155);
+irq_stub!(irq156, 156);irq_stub!(irq157, 157);irq_stub!(irq158, 158);irq_stub!(irq159, 159);
+irq_stub!(irq160, 160);irq_stub!(irq161, 161);irq_stub!(irq162, 162);irq_stub!(irq163, 163);
+irq_stub!(irq164, 164);irq_stub!(irq165, 165);irq_stub!(irq166, 166);irq_stub!(irq167, 167);
+irq_stub!(irq168, 168);irq_stub!(irq169, 169);irq_stub!(irq170, 170);irq_stub!(irq171, 171);
+irq_stub!(irq172, 172);irq_stub!(irq173, 173);irq_stub!(irq174, 174);irq_stub!(irq175, 175);
+irq_stub!(irq176, 176);irq_stub!(irq177, 177);irq_stub!(irq178, 178);irq_stub!(irq179, 179);
+irq_stub!(irq180, 180);irq_stub!(irq181, 181);irq_stub!(irq182, 182);irq_stub!(irq183, 183);
+irq_stub!(irq184, 184);irq_stub!(irq185, 185);irq_stub!(irq186, 186);irq_stub!(irq187, 187);
+irq_stub!(irq188, 188);irq_stub!(irq189, 189);irq_stub!(irq190, 190);irq_stub!(irq191, 191);
+irq_stub!(irq192, 192);irq_stub!(irq193, 193);irq_stub!(irq194, 194);irq_stub!(irq195, 195);
+irq_stub!(irq196, 196);irq_stub!(irq197, 197);irq_stub!(irq198, 198);irq_stub!(irq199, 199);
+irq_stub!(irq200, 200);irq_stub!(irq201, 201);irq_stub!(irq202, 202);irq_stub!(irq203, 203);
+irq_stub!(irq204, 204);irq_stub!(irq205, 205);irq_stub!(irq206, 206);irq_stub!(irq207, 207);
+irq_stub!(irq208, 208);irq_stub!(irq209, 209);irq_stub!(irq210, 210);irq_stub!(irq211, 211);
+irq_stub!(irq212, 212);irq_stub!(irq213, 213);irq_stub!(irq214, 214);irq_stub!(irq215, 215);
+irq_stub!(irq216, 216);irq_stub!(irq217, 217);irq_stub!(irq218, 218);irq_stub!(irq219, 219);
+irq_stub!(irq220, 220);irq_stub!(irq221, 221);irq_stub!(irq222, 222);irq_stub!(irq223, 223);
+irq_stub!(irq224, 224);irq_stub!(irq225, 225);irq_stub!(irq226, 226);irq_stub!(irq227, 227);
+irq_stub!(irq228, 228);irq_stub!(irq229, 229);irq_stub!(irq230, 230);irq_stub!(irq231, 231);
+irq_stub!(irq232, 232);irq_stub!(irq233, 233);irq_stub!(irq234, 234);irq_stub!(irq235, 235);
+irq_stub!(irq236, 236);irq_stub!(irq237, 237);irq_stub!(irq238, 238);irq_stub!(irq239, 239);
+irq_stub!(irq240, 240);irq_stub!(irq241, 241);irq_stub!(irq242, 242);irq_stub!(irq243, 243);
+irq_stub!(irq244, 244);irq_stub!(irq245, 245);irq_stub!(irq246, 246);irq_stub!(irq247, 247);
+irq_stub!(irq248, 248);irq_stub!(irq249, 249);irq_stub!(irq250, 250);irq_stub!(irq251, 251);
+irq_stub!(irq252, 252);irq_stub!(irq253, 253);irq_stub!(irq254, 254);
 
 /// Хвост IRQ-стабов. Кадр (низ→верх): [GPR x15][nr][rip][cs][rflags]
 /// [rsp][ss] — у внешних прерываний CPU НЕ кладёт код ошибки, стаб

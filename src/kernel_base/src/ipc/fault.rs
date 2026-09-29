@@ -466,6 +466,13 @@ pub fn deliver_fault<A: ArchImplementation + 'static>(
             abort_fault(slot);
             return false;
         }
+        ClaimResult::CapsRejected => {
+            // CAPS-квота обработчика исчерпана — конфигурация обработчика
+            // непригодна для доставки фолта (fail-closed, как TooSmall).
+            kernel_log!("fault: caps-квота обработчика {} исчерпана\n", handler);
+            abort_fault(slot);
+            return false;
+        }
         ClaimResult::NotWaiting => {
             // Медленный путь: ящик; обработчик заберёт фолт следующим
             // IPC_WAIT (take_pending, ветка is_fault — пометит доставку

@@ -1,7 +1,7 @@
 use crate::{
     lctl::LocalKernelCTL,
     traits::{
-        irq::IRQArchDefinedContext,
+        irq::{IRQArchDefinedContext, IrqChip},
         memory::{FrameAllocator, MemoryInterfaceKernel, MemoryInterfaceUserspace},
         syscall::SyscallDomain,
     },
@@ -32,6 +32,14 @@ pub trait ArchImplementation: Sized + 'static {
     /// [`ArchImplementation::iommu`].
     type Iommu: self::iommu::IommuUnit;
 
+    /// Бэкенд контроллеров прерываний платформы (см. traits::irq::IrqChip):
+    /// x86 — IO-APIC+LAPIC, ARM64 — GICv3, RISC-V — APLIC/IMSIC. Логика
+    /// (парсинг MADT/DT-узлов, регистры, векторы доставки) — собственность
+    /// порта; общий слой видит только логические линии. `None` — IRQ-
+    /// подсистема ещё не инициализирована (ранний бут) или платформа
+    /// без настраиваемого контроллера.
+    type IrqChip: IrqChip;
+
     fn init_base_state() -> Self;
 
     fn reclaim_memory(allocator: &dyn FrameAllocator) -> Self::KMap;
@@ -58,6 +66,11 @@ pub trait ArchImplementation: Sized + 'static {
     /// Единственная точка доступа к IOMMU из архитектурно-независимого кода.
     /// `None` — платформа без IOMMU либо порт ещё не инициализировал юниты.
     fn iommu() -> Option<&'static Self::Iommu>;
+
+    /// Единственная точка доступа к контроллерам прерываний из
+    /// архитектурно-независимого кода (syscall-слой IRQ-домена).
+    /// `None` — подсистема не инициализирована портом.
+    fn irq_chip() -> Option<&'static Self::IrqChip>;
 
     /// Создаёт пользовательское адресное пространство задачи из ядерной
     /// таблицы (верхняя половина копируется). Связывает KMap::UserspaceMap

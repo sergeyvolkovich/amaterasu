@@ -208,6 +208,21 @@ pub trait IommuTokenLayer: crate::traits::ArchImplementation {
     fn map_dma(&self, token: u64, iova: usize, phys: usize, pages: usize, prot: IommuProtection) -> Result<(), IommuError>;
     fn unmap_dma(&self, token: u64, iova: usize, pages: usize) -> Result<(), IommuError>;
 
+    /// DMA-привязка (MapDmaVa): домен запоминает, чей регион pinned под
+    /// (iova), чтобы UnmapDma снял pin с umap источника (FREE_PAGES
+    /// запрещён, пока привязки живы — иначе use-after-free под DMA).
+    /// Slab-ошибка — E_SLAB (привязка НЕ установлена).
+    fn record_dma_pin(
+        &self,
+        token: u64,
+        iova: usize,
+        owner: u64,
+        virt_base: usize,
+    ) -> Result<(), TokenError>;
+    /// Снимает запись привязки (UnmapDma); None — маппинг ставился
+    /// сырым MapDma (без pin-учёта). Возврат — (owner, virt_base).
+    fn take_dma_pin(&self, token: u64, iova: usize) -> Option<(u64, usize)>;
+
     // ── PASID v2 (см. документацию трейта) ──
 
     /// Создаёт PASID-пространство над доменом. `sva_root` — готовый

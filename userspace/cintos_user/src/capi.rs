@@ -299,10 +299,11 @@ pub extern "C" fn cint_fb_finish(ctx: *mut c_void, out_len: *mut u64) -> *const 
     }
 }
 
-// ─── Таймер (L4-модель: тик — линия IRQ0) ──────────────────────────────────
+// ─── Таймер (L4-модель v2: тик — капа IrqLine на GSI из TASK_STATS) ────────
 
-/// Линия тика и частота (зеркала kernel_limine/kernel_x86::timer).
-pub const CINT_TIMER_LINE: u32 = crate::timer::TIMER_IRQ_LINE;
+/// Частота тика (зеркало kernel_limine/kernel_x86::timer). Линия тика —
+/// динамика платформы (GSI из MADT): берите из TASK_STATS (слово [10]);
+/// на legacy-платформе — timer::FALLBACK_TIMER_LINE (0).
 pub const CINT_TICK_HZ: u64 = crate::timer::TICK_HZ;
 
 /// Уснуть до ближайшего тика таймера. buf — массив 2×u64
@@ -315,10 +316,36 @@ pub extern "C" fn cint_wait_tick(buf: *mut u64) -> u64 {
     }
     // SAFETY: buf — валидная память на 2×u64 (контракт C-ABI).
     let arr = unsafe { &mut *(buf.cast::<[u64; 2]>()) };
-    match crate::timer::wait_tick(arr) {
+    // v2: клеймят лениво при первом вызове (капа в TICK_CAP_SLOT);
+    // линия — из TASK_STATS (u32::MAX/сбой — legacy-линия 0).
+    match lazy_claim_tick() {
+        Ok(()) => {}
+        Err(crate::syscall::SyscallError::Kernel(code)) => return code,
+        Err(_) => return abi::result::E_INTERNAL,
+    }
+    let caps = crate::timer::tick_caps_buf();
+    match crate::timer::wait_tick(arr, &caps) {
         Ok(_) => 0,
         Err(crate::syscall::SyscallError::Kernel(code)) => code,
     }
+}
+
+/// Ленивый claim линии тика (один раз на процесс; атомарный флаг).
+fn lazy_claim_tick() -> Result<(), crate::syscall::SyscallError> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    if CLAIMED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let self_cap = crate::crt0::auxv_get(crate::abi::auxv::AT_CINTOS_SELF_CAP)
+        .unwrap_or(u64::MAX);
+    let mut sbuf = crate::stats::stats_buf();
+    let line = crate::stats::task_stats(self_cap, &mut sbuf)
+        .map(|s| s.timer_line)
+        .unwrap_or(crate::timer::FALLBACK_TIMER_LINE);
+    crate::timer::claim_tick_line(self_cap, line)?;
+    CLAIMED.store(true, Ordering::Release);
+    Ok(())
 }
 
 // ─── Статистика (перенос отчётности в юзерспейс) ───────────────────────────

@@ -33,6 +33,10 @@ pub mod result {
     pub const E_INTERNAL: u64 = SYSCALL_ERROR_FLAG | 12;
     /// Сисколл известен, но не реализован ядром (зеркало kernel_base).
     pub const E_NOT_IMPLEMENTED: u64 = SYSCALL_ERROR_FLAG | 13;
+    /// Ресурс занят DMA-привязкой (FREE_PAGES под pin'ом IOMMU).
+    pub const E_BUSY: u64 = SYSCALL_ERROR_FLAG | 14;
+    /// Истёк дедлайн IPC_WAIT (deadline > 0).
+    pub const E_TIMEOUT: u64 = SYSCALL_ERROR_FLAG | 15;
 
     /// Успех/ошибка по старшему биту.
     #[inline]
@@ -76,7 +80,11 @@ pub mod nr {
     pub const CAP_CREATE_IPC_POOL: u64 = 17;
     /// Capability: создать MMIO-регион.
     pub const CAP_CREATE_MMIO: u64 = 18;
-    /// Capability: создать IRQ.
+    /// Capability: создать капу на ЛОГИЧЕСКУЮ линию IRQ (v2 — не
+    /// «cpu+вектор», а GSI/MSI платформы). Аргументы: owner_task_cap,
+    /// dst_slot, line, trigger (0=edge, 1=level). Линия обязана быть
+    /// свободна (иначе E_BUSY); успех — линия занята владельцем,
+    /// замаскирована, капа в dst_slot.
     pub const CAP_CREATE_IRQ: u64 = 19;
     /// Capability: mint (производная копия с сужением прав).
     pub const CAP_MINT: u64 = 20;
@@ -95,7 +103,7 @@ pub mod nr {
     /// физику резолвит ядро, монтаж получателем — MOUNT_CAP_REGION).
     pub const CAP_CREATE_SHARED: u64 = 25;
     /// Capability: фолт-эндпоинт — фиксирует ТЕКУЩУЮ задачу как
-    /// обработчика фолтов (seL4 fault endpoint / KeyKOS keeper).
+    /// обработчика фолтов (handler = вызывающий).
     pub const CAP_CREATE_FAULT_ENDPOINT: u64 = 26;
 
     /// Фолты: привязать эндпоинт к задаче-цели (её TaskTCB-слот) —
@@ -119,8 +127,24 @@ pub mod nr {
     /// и целевого). Возврат — task_cap_id ребёнка (кладётся в dst_slot).
     pub const TASK_CREATE_FROM_MEM: u64 = 49;
 
-    /// IRQ: сон до срабатывания линий + маска сработавших.
+    /// IRQ (v2): сон до срабатывания линий; линии адресуются КАПАМИ
+    /// IrqLine (список слотов cspace вызывающего), а не сырым битмапом.
+    /// caps_ptr — VA массива слотов (u64), caps_len 1..=8; mask_ptr —
+    /// VA результата `[count][line]...` (обе массы — в одной странице).
+    /// WAIT размаскирует линии набора (claim маскирует — уровневые
+    /// линии не спамят между ожиданиями).
     pub const IRQ_WAIT: u64 = 28;
+
+    /// IRQ (v2): выделить MSI-линии (message-backed) из пространства чипа:
+    /// count линий, корневые капы в слоты first_dst_slot.., MSI-сообщения
+    /// (по 4 u64: [line, address, data, trigger]) в буфер msgs_ptr.
+    /// Линия остаётся замаскированной до первого WAIT (для MSI маска
+    /// программная — доставка вектора без ждущих роняется диспетчером).
+    pub const IRQ_MSI_ALLOC: u64 = 51;
+
+    /// IRQ (v2): владелец возвращает линию платформе (маска + снятие
+    /// записи реестра + тумбстоун капы в слоте slot).
+    pub const IRQ_RELEASE: u64 = 52;
 
     /// Статистика: снапшот счётчиков задачи + глобальные тики/частота
     /// (перенос статистики в юзерспейс; самоинспекция — без прав).
@@ -133,8 +157,8 @@ pub mod nr {
     pub const DBG_LOG_READ: u64 = 46;
 
     // РАСКЛАД NR (зеркало ядра v2): sched/mem 0..8, ipc 10/11,
-    // capability 16..26, fault 27/30, irq 28, stats 29, IOMMU 32..45,
-    // log 46/47, exec 48/49.
+    // capability 16..26, fault 27/30, irq 28/51/52, stats 29, IOMMU
+    // 32..45 + MapDmaVa 50, log 46/47, exec 48/49.
 
     /// IOMMU: создать DMA-домен.
     pub const IOMMU_CREATE_DOMAIN: u64 = 32;
@@ -165,6 +189,13 @@ pub mod nr {
     pub const IOMMU_DESTROY_DOMAIN: u64 = 44;
     /// IOMMU (v2): отвязать устройство от домена.
     pub const IOMMU_DETACH_DEVICE: u64 = 45;
+
+    /// IOMMU (DMA-buf): DMA-маппинг ИЗ ПАМЯТИ ВЫЗЫВАЮЩЕГО — ядро резолвит
+    /// VA -> физика по VmapRegion, пинит регион (FREE_PAGES под пином —
+    /// E_BUSY), UnmapDma снимает pin. task_cap/cap_slot — капа домена,
+    /// iova — устройство видит этот адрес, va — источник в СВОЁМ
+    /// пространстве (обязан лежать в одной ALLOC_PAGES-аллокации).
+    pub const IOMMU_MAP_DMA_VA: u64 = 50;
 }
 
 /// Биты NamespaceRights (зеркало kernel_base::access::namespace::

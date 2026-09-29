@@ -224,8 +224,11 @@ pub fn destroy_task_full<A: ArchImplementation>(
             }
 
             // IRQ: реестр ожиданий не должен течь (мёртвая задача
-            // никогда не перевызовет WaitIrq).
+            // никогда не перевызовет WaitIrq), линии владельца
+            // возвращаются платформе (маскирование — через колбэк
+            // порта, см. crate::irq::set_mask_callback).
             crate::task::irq_wait::unregister_task_wait(task_cap_id);
+            crate::irq::teardown_task(task_cap_id);
 
             // Фолты (ipc::fault): биндинги снимаются, упавшие под
             // умершим обработчиком БУДЯТСЯ — задача повторит упавшую
@@ -236,6 +239,11 @@ pub fn destroy_task_full<A: ArchImplementation>(
             for wait_object in crate::ipc::fault::on_task_destroyed(task_cap_id) {
                 lctl.scheduler_release_object(wait_object);
             }
+
+            // Дедлайны (IPC_WAIT deadline): слот погибшей задачи больше
+            // не пригодится — хендлер не проснётся, тик не должен будить
+            // мёртвую (слот снимаем до-IOMMU-хука, безусловно).
+            crate::task::deadline::remove_task(task_cap_id);
 
             // IOMMU (v2): единственная точка, где центральная политика
             // знает о смерти задачи. Порт (kernel_limine) регистрирует

@@ -36,6 +36,9 @@ pub struct TaskStats {
     pub global_ticks: u64,
     /// Частота тика (Гц), объявленная портом (0 — без таймера).
     pub tick_hz: u64,
+    /// Логическая линия тика таймера (u32::MAX — таймер не поднят):
+    /// таймер-сервер берёт её капой (CAP_CREATE_IRQ) и ждёт WAIT'ом.
+    pub timer_line: u64,
 }
 
 /// Буфер под снапшот (16 u64-слов, выравнивание u64).
@@ -75,5 +78,6 @@ pub fn parse(buf: &StatsBuf) -> Option<TaskStats> {
         blocks: buf[7],
         global_ticks: buf[8],
         tick_hz: buf[9],
+        timer_line: buf[10],
     })
 }
