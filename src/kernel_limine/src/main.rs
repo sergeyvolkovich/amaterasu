@@ -123,6 +123,10 @@ static mut BOOT_MODULES: [BootModule<'static>; MAX_BOOT_MODULES] =
 /// (init_into) и const-инициализацией SCHEDULERS этого трафика больше нет.
 const BOOT_STACK_BYTES: usize = 64 * 1024;
 
+/// Частота системного тика: PIT-линия на BSP и LAPIC-таймер на AP —
+/// единая константа (калибровка AP-таймера идёт от этого же числа).
+const TIMER_HZ: u32 = 100;
+
 /// Собственный стартовый стек BSP в .bss (не в reclaimable-памяти
 /// загрузчика!): стек Limine живёт в BOOTLOADER_RECLAIMABLE регионах —
 /// после возврата их в FrameAllocator (reclaim в KernelCTL::init_into)
@@ -259,6 +263,9 @@ fn boot_main() -> ! {
     iommu_early_init(boot_info, fm);
     let kctl = kernel_up(fm, boot_info);
     exec_up(kctl, boot_info, fm);
+    // 11.2. Калибровка LAPIC-таймера по PIT-каналу 2 — ДО подъёма AP:
+    // ap_main программирует локальный тик откалиброванным счётом.
+    kernel_x86::timer::calibrate_lapic_timer(TIMER_HZ);
     smp_up(fm);
     time_up();
     run()
@@ -743,18 +750,22 @@ fn smp_up(fm: &'static FrameManager) {
     }
 }
 
-/// 11.5-11.8. ТАЙМЕР: PIT на 100 Гц + хук линии 0 (учёт статистики ядром +
+/// 11.5-11.8. ТАЙМЕР: PIT на 100 Гц + хук линии (учёт статистики ядром +
 /// доставка тика юзерспейс-таймер-серверу через WaitIrq — L4-модель
 /// «таймер — сервис юзерспейса»). Источник стартует после подъёма AP:
 /// до этого BOOTLOADER_RECLAIMABLE-транзакции smp::bringup_aps не
 /// должны прерываться тиками. Затем — маскируемые прерывания (BSP):
 /// тик таймера периодически входит в irq_common, ведёт учёт
-/// (cpu_ticks/uptime) и будит ждущих. AP остаются с IF=0 (их циклы
-/// диспетчеризации поллят готовность; межъядерные IPI — отдельный этап).
+/// (cpu_ticks/uptime) и будит ждущих. AP тикают собственным LAPIC-
+/// таймером (timer.rs, вектор ipi::LOCAL_TIMER_VECTOR) — их STI
+/// в ap_online сразу после постановки в онлайновую IPI-маску.
 fn time_up() {
-    kernel_x86::timer::start_periodic_tick(100);
+    kernel_x86::timer::start_periodic_tick(TIMER_HZ);
+    // BSP в онлайновую IPI-маску — непосредственно перед STI: с этого
+    // момента другие ядра имеют право ждать от нас подтверждений IPI.
+    kernel_x86::ipi::mark_cpu_online();
     X86Backend::irq_enable();
-    kernel_log!("irq: STI (BSP) — тики таймера активны\n");
+    kernel_log!("irq: STI (BSP) — тики таймера активны, IPI-маска {:#x}\n", kernel_x86::ipi::online_mask());
 }
 
 /// 12. Отчёт по стекам + вход в цикл планировщика BSP (не возвращается;
@@ -920,14 +931,20 @@ fn task_kill_x86(
     }
 }
 
-/// Хук AP-онлайна (политика фронта): планировщик этого ядра + цикл
-/// диспетчеризации. Не возвращается (контракт smp::ApOnlineHook).
+/// Хук AP-онлайна (политика фронта): планировщик этого ядра + онлайновая
+/// IPI-маска + включение прерываний + цикл диспетчеризации. Не возвращает
+/// (контракт smp::ApOnlineHook).
 fn ap_online(core_slot: usize) -> ! {
     install_scheduler(core_slot);
+    // Онлайн для IPI-протоколов (шутдаун ждёт наших подтверждений) —
+    // строго ДО STI: между отметкой и включением IF нет окон, т.к. IPI
+    // начнёт доставляться только с STI, а отметка уже стоит.
+    kernel_x86::ipi::mark_cpu_online();
+    X86Backend::irq_enable();
     // High-water отчёт по стеку цикла планировщика этого AP (залит
     // паттерном в setup_cpu_area; сюда AP уже успел поработать).
     kernel_log!(
-        "smp: AP {} онлайн, стек цикла: пик ≈{} КиБ из {} КиБ\n",
+        "smp: AP {} онлайн (IF=1, тик LAPIC), стек цикла: пик ≈{} КиБ из {} КиБ\n",
         core_slot,
         cswitch::sched_stack_used(core_slot) / 1024,
         32

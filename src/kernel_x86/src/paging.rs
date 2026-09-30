@@ -571,6 +571,11 @@ impl MemoryInterfaceUserspace for X86Umap {
             unmap_leaf(self.root_phys, virt + i * PAGE_SIZE, LeafSize::P4K);
             flush_if_active(self.root_phys, virt + i * PAGE_SIZE);
         }
+        // Remote TLB-shootdown: на ДРУГИХ ядрах, исполняющих этот же
+        // корень, остаются устаревшие записи — синхронная инвалидация
+        // через IPI (ipi.rs: очередь+поколение+ack). Ранний бут/уни-
+        // процессор вырождается в no-op внутри (маска целей пуста).
+        crate::ipi::shootdown_range(self.root_phys, virt, p_base.pages());
         Ok(())
     }
 

@@ -332,6 +332,13 @@ fn gs_base_slot() -> Option<usize> {
     Some(off / core::mem::size_of::<PerCpuArea>())
 }
 
+/// Слот ТЕКУЩЕГО ядра (публично: IPI-слой и отладка). `None` — per-CPU
+/// область ещё не установлена (ранний бут; ядро в этот момент одно и
+/// межъядерные протоколы вырождаются в no-op).
+pub fn current_cpu_slot() -> Option<usize> {
+    gs_base_slot()
+}
+
 /// Установка per-CPU lctl (реализация ArchImplementation::set_ktls_block).
 ///
 /// ДВА ПУТИ: AP уже настроил свою область (smp::ap_entry → GS base) —

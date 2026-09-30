@@ -1,6 +1,13 @@
 //! Системный тик: PIT (Intel 8253/8254, канал 0) → IO-APIC (GSI из
 //! override для ISA 0, обычно GSI 2) → хук ядра.
 //!
+//! ТАЙМЕР НА AP: у каждого AP — собственный LAPIC-таймер (LVT, periodic,
+//! вектор LOCAL_TIMER_VECTOR из ipi.rs), калиброванный на BSP по
+//! PIT-каналу 2 ДО подъёма AP (calibrate_lapic_timer). BSP продолжает
+//! тикать PIT-линией; AP — локальным таймером (доставка на своё ядро,
+//! учёт per-CPU, преемпция ring3 на этом ядре). Локальный тик — НЕ
+//! линия IRQ: пробуждение ждущих irq_wait не требуется.
+//!
 //! РАСПРЕДЕЛЕНИЕ ОТВЕТСТВЕННОСТИ (L4-философия «таймер — юзерспейсный
 //! сервис», ядро — только транспорт, учёт и вытеснение):
 //!   - АРХ-БЕКЕНД (этот модуль): программирует PIT, маршрут GSI в
@@ -26,17 +33,32 @@
 //! EOI шлёт диспетчер (irq::irq_vector_dispatch) ПОСЛЕ хука — по
 //! стандартному контракту «подтверждать после обработки».
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use kernel_base::kernel_log;
 use kernel_base::lctl::LocalKernelCTL;
 use kernel_base::task::stats;
 use kernel_base::traits::scheduller::TaskExecStatus;
 
+use crate::apic;
 use crate::irq;
 use crate::paging::X86Umap;
 use crate::pic;
 
 /// Линия таймера в legacy-режиме (PIT → IRQ0 → вектор 32).
 pub const LEGACY_TIMER_LINE: u32 = 0;
+
+/// Делитель счёта LAPIC-таймера (см. apic::TIMER_DIVIDE_16).
+const LAPIC_DIVIDE: u32 = apic::TIMER_DIVIDE_16;
+/// Окно калибровки LAPIC-таймера (PIT-канал 2, one-shot, мс).
+const CALIBRATION_MS: u64 = 50;
+/// Фоллбэк counts/тик, если калибровка не удалась (предположение
+/// «шина LAPIC ≈ 100 МГц» / делитель 16: 100e6/16/100 Гц = 62500).
+const LAPIC_COUNTS_FALLBACK: u32 = 62_500;
+
+/// Откалиброванный счёт LAPIC-таймера на ОДИН тик (0 — не калиброван:
+/// AP стартуют без локального тика, лог выводится один раз).
+static LAPIC_COUNTS_PER_TICK: AtomicU32 = AtomicU32::new(0);
 
 /// GSI линии таймера (заполняется start_periodic_tick; для диагностики
 /// и будущего bootinfo-расширения).
@@ -48,8 +70,14 @@ const PIT_INPUT_HZ: u32 = 1_193_182;
 /// Порт канала 0 PIT и порт команд.
 const PIT_CH0_DATA: u16 = 0x40;
 const PIT_MODE_CMD: u16 = 0x43;
+/// Порт канала 2 (используется для калибровки LAPIC) и порт B NMI/спикера.
+const PIT_CH2_DATA: u16 = 0x42;
+const PORT_61: u16 = 0x61;
 /// Режим 3 (square wave), двоичный счёт, доступ lo/hi байта.
 const PIT_MODE3_LOHI: u8 = 0b0011_0110;
+/// Режим 0 (one-shot, прерывание по терминальному счёту) канала 2,
+/// доступ lo/hi: BCD=0, mode=000, RL=11, CH=10 → 0b1011_0000.
+const PIT_CH2_MODE0_LOHI: u8 = 0b1011_0000;
 
 /// Запускает периодический тик: ремап+маска PIC, программирование PIT
 /// канала 0, маршрут GSI таймера в IO-APIC (или размаска PIC в legacy),
@@ -142,5 +170,148 @@ fn timer_tick_hook(_line: u32, lctl: &mut LocalKernelCTL<X86Umap>, from_user: bo
             }
             _ => {}
         }
+    }
+}
+
+// ─── LAPIC-таймер: калибровка + тик на AP ────────────────────────────────────
+
+/// Кубликация чистой математики калибровки для хост-тестов: elapsed —
+/// счёт LAPIC (делитель уже учтён: счётчик тикает на шине/делитель),
+/// вычисляет counts на один тик частоты hz.
+fn counts_per_tick_from(elapsed: u32, window_ms: u64, hz: u32) -> u32 {
+    let per_sec = (elapsed as u64) * 1000 / window_ms.max(1);
+    (per_sec / hz.max(1) as u64) as u32
+}
+
+/// Калибровка LAPIC-таймера по PIT-каналу 2 (BSP, IF=0 — прерывания
+/// ещё не включены, доставка не мешает измерению; LVT-таймер маскирован).
+///
+/// Схема: PIT ch2 в one-shot на ~50 мс (гейт через порт 0x61, спикер
+/// выключен — канал 0 не трогаем, системный тик остаётся PIT'овским);
+/// параллельно LAPIC-таймер считает от u32::MAX вниз; по OUT2 читаем
+/// elapsed → частота счётчика → counts на один тик частоты hz.
+///
+/// ВАЖНО: вызывается ДО подъёма AP (smp_up) — AP-циклы программируют
+/// свой LVT-таймер откалиброванным счётом (start_ap_tick).
+pub fn calibrate_lapic_timer(hz: u32) {
+    if !apic::active() {
+        kernel_log!("timer: LAPIC неактивен — AP без локального тика\n");
+        return;
+    }
+
+    use x86_64::instructions::port::Port;
+    use x86_64::instructions::port::PortGeneric;
+    use x86_64::instructions::port::ReadWriteAccess;
+
+    // 1. Программируем PIT ch2: one-shot, счёт на ~CALIBRATION_MS.
+    let window_ticks = PIT_INPUT_HZ as u64 * CALIBRATION_MS / 1000;
+    let mut mode = x86_64::instructions::port::PortWriteOnly::new(PIT_MODE_CMD);
+    let mut ch2 = x86_64::instructions::port::PortWriteOnly::new(PIT_CH2_DATA);
+    unsafe {
+        mode.write(PIT_CH2_MODE0_LOHI);
+        ch2.write((window_ticks & 0xFF) as u8);
+        ch2.write((window_ticks >> 8) as u8);
+    }
+
+    // 2. Старт LAPIC-счёта (маскирован — только счёт).
+    apic::timer_oneshot_calibration_start(LAPIC_DIVIDE);
+
+    // 3. Гейт ch2 (порт 0x61: bit0 GATE2=1, bit1 SPKR=0), старт PIT-окна.
+    let mut port61: PortGeneric<u8, ReadWriteAccess> = Port::new(PORT_61);
+    // SAFETY: порт 0x61 — стандартный контроллер NMI/спикера.
+    let p61 = unsafe { port61.read() };
+    unsafe { port61.write((p61 & !0b10) | 1) };
+
+    // 4. Ждём OUT2 (bit5) с bounded-спином (хост-время ~50 мс; TCG —
+    //    дольше по хост-циклам, но bound задан с запасом).
+    let mut timed_out = true;
+    for _ in 0..(1u64 << 34) {
+        // SAFETY: см. выше.
+        if unsafe { port61.read() } & (1 << 5) != 0 {
+            timed_out = false;
+            break;
+        }
+    }
+
+    // 5. Читаем elapsed LAPIC, глушим канал (гейт) и LVT-таймер.
+    let elapsed = u32::MAX - apic::timer_current_count();
+    // SAFETY: см. выше.
+    let p61_end = unsafe { port61.read() };
+    unsafe { port61.write(p61_end & !1) };
+    apic::timer_mask();
+
+    let counts = if timed_out || elapsed == 0 {
+        kernel_log!(
+            "timer: калибровка LAPIC не удалась (timeout={}, elapsed={}) — фоллбэк {} counts/тик\n",
+            timed_out,
+            elapsed,
+            LAPIC_COUNTS_FALLBACK
+        );
+        LAPIC_COUNTS_FALLBACK
+    } else {
+        let c = counts_per_tick_from(elapsed, CALIBRATION_MS, hz).max(16);
+        kernel_log!(
+            "timer: LAPIC калиброван: elapsed {} за {} мс → {} counts/тик при {} Гц (делитель /16)\n",
+            elapsed,
+            CALIBRATION_MS,
+            c,
+            hz
+        );
+        c
+    };
+    LAPIC_COUNTS_PER_TICK.store(counts, Ordering::Release);
+}
+
+/// Программирует LVT-таймер ТЕКУЩЕГО ядра (AP): periodic, вектор
+/// LOCAL_TIMER_VECTOR, откалиброванный счёт. Вызывается из ap_main
+/// после apic::init_ap, до включения прерываний фронтом.
+pub fn start_ap_tick() {
+    let counts = LAPIC_COUNTS_PER_TICK.load(Ordering::Acquire);
+    if counts == 0 {
+        // Калибровка не проводилась/не удалась: тик на AP не стартует —
+        // AP продолжает кооперативную модель (поллинг цикла планировщика).
+        return;
+    }
+    apic::timer_program_periodic(crate::ipi::LOCAL_TIMER_VECTOR, counts, LAPIC_DIVIDE);
+}
+
+/// Диспетчеризация локального тика (вектор LOCAL_TIMER_VECTOR, только
+/// AP; BSP тикает PIT-линией через irq_vector_dispatch). Это НЕ линия:
+/// пробуждение irq_wait-ждущих не требуется — только учёт ядра.
+/// EOI отправит диспетчер после возврата.
+pub fn local_timer_dispatch(lctl: &mut LocalKernelCTL<X86Umap>, from_user: bool) {
+    timer_tick_hook(TIMER_GSI.load(Ordering::Relaxed), lctl, from_user);
+}
+
+// ─── Тесты (хост: чистая математика калибровки) ──────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_math_divides_counts_per_second() {
+        // LAPIC насчитал 500_000 тиков за 50 мс → 10 МГц → 100 Гц тик:
+        // 100_000 counts/тик.
+        assert_eq!(counts_per_tick_from(500_000, 50, 100), 100_000);
+        // 1_250_000 за 50 мс → 25 МГц → 250_000 counts/тик.
+        assert_eq!(counts_per_tick_from(1_250_000, 50, 100), 250_000);
+        // Некруглые частоты тика (125 Гц).
+        assert_eq!(counts_per_tick_from(500_000, 50, 125), 80_000);
+    }
+
+    #[test]
+    fn calibration_math_is_zero_safe() {
+        // Нулевые окно/частота не паникуют (max(1) внутри).
+        assert_eq!(counts_per_tick_from(1_000, 0, 100), 10_000);
+        assert_eq!(counts_per_tick_from(1_000, 50, 0), 20_000);
+    }
+
+    #[test]
+    fn calibration_counts_fit_32bit_initial_count() {
+        // Делитель /16: даже шина 4 ГГц даёт 250 МГц счётчик →
+        // 2.5 М counts/тик при 100 Гц — помещается в u32.
+        let worst_case = counts_per_tick_from(u32::MAX, 50, 100);
+        assert!(worst_case <= u32::MAX);
     }
 }

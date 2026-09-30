@@ -140,7 +140,8 @@ pub fn irq_restore_state(was_enabled: bool) {
 // ─── Чип прерываний (IrqChip) ────────────────────────────────────────────────
 
 /// Ёмкость MSI-пространства (линий). Ограничена векторами: wired-векторы
-/// 32..32+wired, MSI — от базиса до 254 (255 — спурьё).
+/// 32..32+wired, MSI — от базиса до начала СЛУЖЕБНОГО пространства IPI
+/// (250; 255 — спурьё).
 pub const MSI_POOL_MAX: u32 = 64;
 
 /// Реализация IrqChip поверх IO-APIC + LAPIC (+ MSI-сообщения LAPIC).
@@ -308,9 +309,11 @@ pub unsafe fn init_from_boot(boot: &crate::boot::BootBackend) -> bool {
                 if pool.is_some() {
                     let wired = crate::ioapic::wired_line_count();
                     // Векторы MSI: базис = align16(32 + wired), пул ограничен
-                    // 254 (спурьё 255 не входит в доставку).
+                    // началом служебного пространства IPI (ipi.rs:
+                    // таймер/шутдаун/ресчед — выше только спурьё 255).
                     let vec_base = (32 + wired).div_ceil(16) * 16;
-                    let pool_capacity = MSI_POOL_MAX.min(255u32.saturating_sub(vec_base));
+                    let pool_capacity = MSI_POOL_MAX
+                        .min(crate::ipi::IPI_VECTOR_SPACE_BASE.saturating_sub(vec_base));
                     // Колбэк маскирования teardown'а (kernel_base).
                     kernel_base::irq::set_mask_callback(mask_line_for_teardown);
                     return X86IrqChip {
@@ -398,6 +401,35 @@ pub fn irq_vector_dispatch(
         return;
     }
     let v = vector as u32;
+
+    // Служебное пространство LAPIC (не линии): локальный таймер AP + IPI.
+    // Доставка возможна только при активном LAPIC (на BSP без IO-APIC/
+    // legacy-PIC эти векторы появиться не могут — гейт бесплатный).
+    if crate::apic::active() {
+        if v == crate::ipi::LOCAL_TIMER_VECTOR as u32 {
+            // Локальный тик AP: учёт + дедлайны + преемпция ring3 (тот
+            // же хук, что у PIT-тика BSP; это НЕ линия — пробуждение
+            // irq_wait-ждущих не требуется).
+            crate::timer::local_timer_dispatch(lctl, from_user);
+            crate::apic::eoi();
+            return;
+        }
+        if v == crate::ipi::IPI_TLB_SHOOTDOWN_VECTOR as u32 {
+            crate::ipi::on_shootdown_ipi();
+            crate::apic::eoi();
+            return;
+        }
+        if v == crate::ipi::IPI_RESCHED_VECTOR as u32 {
+            crate::ipi::on_resched_ipi();
+            crate::apic::eoi();
+            return;
+        }
+        if v == crate::ipi::IPI_HALT_VECTOR as u32 {
+            crate::ipi::on_halt_ipi();
+            crate::apic::eoi();
+            return;
+        }
+    }
 
     // Вектор → линия: legacy-PIC (32..47 → 0..15), IO-APIC (32+wired),
     // MSI (msi_vector_base..). Чип может быть ещё не поднят (ранний IRQ
@@ -533,10 +565,11 @@ mod tests {
         assert!(legacy.msi_vector(16).is_none());
 
         // QEMU-подобный чип: 24 GSI → MSI-базис линий 24, векторы с 48.
+        // Cap — служебное пространство IPI (250), а не 255.
         let qemu = X86IrqChip {
             wired: 24,
             msi_line_base: 24,
-            msi_capacity: MSI_POOL_MAX.min(255 - 48),
+            msi_capacity: MSI_POOL_MAX.min(crate::ipi::IPI_VECTOR_SPACE_BASE - 48),
             msi_vector_base: 48,
             legacy: false,
         };
@@ -546,8 +579,16 @@ mod tests {
         assert_eq!(qemu.msi_vector(24 + 63), Some(48 + 63));
         assert!(qemu.msi_vector(23).is_none(), "проводная — не MSI");
         assert!(qemu.msi_vector(24 + 64).is_none(), "за пулом");
-        // Последний MSI-вектор не задевает спурьё (255).
-        assert!(48 + 63 < 255);
+        // Последний MSI-вектор не задевает служебное IPI-пространство.
+        assert!(48 + 63 < crate::ipi::IPI_VECTOR_SPACE_BASE);
+
+        // Много wired: базис MSI вылезает за служебное пространство —
+        // ёмкость обрезается в ноль (init_from_boot — saturating_sub).
+        let big_wired_vec_base = (32 + 230u32).div_ceil(16) * 16; // 272 > 250
+        assert_eq!(
+            MSI_POOL_MAX.min(crate::ipi::IPI_VECTOR_SPACE_BASE.saturating_sub(big_wired_vec_base)),
+            0
+        );
     }
 
     #[test]

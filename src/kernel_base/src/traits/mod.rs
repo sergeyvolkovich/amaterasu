@@ -10,6 +10,7 @@ use crate::{
 pub mod dma;
 pub mod hwinfo;
 pub mod iommu;
+pub mod ipi;
 pub mod irq;
 pub mod memory;
 pub mod scheduller;

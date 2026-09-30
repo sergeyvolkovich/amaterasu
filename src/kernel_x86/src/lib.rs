@@ -19,6 +19,7 @@ pub mod cswitch;
 pub mod fault;
 pub mod ioapic;
 pub mod iommu;
+pub mod ipi;
 pub mod irq;
 pub mod paging;
 pub mod pic;

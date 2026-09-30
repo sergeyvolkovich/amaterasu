@@ -8,10 +8,13 @@
 //!   - x2APIC (MSR 0x800..): обнаруживается по биту 10 IA32_APIC_BASE;
 //!     EOI/id/спурьё идут через MSR.
 //!
-//! ЕДИНИСТВЕННОЕ, что нужно ядру от LAPIC в v2: EOI после обработки
-//! прерывания (диспетчер irq.rs), чтение ID (RTE-дестинейшены IO-APIC
-//! и MSI-сообщения адресуются на BSP) и глушение LVT-источников, которые
-//! загрузчик мог оставить активными (LINT0/1, таймер, perf, thermal).
+//! ЧТО НУЖНО ЯДРУ ОТ LAPIC: EOI после обработки прерывания (диспетчер
+//! irq.rs), чтение ID (RTE-дестинейшены IO-APIC и MSI-сообщения
+//! адресуются на BSP), отправка IPI через ICR (kernel_x86::ipi:
+//! TLB-shootdown/resched/halt), локальный LVT-таймер (тик на AP —
+//! timer.rs) и глушение LVT-источников, которые загрузчик мог оставить
+//! активными (LINT0/1, perf, thermal). Инициализация — на BSP (init),
+//! затем на КАЖДОМ AP до включения прерываний (init_ap ← smp::ap_main).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -28,6 +31,14 @@ const APIC_BASE_X2APIC: u64 = 1 << 10;
 const MSR_X2APIC_ID: u32 = 0x802;
 const MSR_X2APIC_EOI: u32 = 0x80B;
 const MSR_X2APIC_SPURIOUS: u32 = 0x80F;
+
+/// x2APIC MSR: ICR (64-битный: [31:0] — поля доставки, [63:32] — dest).
+const MSR_X2APIC_ICR: u32 = 0x830;
+/// x2APIC MSR: LVT-таймер, initial/current count, divide configuration.
+const MSR_X2APIC_LVT_TIMER: u32 = 0x832;
+const MSR_X2APIC_TIMER_ICR: u32 = 0x838;
+const MSR_X2APIC_TIMER_CCR: u32 = 0x839;
+const MSR_X2APIC_TIMER_DIVIDE: u32 = 0x83E;
 
 /// Вектор спурифика (совпадает с 255 — вне IRQ-пространства диспетчера).
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
@@ -46,8 +57,127 @@ const REG_LVT_PERF: usize = 0x340;
 const REG_LVT_LINT0: usize = 0x350;
 const REG_LVT_LINT1: usize = 0x360;
 
+/// ICR (interrupt command): low — вектор+поля доставки, high — dest.
+const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
+
+/// LAPIC-таймер: initial count, current count, divide configuration.
+const REG_TIMER_ICR: usize = 0x380;
+const REG_TIMER_CCR: usize = 0x390;
+const REG_TIMER_DIVIDE: usize = 0x3E0;
+
 /// Бит 16 LVT-регистра: маскирование источника.
 const LVT_MASK: u32 = 1 << 16;
+
+/// Поля ICR-low (xAPIC 0x300 / x2APIC MSR 0x830 [31:0]):
+/// вектор [7:0]; delivery mode fixed [10:8]=0; destination mode
+/// physical [11]=0; delivery status [12] (RO); level assert [14]=1;
+/// trigger mode edge [15]=0; shorthand [19:18].
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+/// Shorthand 0b11: все ядра, КРОМЕ отправителя (dest-поле игнорируется).
+const ICR_SHORTHAND_ALL_EXCL_SELF: u32 = 0b11 << 18;
+
+/// Divide configuration: 0b1000 = счёт LAPIC-таймера на 16 (широкий
+/// диапазон counts/тик без переполнения 32-битного initial count).
+pub const TIMER_DIVIDE_16: u32 = 0b1000;
+/// Бит 17 LVT-таймера: периодический режим (иначе — one-shot).
+const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+
+/// Программирует LVT-таймер ТЕКУЩЕГО ядра: periodic, вектор, счёт,
+/// делитель. ВАЖНО: вызывается на AP после [`init_ap`] (per-CPU
+/// регистры LAPIC) и на BSP только в калибровке (тик BSP — PIT).
+pub fn timer_program_periodic(vector: u8, initial_count: u32, divide_bits: u32) {
+    let lvt = (vector as u32) | LVT_TIMER_PERIODIC; // unmasked
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: MSR-группа таймера существует при x2APIC (бит 10 base).
+        unsafe {
+            Msr::new(MSR_X2APIC_TIMER_DIVIDE).write(divide_bits as u64);
+            Msr::new(MSR_X2APIC_LVT_TIMER).write(lvt as u64);
+            Msr::new(MSR_X2APIC_TIMER_ICR).write(initial_count as u64);
+        }
+    } else {
+        mmio_write(REG_TIMER_DIVIDE, divide_bits);
+        mmio_write(REG_LVT_TIMER, lvt);
+        // initial count ПОСЛЕДНИМ — запускает счёт (порядок SDM).
+        mmio_write(REG_TIMER_ICR, initial_count);
+    }
+}
+
+/// One-shot старт с максимальным счётом (калибровка: счёт идёт, доставка
+/// маскирована/IF=0 — приход вектора никуда не доставляется до STI).
+pub fn timer_oneshot_calibration_start(divide_bits: u32) {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: см. timer_program_periodic.
+        unsafe {
+            Msr::new(MSR_X2APIC_TIMER_DIVIDE).write(divide_bits as u64);
+            Msr::new(MSR_X2APIC_LVT_TIMER).write(LVT_MASK as u64);
+            Msr::new(MSR_X2APIC_TIMER_ICR).write(u32::MAX as u64);
+        }
+    } else {
+        mmio_write(REG_TIMER_DIVIDE, divide_bits);
+        mmio_write(REG_LVT_TIMER, LVT_MASK); // маскирован: только счёт
+        mmio_write(REG_TIMER_ICR, u32::MAX);
+    }
+}
+
+/// Текущее значение счётчика LAPIC-таймера (деcrement от initial).
+pub fn timer_current_count() -> u32 {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: MSR 0x839 — current count (x2APIC).
+        unsafe { Msr::new(MSR_X2APIC_TIMER_CCR).read() as u32 }
+    } else {
+        mmio_read(REG_TIMER_CCR)
+    }
+}
+
+/// Останов и маскирование LVT-таймера (конец калибровки на BSP).
+pub fn timer_mask() {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: см. выше.
+        unsafe { Msr::new(MSR_X2APIC_LVT_TIMER).write(LVT_MASK as u64) };
+    } else {
+        mmio_write(REG_LVT_TIMER, LVT_MASK);
+    }
+}
+
+/// Отправка IPI ФИКСИРОВАННОМУ дестинейшену (physical dest, edge,
+/// assert). xAPIC: high-регистр ДО low (порядок SDM: запись в low
+/// отправляет); x2APIC: одна 64-битная запись MSR.
+pub fn send_ipi(dest_lapic: u32, vector: u8) {
+    if X2APIC.load(Ordering::Relaxed) {
+        let val = (dest_lapic as u64) << 32 | (vector as u64);
+        // SAFETY: MSR 0x830 — ICR x2APIC (бит 10 base проверен init).
+        unsafe { Msr::new(MSR_X2APIC_ICR).write(val) };
+    } else {
+        mmio_write(REG_ICR_HIGH, (dest_lapic & 0xFF) << 24);
+        mmio_write(REG_ICR_LOW, vector as u32 | ICR_LEVEL_ASSERT);
+    }
+    // SDM: между последовательными отправками ICR — пауза (порядка
+    // 200 циклов): локальный спин-запас против отбрасывания доставки.
+    for _ in 0..64 {
+        unsafe { core::arch::x86_64::_mm_pause() };
+    }
+}
+
+/// Широковещательная отправка IPI всем ядрам КРОМЕ текущего
+/// (shorthand 0b11 ICR). Dest-поле игнорируется контроллером.
+pub fn send_ipi_all_excluding_self(vector: u8) {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: MSR 0x830 — ICR x2APIC; shorthand в [19:18].
+        unsafe {
+            Msr::new(MSR_X2APIC_ICR).write(vector as u64 | ICR_SHORTHAND_ALL_EXCL_SELF as u64)
+        };
+    } else {
+        mmio_write(REG_ICR_HIGH, 0);
+        mmio_write(
+            REG_ICR_LOW,
+            vector as u32 | ICR_LEVEL_ASSERT | ICR_SHORTHAND_ALL_EXCL_SELF,
+        );
+    }
+    for _ in 0..64 {
+        unsafe { core::arch::x86_64::_mm_pause() };
+    }
+}
 
 static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
 static X2APIC: AtomicBool = AtomicBool::new(false);
@@ -90,13 +220,31 @@ fn detect() -> Option<(usize, bool)> {
 
 /// Инициализирует LAPIC на ТЕКУЩЕМ ядре: детект, включение (глобальный
 /// бит MSR + программное разрешение через spurious), глушение LVT.
-/// Вызывается на BSP из init (см. irq::init_from_madt); AP-ядра в v2
-/// остаются с IF=0 — их LAPIC не настраивается (не мешает: маскирован-
-/// ные линии им ничего не доставляют).
+/// Вызывается на BSP из init (см. irq::init_from_madt); AP-ядра —
+/// [`init_ap`] из ap_main (smp.rs) ДО включения прерываний: с этого
+/// момента ядро получает EOI-обязанности, IPI и локальный таймер.
 pub fn init() -> bool {
+    if !init_common() {
+        return false;
+    }
+    BSP_LAPIC_ID.store(lapic_id(), Ordering::Relaxed);
+    true
+}
+
+/// Инициализация LAPIC на AP-ядре (ap_main): та же механика, что и на
+/// BSP, но ID в BSP_LAPIC_ID НЕ пишется (он — собственность bootstrap).
+/// Контракт: вызывается один раз, до STI этого ядра.
+pub fn init_ap() -> bool {
+    init_common()
+}
+
+/// Общая механика включения LAPIC текущего ядра.
+fn init_common() -> bool {
     let Some((mmio, x2)) = detect() else {
         return false;
     };
+    // LAPIC-окно у ВСЕХ ядер одно и то же (каждое ядро через него
+    // видит СВОЙ локальный APIC) — перезапись тем же значением безвредна.
     LAPIC_MMIO_BASE.store(mmio, Ordering::Relaxed);
     X2APIC.store(x2, Ordering::Relaxed);
 
@@ -128,7 +276,6 @@ pub fn init() -> bool {
         }
     }
 
-    BSP_LAPIC_ID.store(lapic_id_inner(x2, mmio), Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
     true
 }
@@ -148,17 +295,6 @@ pub fn lapic_id() -> u32 {
         (unsafe { Msr::new(MSR_X2APIC_ID).read() }) as u32
     } else {
         mmio_read(REG_ID) >> 24
-    }
-}
-
-/// Внутреннее чтение ID во время init() (до установки ACTIVE).
-fn lapic_id_inner(x2: bool, mmio: usize) -> u32 {
-    if x2 {
-        // SAFETY: x2APIC id — MSR 0x802 (бит 10 APIC_BASE проверен).
-        (unsafe { Msr::new(MSR_X2APIC_ID).read() }) as u32
-    } else {
-        // SAFETY: MMIO-окно LAPIC замаплено HHDM (reserved-регион).
-        (unsafe { core::ptr::read_volatile((mmio + REG_ID) as *const u32) }) >> 24
     }
 }
 

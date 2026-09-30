@@ -247,8 +247,8 @@ unsafe extern "C" fn ap_trampoline(
 }
 
 /// Продолжение AP НА СВОЁМ стеке (вызывается только из трамплина):
-/// per-CPU механика arch-бэкенда, отметка он-лайна и вход в цикл
-/// планировщика порта (политика фронтенда).
+/// per-CPU механика arch-бэкенда, LAPIC+локальный таймер, отметка
+/// он-лайна и вход в цикл планировщика порта (политика фронтенда).
 unsafe extern "C" fn ap_main(slot: usize, lapic: usize) -> ! {
     // per-CPU: GDT/TSS, FPU, MSR, GS base (lctl в области нулевой).
     let setup_ok = unsafe { cswitch::ap_cpu_setup(slot) };
@@ -258,10 +258,23 @@ unsafe extern "C" fn ap_main(slot: usize, lapic: usize) -> ! {
         park()
     }
 
+    // LAPIC ЭТОГО ядра + локальный таймер: до них ядро не могло ни
+    // подтверждать прерывания (EOI), ни получать IPI (TLB-shootdown),
+    // ни тикать. Без LAPIC ядро НЕ включается в онлайновую маску
+    // (ipi::mark_cpu_online фронт вызовет только из хука ниже — сюда
+    // без LAPIC мы не доходим) и паркуется: включить его в SMP-протоколы
+    // без EOI/шутдауна нельзя.
+    if !crate::apic::init_ap() {
+        kernel_log!("smp: AP slot={} без LAPIC — park (вне SMP-протоколов)\n", slot);
+        park()
+    }
+    crate::timer::start_ap_tick();
+
     APS_ONLINE.fetch_add(1, Ordering::AcqRel);
     kernel_log!("smp: AP-ядро {} онлайн (lapic {})\n", slot, lapic);
 
-    // Политика фронта: планировщик + цикл. Без хука — парковка.
+    // Политика фронта: планировщик + цикл (фронт отметит ядро в
+    // ipi-маске и включит прерывания). Без хука — парковка.
     let hook_addr = {
         let area = unsafe { cswitch::per_cpu_area(slot) }.expect("слот валиден");
         area.fixed.sched_loop_entry as usize
