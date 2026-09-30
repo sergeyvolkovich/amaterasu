@@ -16,6 +16,7 @@ pub mod deadline;
 pub mod irq_wait;
 pub mod stats;
 pub mod tcb;
+pub mod wake;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskRuntime {

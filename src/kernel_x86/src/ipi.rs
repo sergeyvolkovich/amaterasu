@@ -47,6 +47,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_base::irqsafe::IrqSafeSpinMutex;
 use kernel_base::kernel_log;
+use kernel_base::lctl::LocalKernelCTL;
 use kernel_base::traits::ipi::{IpiController, IpiError, IpiKind};
 use kernel_base::traits::memory::PAGE_SIZE;
 use x86_64::registers::control::Cr3;
@@ -54,6 +55,7 @@ use x86_64::VirtAddr;
 
 use crate::apic;
 use crate::cswitch;
+use crate::paging::X86Umap;
 
 // ─── Векторы служебного пространства ─────────────────────────────────────────
 
@@ -313,9 +315,26 @@ pub fn on_shootdown_ipi() {
     ACKED_GEN[slot].store(ack, Ordering::Release);
 }
 
-/// Обработчик IPI Reschedule (v1 — no-op: циклы планировщика поллят;
-/// будущий кик пустого ядра из спящего состояния).
-pub fn on_resched_ipi() {}
+/// Обработчик IPI Reschedule: «виртуальный тик» внешнего пробуждения.
+///
+/// На это ядро только что переложили задачу(и) в ready (task::wake —
+/// глобальный wake с чужого ядра). Если прерванный контекст — ring3,
+/// карусель крутится так же, как на тике таймера (преемпция через
+/// preempt_next в хвосте диспетчера): проснувшаяся задача стартует
+/// немедленно, а не на ближайшем PIT/LAPIC-тике (≤10 мс при 100 Гц).
+/// Ядерный контекст НЕ вытесняется (та же семантика, что у таймера:
+/// ротация середины сисколла разъехалась бы с assign/unregister) —
+/// задача подхватится на ближайшей границе/тике.
+pub fn on_resched_ipi(lctl: &mut LocalKernelCTL<X86Umap>, from_user: bool) {
+    if from_user {
+        match lctl.scheduler_process_tick(kernel_base::task::stats::global_ticks() as usize) {
+            kernel_base::traits::scheduller::TaskExecStatus::ChangeTask(next) => {
+                lctl.set_preempt_next(next as u64);
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Обработчик IPI Halt (v1 — no-op: семантика парковки ещё не введена;
 /// вектор зарезервирован за контрактом IpiKind::Halt).

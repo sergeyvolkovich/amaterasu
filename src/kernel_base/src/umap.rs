@@ -550,6 +550,8 @@ mod tests {
 
     #[test]
     fn dma_pin_find_and_gate() {
+        // ГАРД: ensure_slab двигает глобальные slab-хуки (см. idalloc).
+        let _guard = crate::test_guard::GLOBAL.lock();
         ensure_slab();
         let mut tracker = VirtualPageTracker::new(0x0000_0001_0000_0000, 64).expect("tracker");
         let virt = tracker.reserve(4).expect("reserve");

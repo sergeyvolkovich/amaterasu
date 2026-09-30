@@ -160,6 +160,9 @@ mod tests {
 
     #[test]
     fn pool_bump_and_reuse() {
+        // ГАРД: ensure_slab двигает глобальные slab-хуки — параллельные
+        // тесты с HHDM/slab ловили glibc-порчу кучи (pre-existing флейк).
+        let _guard = crate::test_guard::GLOBAL.lock();
         ensure_slab();
         let pool = IdPool::new(8);
         assert_eq!(pool.alloc(), Some(1));

@@ -175,6 +175,10 @@ pub fn teardown_task(task_cap_id: u64) -> usize {
         // но EOI-спам без владельца хуже молчаливой маски.
         mask_via_callback(line);
         let _ = release_line(line);
+        // Wake ждущих mint-копий погибшей линии: teardown не должен
+        // оставлять чужие задачи спать навсегда (см. task::irq_wait::
+        // on_line_released — пустое пробуждение → re-WAIT → E_CAP_REVOKED).
+        crate::task::irq_wait::on_line_released(line);
     }
     count
 }
@@ -213,6 +217,11 @@ mod tests {
 
     #[test]
     fn claim_release_teardown_lifecycle() {
+        // ГАРД: teardown_task теперь зовёт task::irq_wait::on_line_released
+        // (ленивый WAITERS-иниц + slab) — без сериализации тесты, двигающие
+        // HHDM-offset/slab-хуки параллельно, рвут друг другу память
+        // (ловилось как glibc malloc-assert в irq_wait-тесте).
+        let _guard = crate::test_guard::GLOBAL.lock();
         init_slab();
         // Занять две линии разным владельцем.
         claim_line(2, entry(0x11)).expect("claim 2");

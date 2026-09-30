@@ -97,6 +97,10 @@ impl ArchImplementation for X86Backend {
     /// (IRQ-сисколлы отвечают E_INTERNAL — «подсистема не поднята»).
     type IrqChip = crate::irq::X86IrqChip;
 
+    /// IPI-контроллер: LAPIC ICR (xAPIC/x2APIC), протоколы shootdown/resched
+    /// — kernel_x86::ipi. Активен с apic::init(); до него send даёт NotReady.
+    type Ipi = crate::ipi::X86IpiController;
+
     fn init_base_state() -> Self {
         X86Backend
     }
@@ -158,6 +162,10 @@ impl ArchImplementation for X86Backend {
 
     fn irq_chip() -> Option<&'static Self::IrqChip> {
         crate::irq::chip()
+    }
+
+    fn ipi() -> Option<&'static Self::Ipi> {
+        Some(crate::ipi::controller())
     }
 
     /// Umap = UserspaceMap для x86 (один тип).

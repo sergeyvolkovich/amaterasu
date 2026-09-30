@@ -786,9 +786,17 @@ mod tests {
     /// глобальный static, параллельные тесты перемешали бы его.
     #[test]
     fn rendezvous_lifecycle() {
+        // ГАРД: тест двигает HHDM-offset и slab-хуки (глобальные статики);
+        // параллельный slab-потребитель портит ему память (glibc abort).
+        let _guard = crate::test_guard::GLOBAL.lock();
         let u = umap();
         // "Физическая память" приёмника: буфер на 4К по VA=delta+0x800.
-        let mem = crate::traits::memory::test_alloc::page_aligned_leak(2);
+        // 64 страницы, а не 2: slab-страницы выдаёт ОБЩИЙ на процесс
+        // bump-аллокатор (init_hooks Once — побеждает первый тест), счётчик
+        // которого к этому тесту может стоять на странице ~N. Буфер обязан
+        // вместить slab-узлы страниц 1..N + данные теста, иначе запись
+        // slab уходит за буфер в чужую кучу (ловилось как glibc abort).
+        let mem = crate::traits::memory::test_alloc::page_aligned_leak(64);
         set_hhdm_offset(mem.as_ptr() as usize);
 
         // ── WAIT-медленный: получатель 100 ждёт от кого угодно, окно

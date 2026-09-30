@@ -247,7 +247,18 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainIrq<A, SyscallIrqW
         if count == 0 {
             return res::E_INVALID_ARG;
         }
-        drop(access);
+
+        // ЖИВОСТЬ ЛИНИЙ (per-line authority): капа резолвится даже после
+        // RELEASE владельца (tombstone — только в слоте владельца, mint-
+        // копии остаются живыми записями). Ждать можно только линию,
+        // которая есть в реестре владения — протухшая mint-копия даёт
+        // E_CAP_REVOKED (после wake-а из on_line_released userspace
+        // завершает цикл ожидания предсказуемо, а не спит навсегда).
+        for &line in &lines[..count] {
+            if irq::line_is_free(line) {
+                return res::E_CAP_REVOKED;
+            }
+        }
 
         // АТОМАРНОСТЬ РЕГИСТРАЦИИ И БЛОКИРОВКИ (фикс lost wakeup):
         // между register_irq_wait и постановкой в wait-очередь мог
@@ -258,6 +269,14 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainIrq<A, SyscallIrqW
         // регистрации (уровневая линия может заспамить EOI между
         // размаской и сном — OneShot-объект уже зарегистрирован,
         // пробуждение не потеряется).
+        //
+        // PIN (фикс TOCTOU): umap — заимствование из GTcb под
+        // permission_backend-локом. Раньше лок опускался ДО
+        // register_irq_wait — параллельный destroy_task_full (тот же
+        // лок) мог освободить GTcb/умап между drop(access) и
+        // translate_user внутри регистрации (use-after-free). Теперь
+        // лок держится ДО конца регистрации: destroy сериализован тем
+        // же локом; отпускаем перед блокировкой (спать с локом нельзя).
         let flags = crate::irqsafe::irq_save();
         let outcome = irq_wait::register_irq_wait(
             current,
@@ -266,6 +285,7 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainIrq<A, SyscallIrqW
             args.mask_ptr as usize,
             args.mask_slots as usize,
         );
+        drop(access);
         match outcome {
             Ok(seq) => {
                 // Размаскируем линии набора (claim маскирует; WAIT открывает
@@ -548,11 +568,17 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainIrq<A, SyscallIrqR
                 }
                 // Капа-носитель линии затумбстоунивается на месте (слот
                 // остаётся занят мёртвой записью — как CAP_DESTROY).
-                match capspace::take_slot(task, args.slot) {
+                let r = match capspace::take_slot(task, args.slot) {
                     Ok(_) => res::OK,
                     Err(capspace::CapspaceError::SlotEmpty) => res::E_SLOT_EMPTY,
                     Err(_) => res::E_INTERNAL,
-                }
+                };
+                // Wake ждущих mint-копий released-линии — ПОСЛЕ снятия
+                // записи реестра (они перевызовут WaitIrq и получат
+                // E_CAP_REVOKED: линия уже free). wake не берёт
+                // permission_backend — цикла по локам нет.
+                crate::task::irq_wait::on_line_released(line);
+                return r;
             }
             Err(irq::LineError::NotFound) => {
                 // Реестр уже без линии (гонка двух RELEASE одной капы):

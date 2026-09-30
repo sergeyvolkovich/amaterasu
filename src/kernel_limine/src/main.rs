@@ -958,14 +958,33 @@ fn ap_online(core_slot: usize) -> ! {
 /// сводится к безопасной ссылке (никаких 19.5-КиБ конструкций на стеке
 /// — прежний BootCell::write(RoundRobinScheduler::new()) строил и
 /// копировал гиганта на КАЖДОМ ядре).
+///
+/// Установка — через install_cpu_scheduler: слот ядра попадает и в
+/// глобальный реестр пробуждения (task::wake) — чужие ядра могут будить
+/// задачи, спящие на этом планировщике. Resched-IPI кик разбуженным
+/// (виртуальный тик) — через IPI-контроллер ArchImplementation.
 fn install_scheduler(core_id: usize) {
     if core_id >= SCHEDULERS.len() {
         kernel_log!("smp: ядро {} сверх лимита — без планировщика\n", core_id);
         return;
     }
+    // Хук кика (Resched-IPI) — достаточно одного на систему; установка
+    // идемпотентна (fn-указатель перезаписывается тем же значением).
+    kernel_base::task::wake::set_kick_hook(resched_kick);
     let lctl = X86Backend::get_local_base();
-    lctl.install_scheduler(&SCHEDULERS[core_id]);
-    kernel_log!("sched: RR поставлен на ядро {}\n", core_id);
+    lctl.install_cpu_scheduler(core_id, &SCHEDULERS[core_id]);
+    kernel_log!("sched: RR поставлен на ядро {} (wake-реестр)\n", core_id);
+}
+
+/// Кик проснувшегося ядра из task::wake: Resched-IPI через переносимый
+/// IpiController (x86 — LAPIC ICR; ARM64/RISC-V — SGI/IMSIC того же
+/// контракта). Ошибки доставки (ядро ушло в оффлайн) — не фатальны:
+/// задача всё равно подхватится тиком таймера.
+fn resched_kick(slot: usize) {
+    use kernel_base::traits::ipi::{IpiController as _, IpiKind};
+    if let Some(ipi) = <X86Backend as kernel_base::traits::ArchImplementation>::ipi() {
+        let _ = ipi.send_to_cpu(slot, IpiKind::Reschedule);
+    }
 }
 
 // ─── Инструментировка бут-стека ─────────────────────────────────────────────

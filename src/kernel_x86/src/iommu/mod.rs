@@ -878,12 +878,19 @@ pub fn map_va_token(
 }
 
 /// Снимает first-stage страницы через PASID-капабилити.
+///
+/// ВОЗВРАТ: физика корня таблиц (Some) — ТОЛЬКО для SVA-пространств
+/// (fs_root = CR3 процесса-владельца): их first-stage таблицы совпадают
+/// с CPU-таблицами, поэтому снятие PTE обязано инвалинировать и CPU-TLB
+/// (локальный invlpg активного корня + remote shootdown через IPI).
+/// Dedicated-пространства (собственные таблицы бэкенда) в CPU-TLB не
+/// живут — None, инвалидация только IOTLB (внутри unmap_first_stage).
 pub fn unmap_va_token(
     unit: &IommuUnitHandle,
     token: u64,
     gva: usize,
     pages: usize,
-) -> Result<(), IommuError> {
+) -> Result<Option<usize>, IommuError> {
     let entry = resolve_pasid(token).map_err(|_| IommuError::StaleToken)?;
     // SAFETY: запись бессмертна; консистентность — под users-локом.
     let entry = unsafe { entry.as_ref() };
@@ -906,10 +913,22 @@ pub fn unmap_va_token(
             function: 0,
         }));
     };
+    let sva = !space_ref.dedicated;
     let result = unit.unmap_first_stage(&entry.domain, entry.pasid, root, gva, pages);
     drop(root_guard);
     drop(users);
-    result
+
+    // CPU-TLB-инвалидация SVA-корня — ПОСЛЕ снятия лока (shootdown ждёт
+    // ack-ов; держать users/fs_root на это нельзя). Локально — invlpg
+    // активного корня; удалённо — синхронный IPI-шутдаун (ipi.rs:
+    // очередь+поколение+ack). Ранний бут/унипроцессор — no-op внутри.
+    if let (Ok(()), true) = (result, sva) {
+        for i in 0..pages {
+            crate::paging::flush_if_active(root, gva + i * PAGE_SIZE);
+        }
+        crate::ipi::shootdown_range(root, gva, pages);
+    }
+    result.map(|_| if sva { Some(root) } else { None })
 }
 
 // ─── Teardown задачи (хук из syscall_task::destroy_task_full) ────────────────
@@ -1184,7 +1203,10 @@ impl IommuTokenLayer for crate::X86Backend {
 
     fn unmap_va(&self, pasid_token: u64, gva: usize, pages: usize) -> Result<(), IommuError> {
         let unit = self.iommu_unit().ok_or(IommuError::NoIommuUnits)?;
-        unmap_va_token(unit, pasid_token, gva, pages)
+        // SVA-пространства внутри unmap_va_token уже инвалинировали и
+        // CPU-TLB (локальный invlpg + remote IPI-shootdown); корень
+        // вызывающему не нужен.
+        unmap_va_token(unit, pasid_token, gva, pages).map(|_| ())
     }
 }
 

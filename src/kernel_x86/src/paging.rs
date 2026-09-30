@@ -311,8 +311,10 @@ fn is_active(_root_phys: usize) -> bool {
     false
 }
 
-/// INVLPG, если страница могла осесть в TLB текущего ядра.
-fn flush_if_active(root_phys: usize, virt: usize) {
+/// INVLPG, если страница могла осесть в TLB текущего ядра. Для SVA-путей
+/// IOMMU (unmap_va на разделяемом CR3) — тоже часть контракта: IOMMU-
+/// таблицы и CPU-таблицы одни и те же.
+pub(crate) fn flush_if_active(root_phys: usize, virt: usize) {
     if is_active(root_phys) {
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virt as u64));
     }

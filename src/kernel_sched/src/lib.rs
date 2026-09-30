@@ -129,19 +129,19 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
     }
 
     /// Тик: карусель. Возвращает смену задачи (порт грузит контекст).
-    fn process_tick(&mut self, _time: usize) -> TaskExecStatus {
+    fn process_tick(&self, _time: usize) -> TaskExecStatus {
         let mut inner = self.inner.lock();
         inner.ticks += 1;
         Self::rotate(&mut inner)
     }
 
-    fn yield_current_task(&mut self) -> TaskExecStatus {
+    fn yield_current_task(&self) -> TaskExecStatus {
         let mut inner = self.inner.lock();
         Self::rotate(&mut inner)
     }
 
     fn register_task(
-        &mut self,
+        &self,
         task_cap_id: u64,
         _task_begin_addr: u64,
         _task_code_size: u64,
@@ -164,7 +164,7 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
         }
     }
 
-    fn unregister_task(&mut self, task_cap_id: u64) -> TaskExecStatus {
+    fn unregister_task(&self, task_cap_id: u64) -> TaskExecStatus {
         let mut inner = self.inner.lock();
         inner.ready.retain(|t| *t != task_cap_id);
         // Из очередей ожидания тоже (задача умирает во сне).
@@ -188,7 +188,7 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
     /// ждущих > MAX_WAITERS), задача ОСТАЁТСЯ текущей (sleep не состоялся):
     /// раньше она снималась с current, не попадая ни в wait, ни в ready —
     /// и терялась навсегда (никогда больше не запланируется).
-    fn assign_current_task_to_wait(&mut self, object_id: usize, model: WaitModel) -> usize {
+    fn assign_current_task_to_wait(&self, object_id: usize, model: WaitModel) -> usize {
         let mut inner = self.inner.lock();
         let current = inner.current;
         let queue_id = object_id;
@@ -229,22 +229,28 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
     /// Пробуждение: OneShot — событие потребляет ровно ОДНОГО ждущего
     /// (FIFO); Multiple — будим всех. Текущая не трогается.
     ///
+    /// Возвращает число задач, ставших runnable этим вызовом (см. трейт:
+    /// уже-готовые не считаются — Resched-IPI для них избыточен).
+    ///
     /// Если ready переполнена, не поместившиеся остаются в wait-очереди
     /// (дождутся следующего пробуждения) — раньше они молча терялись.
-    fn awake_task_from_wait(&mut self, queue_id: usize) {
+    fn awake_task_from_wait(&self, queue_id: usize) -> usize {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let Some(pos) = inner.waits.iter().position(|(id, _, _)| *id == queue_id) else {
-            return;
+            return 0;
         };
+        let mut woken = 0usize;
         match inner.waits[pos].1 {
             WaitModel::OneShot => {
                 if let Some(&t) = inner.waits[pos].2.first() {
                     if inner.ready.contains(&t) {
-                        // Уже в готовых (не должно случаться) — просто снять.
+                        // Уже в готовых (не должно случаться) — просто снять;
+                        // нового runnable нет — не считаем.
                         inner.waits[pos].2.remove(0);
                     } else if inner.ready.push(t).is_ok() {
                         inner.waits[pos].2.remove(0);
+                        woken += 1;
                     }
                     // ready полна — ждущий остаётся в очереди.
                 }
@@ -263,6 +269,7 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
                     }
                     if inner.ready.push(t).is_ok() {
                         q.remove(i);
+                        woken += 1;
                     } else {
                         // ready полна — остальные ждут следующего пробуждения.
                         i += 1;
@@ -273,6 +280,7 @@ impl LocalSchedullerInterface for RoundRobinScheduler {
                 }
             }
         }
+        woken
     }
 }
 
@@ -304,6 +312,35 @@ mod tests {
         sched.register_task(20, 0, 0, 0);
         assert_eq!(sched.yield_current_task(), TaskExecStatus::ChangeTask(20));
         assert_eq!(sched.yield_current_task(), TaskExecStatus::ChangeTask(10));
+    }
+
+    /// Счётчик пробуждений (контракт task::wake): только НОВЫЕ runnable.
+    #[test]
+    fn awake_counts_only_newly_runnable() {
+        let sched = RoundRobinScheduler::new();
+        sched.register_task(1, 0, 0, 0);
+        sched.register_task(2, 0, 0, 0);
+
+        // Никто не ждёт — 0.
+        assert_eq!(sched.awake_task_from_wait(99), 0);
+
+        // Задача 1 (текущая) засыпает на объекте 5 (OneShot); текущей
+        // становится 2 из ready.
+        sched.assign_current_task_to_wait(5, WaitModel::OneShot);
+        assert_eq!(sched.current(), Some(2));
+        // Пробуждение: 1 новый runnable.
+        assert_eq!(sched.awake_task_from_wait(5), 1);
+        // Повтор — очередь пуста: 0 (double-wake безопасен).
+        assert_eq!(sched.awake_task_from_wait(5), 0);
+
+        // Multiple: двое ждут — один wake даёт 2.
+        // Гасим готовую (2 становится текущей после ротации) и укладываем
+        // обе задачи на объект 6 по очереди.
+        let _ = sched.process_tick(0); // текущая = 2 (проснувшаяся)
+        sched.assign_current_task_to_wait(6, WaitModel::Multiple); // 2 спит
+        sched.assign_current_task_to_wait(6, WaitModel::Multiple); // 1 спит
+        assert_eq!(sched.current(), None);
+        assert_eq!(sched.awake_task_from_wait(6), 2, "Multiple будит обоих");
     }
 
     #[test]

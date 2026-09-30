@@ -18,8 +18,14 @@ pub enum TaskExecStatus {
 /// compatible for ports that only implement the tick/wait primitives.
 pub trait GKernelSchedullerInterface {}
 
-pub trait LocalSchedullerInterface {
-    fn process_tick(&mut self, time: usize) -> TaskExecStatus;
+/// КОНТРАКТ РАЗДЕЛЯЕМОСТИ: `&self` во всех методах (состояние — за
+/// внутренней IRQ-безопасной блокировкой реализации) + Sync-супертрейт.
+/// Обоснование — межъядерное пробуждение (см. task::wake): ожидать задачи
+/// могут на ЛЮБОМ ядре, а событие (IRQ, IPC, смерть задачи) случается на
+/// произвольном. Реализация обязана корректно работать при конкурентных
+/// вызовах с разных ядер — IrqSafeSpinMutex внутри это даёт.
+pub trait LocalSchedullerInterface: Sync {
+    fn process_tick(&self, time: usize) -> TaskExecStatus;
 
     /// Кто должен исполняться сейчас по мнению планировщика.
     ///
@@ -32,13 +38,13 @@ pub trait LocalSchedullerInterface {
     fn current_task(&self) -> Option<u64>;
 
     /// Voluntary reschedule requested by the current task.
-    fn yield_current_task(&mut self) -> TaskExecStatus {
+    fn yield_current_task(&self) -> TaskExecStatus {
         TaskExecStatus::NoAction
     }
 
     /// Register a task that already owns a live TaskTCB capability.
     fn register_task(
-        &mut self,
+        &self,
         task_cap_id: u64,
         task_begin_addr: u64,
         task_code_size: u64,
@@ -49,7 +55,7 @@ pub trait LocalSchedullerInterface {
     }
 
     /// Remove a task from scheduler-owned run/wait queues.
-    fn unregister_task(&mut self, task_cap_id: u64) -> TaskExecStatus {
+    fn unregister_task(&self, task_cap_id: u64) -> TaskExecStatus {
         let _ = task_cap_id;
         TaskExecStatus::NoAction
     }
@@ -58,11 +64,13 @@ pub trait LocalSchedullerInterface {
     ///
     /// The returned queue id is the token later consumed by
     /// `awake_task_from_wait`.
-    fn assign_current_task_to_wait(
-        &mut self,
-        object_id: usize,
-        model: WaitModel,
-    ) -> usize;
+    fn assign_current_task_to_wait(&self, object_id: usize, model: WaitModel) -> usize;
 
-    fn awake_task_from_wait(&mut self, queue_id: usize);
+    /// Пробуждение всех ждущих `queue_id` по модели очереди.
+    ///
+    /// Возвращает число задач, СТАВШИХ runnable ЭТИМ вызовом (перевод
+    /// wait → ready). Задачи, уже стоявшие в ready (разбудил кто-то
+    /// другой), не считаются: новый runnable на целевом ядре не появился,
+    /// Resched-IPI для него избыточен. 0 — никто не проснулся.
+    fn awake_task_from_wait(&self, queue_id: usize) -> usize;
 }

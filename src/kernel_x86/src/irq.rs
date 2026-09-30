@@ -420,7 +420,7 @@ pub fn irq_vector_dispatch(
             return;
         }
         if v == crate::ipi::IPI_RESCHED_VECTOR as u32 {
-            crate::ipi::on_resched_ipi();
+            crate::ipi::on_resched_ipi(lctl, from_user);
             crate::apic::eoi();
             return;
         }

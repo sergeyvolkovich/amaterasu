@@ -291,6 +291,48 @@ pub fn unregister_task_wait(task_cap_id: u64) {
     }
 }
 
+/// Линия ПЕРЕСТАЛА существовать (RELEASE владельцем или teardown): будим
+/// всех, кто ждал её mint-копией. Номер линии в их массивы НЕ дописывается
+/// (события не было — это «линия ушла»): userspace после пустого
+/// пробуждения перевызывает WaitIrq и получает E_CAP_REVOKED (проверка
+/// живости линии в syscall-слое). Без этого wake-а ждущий протухшей
+/// линии спал бы навсегда (revocation-vs-wait; полная механика —
+/// cap-нотификации, отложены).
+///
+/// Возвращает число снятых регистраций (диагностика). Вызываемо из любого
+/// контекста: скан/снятие под IrqSafe-локом таблицы, wake — глобальный
+/// (task::wake, без lctl: дренит и своё ядро тоже).
+pub fn on_line_released(line: u32) -> usize {
+    let Some(t) = table() else {
+        return 0;
+    };
+    // Двухфазно (как on_irq_fired): сбор seq под локом, снятие+wake вторым.
+    let mut gone = [0u64; MAX_IRQ_WAITERS];
+    let mut gone_count = 0usize;
+    {
+        let t = t.0.lock();
+        t.for_each_kv(|seq, w| {
+            if w.lines[..w.line_count].contains(&line) && gone_count < MAX_IRQ_WAITERS {
+                gone[gone_count] = *seq;
+                gone_count += 1;
+            }
+        });
+    }
+    if gone_count == 0 {
+        return 0;
+    }
+    let mut woken = 0usize;
+    let mut t = t.0.lock();
+    for &seq in &gone[..gone_count] {
+        if t.remove(&seq).is_some() {
+            LIVE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            crate::task::wake::release_object_global(irq_wait_object(seq), None);
+            woken += 1;
+        }
+    }
+    woken
+}
+
 /// Пишет u64 в физическую память через HHDM.
 ///
 /// # Safety
@@ -389,16 +431,17 @@ mod tests {
         let _guard = crate::test_guard::GLOBAL.lock();
         // Раскладка как у iommu-тестов: HHDM-offset = адрес буфера (физ 0
         // -> буфер), slab-страницы (с "физической" страницы 1) приземляются
-        // в буфер. Буфер 32 страницы; массив маски кладём на страницу 20 —
-        // подальше от slab-узлов (первые ~4 страницы).
-        let mem = crate::traits::memory::test_alloc::page_aligned_leak(32);
+        // в буфер. Буфер 64 страницы (общий bump-аллокатор мог уже выдать
+        // slab-страницы до ~N — запас обязателен, см. endpoint-тест);
+        // массив маски кладём на страницу 40 — подальше от slab-узлов.
+        let mem = crate::traits::memory::test_alloc::page_aligned_leak(64);
         set_hhdm_offset(mem.as_ptr() as usize);
         init_slab();
 
         let umap = FakeUmap {
             delta: 0x1_0000_0000,
         };
-        const MASK_PAGE: usize = 20;
+        const MASK_PAGE: usize = 40;
         let mask_phys = MASK_PAGE * PAGE_SIZE + 0x100;
         let mask_va = mask_phys + 0x1_0000_0000; // внутри буфера
 
@@ -473,5 +516,18 @@ mod tests {
         let _seq3 = register_irq_wait(0x77, &umap, &[3], mask_va, 4).expect("регистрация 3");
         unregister_task_wait(0x77);
         on_irq_fired(&mut lctl, 3); // не должно паниковать/писать массив
+
+        // RELEASE линии: ожидание mint-копии снимается ПУСТЫМ пробуждением
+        // (номер линии в массив не пишется — события не было).
+        let _seq4 = register_irq_wait(0x88, &umap, &[9], mask_va, 4).expect("регистрация 4");
+        let woken = on_line_released(9);
+        assert_eq!(woken, 1, "ожидание линии 9 снято");
+        // Массив НЕ дополнен (счётчик остался 0 — обнулён при регистрации).
+        let words = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(MASK_PAGE * PAGE_SIZE + 0x100) as *const u64, 1) };
+        assert_eq!(words[0], 0, "пустое пробуждение: события не было");
+        // Повторный release той же линии — никого.
+        assert_eq!(on_line_released(9), 0);
+        // Незадетые линии — нет ни снятий, ни эффектов.
+        assert_eq!(on_line_released(42), 0);
     }
 }

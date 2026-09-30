@@ -41,6 +41,12 @@ pub trait ArchImplementation: Sized + 'static {
     /// без настраиваемого контроллера.
     type IrqChip: IrqChip;
 
+    /// Контроллер межъядерных прерываний (см. traits::ipi::IpiController):
+    /// x86 — LAPIC ICR, ARM64 — GICv3 SGI (IC_SGI1R_EL1), RISC-V — IMSIC.
+    /// Протоколы надстройки (TLB-shootdown с ack, кик планировщика) —
+    /// собственность порта; контракт отдаёт только семантику IpiKind.
+    type Ipi: self::ipi::IpiController;
+
     fn init_base_state() -> Self;
 
     fn reclaim_memory(allocator: &dyn FrameAllocator) -> Self::KMap;
@@ -72,6 +78,11 @@ pub trait ArchImplementation: Sized + 'static {
     /// архитектурно-независимого кода (syscall-слой IRQ-домена).
     /// `None` — подсистема не инициализирована портом.
     fn irq_chip() -> Option<&'static Self::IrqChip>;
+
+    /// Единственная точка доступа к IPI-контроллеру из архитектурно-
+    /// независимого кода (межъядерные wake, SVA-инвалидации). `None` —
+    /// пер-CPU идентификация ещё не поднята портом (ранний бут).
+    fn ipi() -> Option<&'static Self::Ipi>;
 
     /// Создаёт пользовательское адресное пространство задачи из ядерной
     /// таблицы (верхняя половина копируется). Связывает KMap::UserspaceMap
