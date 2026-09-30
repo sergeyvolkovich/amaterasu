@@ -17,6 +17,14 @@ pub struct LocalKernelCTL<UMAP: MemoryInterfaceUserspace> {
     /// стало бы use-after-free — а сверка/сброс как раз нужны ПОСЛЕ
     /// уничтожения (см. SyscallDestroyTask).
     current_task_cap_id: Option<u64>,
+    /// Отложенная преемпция: планировщик (тик таймера, заставший задачу
+    /// в ring3) выбрал другую задачу. Хвост IRQ-диспетчера порта —
+    /// единственный, кто видит прерванный кадр, — забирает решение
+    /// (`take_preempt_next`) и выполняет переключение. Задача в ring3 не
+    /// держит ядерных локов/состояния, поэтому решение безопасно отложить
+    /// до конца обработки прерывания. per-CPU поле (lctl живёт в
+    /// per-CPU области), гонок нет: тик и хвост — один и тот же IRQ.
+    preempt_next: Option<u64>,
     _p: PhantomData<UMAP>,
 }
 
@@ -32,6 +40,7 @@ impl<UMAP: MemoryInterfaceUserspace> LocalKernelCTL<UMAP> {
             scheduler: None,
             current_task: None,
             current_task_cap_id: None,
+            preempt_next: None,
             _p: PhantomData,
         }
     }
@@ -124,6 +133,19 @@ impl<UMAP: MemoryInterfaceUserspace> LocalKernelCTL<UMAP> {
             .unwrap_or(TaskExecStatus::NoAction)
     }
 
+    /// Отложить переключение до хвоста IRQ-диспетчера (ставит тик таймера).
+    /// Перезапись — «последний тик выиграл» (переключение всё равно
+    /// произойдёт не раньше текущего IRQ).
+    pub fn set_preempt_next(&mut self, task_cap_id: u64) {
+        self.preempt_next = Some(task_cap_id);
+    }
+
+    /// Забрать отложенное решение о преемпции (хвост IRQ-диспетчера).
+    /// Извлечение очищает флаг: решение потребляется ровно один раз.
+    pub fn take_preempt_next(&mut self) -> Option<u64> {
+        self.preempt_next.take()
+    }
+
     pub fn scheduler_block_on_object(
         &mut self,
         object_id: usize,
@@ -137,5 +159,106 @@ impl<UMAP: MemoryInterfaceUserspace> LocalKernelCTL<UMAP> {
         if let Some(scheduler) = self.scheduler_mut() {
             scheduler.awake_task_from_wait(object_id);
         }
+    }
+
+    /// Тик планировщика (вызывает хук линии таймера порта). Возврат
+    /// `ChangeTask(next)` — команда порту переключить контекст; порт
+    /// выполняет её в хвосте IRQ-диспетчера (кадр уже виден) через
+    /// `set_preempt_next`, либо сразу — на границе сисколла.
+    pub fn scheduler_process_tick(&mut self, time: usize) -> TaskExecStatus {
+        self.scheduler_mut()
+            .map(|scheduler| scheduler.process_tick(time))
+            .unwrap_or(TaskExecStatus::NoAction)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::scheduller::WaitModel;
+
+    /// Фейковый Umap: lctl типизируется пространством пользователя, но
+    /// для преемпций/тик-обёрток память не нужна.
+    struct FakeUmap;
+    impl crate::traits::memory::MemoryInterfaceUserspace for FakeUmap {
+        fn allocate_memory_region(
+            &self,
+            _a: &dyn crate::traits::memory::FrameAllocator,
+            _c: usize,
+        ) -> Result<crate::traits::memory::MemoryPTR, crate::traits::memory::ErrorCode> {
+            unimplemented!()
+        }
+        fn deallocate_memory_region(
+            &self,
+            _a: &dyn crate::traits::memory::FrameAllocator,
+            _r: crate::traits::memory::MemoryPTR,
+            _c: usize,
+        ) -> Result<(), crate::traits::memory::ErrorCode> {
+            unimplemented!()
+        }
+        fn map_memory_region(
+            &self,
+            _a: &dyn crate::traits::memory::FrameAllocator,
+            _p: crate::traits::memory::MemoryPTR,
+            _v: usize,
+        ) -> Result<crate::traits::memory::MemoryPTR, crate::traits::memory::ErrorCode> {
+            unimplemented!()
+        }
+        fn unmap_memory_region(
+            &self,
+            _a: &dyn crate::traits::memory::FrameAllocator,
+            _p: crate::traits::memory::MemoryPTR,
+            _v: usize,
+        ) -> Result<(), crate::traits::memory::ErrorCode> {
+            unimplemented!()
+        }
+        fn translate(&self, _virt: usize) -> Option<usize> {
+            None
+        }
+    }
+
+    /// Планировщик-двойник: фиксированный ответ тика.
+    struct FixedSched(u64);
+    impl LocalSchedullerInterface for FixedSched {
+        fn process_tick(&mut self, _time: usize) -> crate::traits::scheduller::TaskExecStatus {
+            crate::traits::scheduller::TaskExecStatus::ChangeTask(self.0 as usize)
+        }
+
+        fn current_task(&self) -> Option<u64> {
+            None
+        }
+
+        fn assign_current_task_to_wait(&mut self, _object_id: usize, _model: WaitModel) -> usize {
+            0
+        }
+
+        fn awake_task_from_wait(&mut self, _queue_id: usize) {}
+    }
+
+    #[test]
+    fn process_tick_wrapper_forwards_to_scheduler() {
+        let mut lctl: LocalKernelCTL<FakeUmap> = LocalKernelCTL::new();
+        // Без планировщика — NoAction.
+        assert_eq!(
+            lctl.scheduler_process_tick(7),
+            crate::traits::scheduller::TaskExecStatus::NoAction
+        );
+        static SCHED: FixedSched = FixedSched(42);
+        lctl.install_scheduler(&SCHED);
+        assert_eq!(
+            lctl.scheduler_process_tick(7),
+            crate::traits::scheduller::TaskExecStatus::ChangeTask(42)
+        );
+    }
+
+    #[test]
+    fn preempt_flag_is_taken_once() {
+        let mut lctl: LocalKernelCTL<FakeUmap> = LocalKernelCTL::new();
+        assert_eq!(lctl.take_preempt_next(), None);
+        lctl.set_preempt_next(9);
+        lctl.set_preempt_next(11); // перезапись — последний выиграл
+        assert_eq!(lctl.take_preempt_next(), Some(11));
+        // Извлечение очищает: повторный take — пусто.
+        assert_eq!(lctl.take_preempt_next(), None);
     }
 }

@@ -2,12 +2,18 @@
 //! override для ISA 0, обычно GSI 2) → хук ядра.
 //!
 //! РАСПРЕДЕЛЕНИЕ ОТВЕТСТВЕННОСТИ (L4-философия «таймер — юзерспейсный
-//! сервис», ядро — только транспорт и учёт):
+//! сервис», ядро — только транспорт, учёт и вытеснение):
 //!   - АРХ-БЕКЕНД (этот модуль): программирует PIT, маршрут GSI в
 //!     IO-APIC, регистрирует хук линии. Сам НЕ ведёт время как сервис.
 //!   - ЯДРО (kernel_base::task::stats): на каждый тик учитывает квант
 //!     текущей задаче (cpu_ticks) и глобальный uptime — единственное,
 //!     что ядру нужно от времени (статистика/учёт).
+//!   - ПРЕЕМПЦИЯ: тик, заставший задачу в ring3, крутит карусель
+//!     планировщика (process_tick); выбранная задача вступает в хвосте
+//!     IRQ-диспетчера (cswitch::irq_preempt_tail — кадр уже на стеке).
+//!     Тик, заставший ядро (сисколл/цикл), карусель НЕ крутит —
+//!     вытеснение ядерного контекста делала бы небезопасным
+//!     семантику «текущей» в assign_current_task_to_wait/unregister_task.
 //!   - ЮЗЕРСПЕЙС: таймер-сервер ждёт линию таймера через WAIT по капе
 //!     (IrqLine GSI), ведёт uptime, раздаёт тайм-ауты/сны через IPC.
 //!
@@ -23,6 +29,7 @@
 use kernel_base::kernel_log;
 use kernel_base::lctl::LocalKernelCTL;
 use kernel_base::task::stats;
+use kernel_base::traits::scheduller::TaskExecStatus;
 
 use crate::irq;
 use crate::paging::X86Umap;
@@ -90,7 +97,7 @@ pub fn start_periodic_tick(hz: u32) {
         crate::ioapic::program_route(gsi, active_low, level, false);
         crate::ioapic::unmask_gsi(gsi);
         kernel_log!(
-            "timer: PIT {} Гц (делитель {}), GSI {} (edge/{}), вектор {}\n",
+            "timer: PIT {} Гц (делитель {}), GSI {} (edge/{}), вектор {}; преемпция ring3 активна\n",
             hz,
             divisor,
             gsi,
@@ -99,7 +106,7 @@ pub fn start_periodic_tick(hz: u32) {
         );
     } else {
         pic::unmask(LEGACY_TIMER_LINE as u8);
-        kernel_log!("timer: PIT {} Гц (делитель {}), legacy IRQ0\n", hz, divisor);
+        kernel_log!("timer: PIT {} Гц (делитель {}), legacy IRQ0; преемпция ring3 активна\n", hz, divisor);
     }
 
     stats::set_tick_hz(hz as u64);
@@ -108,13 +115,32 @@ pub fn start_periodic_tick(hz: u32) {
 
 /// Хук тика (вызывается из IDT-диспетчера с погашенными прерываниями):
 ///   1) квант текущей задаче + глобальный uptime (ядро);
-///   2) пробуждение юзерспейс-ожидающих линии (транспорт).
+///   2) дедлайны IPC_WAIT: будим всех, чей срок вышел (E_TIMEOUT хендлер
+///      вернёт сам после пробуждения; сообщение в тот же тик старше);
+///   3) преемпция: карусель планировщика на ring3-тиках (решение
+///      откладывается в lctl.preempt_next; исполнение — в хвосте
+///      диспетчера, где виден кадр).
+///
+/// Пробуждение ждущих линии (irq_wait) — ответственность диспетчера
+/// (единый путь для всех линий), здесь НЕ дублируется.
 ///
 /// EOI отправит irq_vector_dispatch ПОСЛЕ возврата хука.
-fn timer_tick_hook(line: u32, lctl: &mut LocalKernelCTL<X86Umap>) {
+fn timer_tick_hook(_line: u32, lctl: &mut LocalKernelCTL<X86Umap>, from_user: bool) {
     stats::on_tick(lctl);
-    kernel_base::task::irq_wait::on_irq_fired(lctl, line);
-    // Дедлайны IPC_WAIT: будим всех, чей срок вышел (E_TIMEOUT хендлер
-    // вернёт сам после пробуждения; сообщение в тот же тик старше).
     kernel_base::task::deadline::on_tick(lctl, kernel_base::task::stats::global_ticks());
+
+    // Преемпция: только тик, заставший задачу в ring3. Ротация
+    // планировщика на ядерном контексте разъехалась бы с семантикой
+    // assign_current_task_to_wait/unregister_task (они оперируют
+    // «текущей» серединой сисколла); такие тики не отнимают квант —
+    // вытеснение случится на первом тике в ring3 либо задача
+    // уступит/уснёт сама.
+    if from_user {
+        match lctl.scheduler_process_tick(kernel_base::task::stats::global_ticks() as usize) {
+            TaskExecStatus::ChangeTask(next) => {
+                lctl.set_preempt_next(next as u64);
+            }
+            _ => {}
+        }
+    }
 }

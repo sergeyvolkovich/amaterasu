@@ -85,6 +85,9 @@ pub struct TaskStatsCell {
     pub ipc_recv: AtomicU64,
     /// Блокировок на объектах ожидания.
     pub blocks: AtomicU64,
+    /// Вытеснений таймером (невольная потеря CPU — карусель тика;
+    /// дополнение к добровольным `yields`).
+    pub preempts: AtomicU64,
 }
 
 impl TaskStatsCell {
@@ -95,6 +98,7 @@ impl TaskStatsCell {
             ipc_sent: AtomicU64::new(0),
             ipc_recv: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
+            preempts: AtomicU64::new(0),
         }
     }
 
@@ -135,6 +139,14 @@ pub fn count_yield<Umap: MemoryInterfaceUserspace>(lctl: &LocalKernelCTL<Umap>) 
 pub fn count_block<Umap: MemoryInterfaceUserspace>(lctl: &LocalKernelCTL<Umap>) {
     if let Some(tcb) = lctl.get_current_task() {
         TaskStatsCell::bump(&tcb.stats().blocks);
+    }
+}
+
+/// Вытеснение текущей задачи таймером (хвост IRQ-диспетчера порта,
+/// в момент фактического переключения — кадр уже сохранён в TCB).
+pub fn count_preempt<Umap: MemoryInterfaceUserspace>(lctl: &LocalKernelCTL<Umap>) {
+    if let Some(tcb) = lctl.get_current_task() {
+        TaskStatsCell::bump(&tcb.stats().preempts);
     }
 }
 
@@ -183,6 +195,7 @@ pub struct TaskStatsSnapshot {
     pub ipc_sent: u64,
     pub ipc_recv: u64,
     pub blocks: u64,
+    pub preempts: u64,
 }
 
 impl TaskStatsSnapshot {
@@ -194,13 +207,15 @@ impl TaskStatsSnapshot {
             ipc_sent: cell.ipc_sent.load(Ordering::Relaxed),
             ipc_recv: cell.ipc_recv.load(Ordering::Relaxed),
             blocks: cell.blocks.load(Ordering::Relaxed),
+            preempts: cell.preempts.load(Ordering::Relaxed),
         }
     }
 
     /// Сериализация в 16 u64-слов (wire-формат сисколла TASK_STATS):
     /// [0] magic, [1] version, [2] task_cap_id, [3] cpu_ticks,
     /// [4] yields, [5] ipc_sent, [6] ipc_recv, [7] blocks,
-    /// [8] global_ticks, [9] tick_hz, [10..16] резерв (нули).
+    /// [8] global_ticks, [9] tick_hz, [10] timer_line, [11] preempts,
+    /// [12..16] резерв (нули).
     pub fn to_words(&self) -> [u64; STATS_WORDS] {
         let mut w = [0u64; STATS_WORDS];
         w[0] = STATS_MAGIC;
@@ -214,6 +229,7 @@ impl TaskStatsSnapshot {
         w[8] = global_ticks();
         w[9] = tick_hz();
         w[10] = timer_line() as u64;
+        w[11] = self.preempts;
         w
     }
 }

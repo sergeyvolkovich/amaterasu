@@ -31,6 +31,8 @@ pub struct TaskStats {
     pub ipc_recv: u64,
     /// Блокировок на объектах ожидания.
     pub blocks: u64,
+    /// Вытеснений таймером (невольная потеря CPU — карусель тика).
+    pub preempts: u64,
     /// Глобальный uptime системы (тики) — точное время ядра
     /// (не теряет тики, пропущенные одноразовым WaitIrq).
     pub global_ticks: u64,
@@ -79,5 +81,6 @@ pub fn parse(buf: &StatsBuf) -> Option<TaskStats> {
         global_ticks: buf[8],
         tick_hz: buf[9],
         timer_line: buf[10],
+        preempts: buf[11],
     })
 }

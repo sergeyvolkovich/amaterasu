@@ -365,7 +365,8 @@ pub struct CintTaskStats {
     pub blocks: u64,
     pub global_ticks: u64,
     pub tick_hz: u64,
-    pub reserved: [u64; 6],
+    pub preempts: u64,
+    pub reserved: [u64; 5],
 }
 
 const _: () = assert!(core::mem::size_of::<CintTaskStats>() == crate::stats::STATS_WORDS * 8);

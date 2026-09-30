@@ -518,6 +518,30 @@ pub(crate) struct IntFrame {
     pub(crate) ss: u64,
 }
 
+/// Кадр ВНЕШНЕГО ПРЕРЫВАНИЯ (раскладка irq_common; низ → верх).
+/// Отличие от IntFrame: у внешних IRQ CPU НЕ кладёт код ошибки — поле
+/// err отсутствует (офсеты asm-хвоста привязаны assert-ами ниже).
+/// pub(crate): читает хвост преемпции irq::irq_vector_dispatch_erased.
+#[repr(C)]
+pub(crate) struct IrqFrame {
+    pub(crate) rdi: u64, pub(crate) rsi: u64, pub(crate) rdx: u64, pub(crate) rcx: u64,
+    pub(crate) rax: u64, pub(crate) rbx: u64, pub(crate) rbp: u64,
+    pub(crate) r8: u64, pub(crate) r9: u64, pub(crate) r10: u64, pub(crate) r11: u64,
+    pub(crate) r12: u64, pub(crate) r13: u64, pub(crate) r14: u64, pub(crate) r15: u64,
+    // стаб: номер вектора (код ошибки у внешних IRQ отсутствует)
+    pub(crate) nr: u64,
+    // аппаратный кадр
+    pub(crate) rip: u64, pub(crate) cs: u64, pub(crate) rflags: u64, pub(crate) rsp: u64,
+    pub(crate) ss: u64,
+}
+
+// Контракты naked-хвоста irq_common: номер вектора по +120 (15 GPR),
+// CPL-проверка по CS на +136 (без err — в отличие от исключений).
+const _: () = assert!(core::mem::size_of::<IrqFrame>() == 21 * 8);
+const _: () = assert!(core::mem::offset_of!(IrqFrame, nr) == 120);
+const _: () = assert!(core::mem::offset_of!(IrqFrame, rip) == 128);
+const _: () = assert!(core::mem::offset_of!(IrqFrame, cs) == 136);
+
 /// Число информирующих векторов (0..31 — исключения; 32..255 —
 /// линии IRQ/MSI через irq::irq_vector_dispatch; 255 молчит — спурьё).
 const EXCEPTION_VECTORS: usize = 32;
@@ -996,9 +1020,10 @@ irq_stub!(irq252, 252);irq_stub!(irq253, 253);irq_stub!(irq254, 254);
 /// [rsp][ss] — у внешних прерываний CPU НЕ кладёт код ошибки, стаб
 /// кладёт только номер вектора. IRQ может прийти и в ring3 (GS base в
 /// этот момент пользовательский) — для чтения per-CPU блока делается
-/// условный swapgs по CPL сегмента CS кадра. Обработчик ВОЗВРАЩАЕТСЯ:
-/// прерванный поток продолжается (будящиеся задачи подхватит цикл
-/// планировщика на ближайшей границе сисколла/уступки).
+/// условный swapgs по CPL сегмента CS кадра. Диспетчеру передаётся И
+/// кадр (rsi): если тик таймера выбрал преемпцию ring3-задачи, хвост
+/// диспетчера сохранит кадр в её TCB и уйдёт в следующую задачу БЕЗ
+/// возврата сюда (iretq — только для продолжения прерванного потока).
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn irq_common() -> ! {
@@ -1013,6 +1038,7 @@ unsafe extern "C" fn irq_common() -> ! {
         "swapgs",                       // GS ← ядерный per-CPU
         "1:",
         "mov rdi, [rsp + 120]",         // nr (вектор)
+        "mov rsi, rsp",                 // кадр IrqFrame (низ кадра)
         "call {dispatch}",              // lctl берёт сам, через GS base
         "mov rax, [rsp + 136]",
         "test al, 3",
@@ -1027,6 +1053,96 @@ unsafe extern "C" fn irq_common() -> ! {
         "iretq",
         dispatch = sym crate::irq::irq_vector_dispatch_erased,
     )
+}
+
+// ─── Преемпция ring3 (тик таймера → хвост IRQ-диспетчера) ────────────────────
+
+/// Кадр внешнего прерывания → ПОЛНЫЙ слот возобновления TCB
+/// (RESUME_WORDS слов). Раскладка тождественна сисколл-кадру SysFrame,
+/// НО: у SYSCALL регистры RCX/R11 портятся самой инструкцией (там лежат
+/// RIP/RFLAGS — кадр их хранит в своих полях), а IRQ сохраняет РЕАЛЬНЫЕ
+/// пользовательские RCX/R11 — они уходят в расширение фолт-доставки
+/// (слова 18/19, читает resume_from_frame). Слова 20..24 — нули
+/// (RESUME_WORDS=24 > 20 используемых).
+pub(crate) fn irq_frame_resume_words(frame: &IrqFrame) -> [u64; kernel_base::task::tcb::RESUME_WORDS] {
+    let mut w = [0u64; kernel_base::task::tcb::RESUME_WORDS];
+    w[0] = frame.rdi;
+    w[1] = frame.rsi;
+    w[2] = frame.rdx;
+    w[3] = frame.rax;
+    w[4] = frame.rbx;
+    w[5] = frame.rbp;
+    w[6] = frame.r8;
+    w[7] = frame.r9;
+    w[8] = frame.r10;
+    w[9] = frame.r12;
+    w[10] = frame.r13;
+    w[11] = frame.r14;
+    w[12] = frame.r15;
+    w[13] = frame.rip; // SysFrame.rip (+104)
+    w[14] = frame.cs;
+    w[15] = frame.rflags;
+    w[16] = frame.rsp;
+    w[17] = frame.ss;
+    w[18] = frame.rcx; // SYSFRAME_RCX_WORD: реальные RCX/R11 прерванной задачи
+    w[19] = frame.r11; // SYSFRAME_R11_WORD
+    w
+}
+
+/// Хвост преемпции (зывается из irq::irq_vector_dispatch_erased после
+/// полного прохождения диспетчеризации — хуков, пробуждения ждущих, EOI):
+/// если тик таймера в ЭТОМ ЖЕ прерывании выбрал другую задачу, а
+/// прерванный контекст — ring3, кадр уходит в TCB вытесненной задачи и
+/// управление передаётся выбранной (НЕ ВОЗВРАЩАЕТСЯ — тот же путь, что
+/// уступка внутри сисколла: hook(next) → enter_task порта).
+///
+/// Почему только ring3: тик, заставший ядро (сисколл/цикл планировщика),
+/// НЕ крутит карусель вовсе (ротация state планировщика разъехалась бы с
+/// семантикой assign_current_task_to_wait/unregister_task, которые
+/// оперируют «текущей» серединой сисколла); такие тики просто не
+/// отнимают квант — вытеснение случится на первом тике в ring3 либо
+/// задача уступит/уснёт сама.
+///
+/// GS/CR3-контракт: идентичен пути уступки — swapgs уже сделан стабом
+/// (GS ядерный), return_to_scheduler внутри enter_task сам переключит
+/// CR3 и стек; брошенный exception-стек перезапишется следующим входом
+/// из ring3 (TSS.RSP0).
+pub(crate) fn irq_preempt_tail(frame: &mut IrqFrame) {
+    // Двойная проверка CPL: хвост зовётся только для ring3-входов.
+    if frame.cs & 3 != 3 {
+        return;
+    }
+    let lctl = X86Backend::get_local_base();
+    let Some(next) = lctl.take_preempt_next() else {
+        return; // обычный IRQ: прерванный поток продолжается (iretq)
+    };
+    // Карусель могла оставить текущую (одна живая) — продолжаем без смены.
+    let Some(cur) = lctl.current_task_cap_id() else {
+        return;
+    };
+    if next == cur {
+        return;
+    }
+    // Кадр — реальное CPU-состояние (каноничен по построению); гард
+    // страховочный: нарушение означало бы порчу стаба — честно видим.
+    if !is_user_canonical(frame.rip) || !is_user_canonical(frame.rsp) {
+        kernel_base::kernel_log!(
+            "preempt: неканоничный кадр ring3 rip={:#x} rsp={:#x} — вытеснение отменено\n",
+            frame.rip,
+            frame.rsp
+        );
+        return;
+    }
+    // Кадр вытесненной задачи — в её TCB (возобновление с места тика).
+    if let Some(tcb) = lctl.get_current_task() {
+        tcb.save_resume(&irq_frame_resume_words(frame));
+    }
+    kernel_base::task::stats::count_preempt(lctl);
+    // Управление — выбранной планировщиком задаче (не возвращается).
+    match switch_hook() {
+        Some(hook) => hook(next),
+        None => panic!("cswitch: хук переключения не установлен (set_switch_hook)"),
+    }
 }
 
 // ─── SYSCALL entry ───────────────────────────────────────────────────────────
@@ -1487,5 +1603,79 @@ unsafe fn enable_fpu() {
             "mov cr4, rax",
             out("rax") _,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Конверсия кадра IRQ → слот возобновления: раскладка обязана быть
+    /// тождественна SysFrame (читает resume_from_frame), а РЕАЛЬНЫЕ
+    /// пользовательские RCX/R11 — ложиться в слова 18/19 (расширение
+    /// фолт-доставки). Ноль на слове = потеря регистра на возобновлении.
+    #[test]
+    fn irq_frame_resume_words_layout() {
+        let frame = IrqFrame {
+            rdi: 0xA000, rsi: 0xA001, rdx: 0xA002, rcx: 0xA003,
+            rax: 0xA004, rbx: 0xA005, rbp: 0xA006,
+            r8: 0xA007, r9: 0xA008, r10: 0xA009, r11: 0xA00A,
+            r12: 0xA00B, r13: 0xA00C, r14: 0xA00D, r15: 0xA00E,
+            nr: 36, // вектор не попадает в слот
+            rip: 0x4001_0000,
+            cs: 0x2B, // USER_CS|3
+            rflags: 0x202,
+            rsp: 0x7FF0_00F0,
+            ss: 0x23,
+        };
+        let w = irq_frame_resume_words(&frame);
+        // GPR — тождественно SysFrame (+0..+96, без RCX/R11).
+        assert_eq!(w[0], 0xA000); // rdi
+        assert_eq!(w[1], 0xA001); // rsi
+        assert_eq!(w[2], 0xA002); // rdx
+        assert_eq!(w[3], 0xA004, "rax: SysFrame+24 (в IRQ-кадре после rcx)");
+        assert_eq!(w[4], 0xA005); // rbx
+        assert_eq!(w[5], 0xA006); // rbp
+        assert_eq!(w[6], 0xA007); // r8
+        assert_eq!(w[7], 0xA008); // r9
+        assert_eq!(w[8], 0xA009); // r10
+        assert_eq!(w[9], 0xA00B); // r12 (SysFrame не хранит r11 рядом)
+        assert_eq!(w[10], 0xA00C); // r13
+        assert_eq!(w[11], 0xA00D); // r14
+        assert_eq!(w[12], 0xA00E); // r15
+        // Аппаратный кадр — позиции SysFrame (+104..+136).
+        assert_eq!(w[13], 0x4001_0000, "rip");
+        assert_eq!(w[14], 0x2B, "cs");
+        assert_eq!(w[15], 0x202, "rflags");
+        assert_eq!(w[16], 0x7FF0_00F0, "rsp");
+        assert_eq!(w[17], 0x23, "ss");
+        // Расширение фолт-доставки: РЕАЛЬНЫЕ RCX/R11 (у SysFrame их нет).
+        assert_eq!(w[SYSFRAME_RCX_WORD], 0xA003, "пользовательский RCX");
+        assert_eq!(w[SYSFRAME_R11_WORD], 0xA00A, "пользовательский R11");
+        // Хвост слота — нули (RESUME_WORDS=24 > 20 используемых).
+        for i in 20..kernel_base::task::tcb::RESUME_WORDS {
+            assert_eq!(w[i], 0, "слово {i} обязано быть нулевым");
+        }
+        // Вектор не просачивается в слот (не регистр пользователя).
+        assert!(!w.contains(&36), "nr — служебное слово стаба, в слоте не место");
+    }
+
+    /// Резюме-гард resume_user (cs&3==3, каноничность) срабатывает на
+    /// кадрах IRQ-преемпции: cs/rflags/rip/rsp — реальное ring3-состояние.
+    #[test]
+    fn irq_frame_user_fields_pass_resume_guards() {
+        let frame = IrqFrame {
+            rdi: 0, rsi: 0, rdx: 0, rcx: 0, rax: 0, rbx: 0, rbp: 0,
+            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+            nr: 32,
+            rip: 0x4010_0000,
+            cs: USER_CS as u64 | 3,
+            rflags: 0x202,
+            rsp: 0x7FFF_FFF0,
+            ss: USER_DS as u64 | 3,
+        };
+        let w = irq_frame_resume_words(&frame);
+        assert_eq!(w[14] & 3, 3, "CPL3 в кадре возобновления");
+        assert!(is_user_canonical(w[13]) && is_user_canonical(w[16]));
     }
 }

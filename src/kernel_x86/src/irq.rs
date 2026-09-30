@@ -9,12 +9,15 @@
 //!   - EOI: LAPIC (xAPIC/x2APIC) для всей доставки IO-APIC/MSI;
 //!     legacy-PIC fallback, если MADT без IO-APIC.
 //!
-//! ABI-инвариант диспетчера: стаб IDT получает вектор в RDI →
-//! irq_vector_dispatch → линия → хуки порта → пробуждение ждущих
-//! (kernel_base::task::irq_wait) → EOI. Обработчики НЕ регистрируются
-//! per-line в этом файле для юзерспейс-линий: единственный механизм
-//! доставки задачам — cap-нотификации irq_wait; хуки здесь — для
-//! ВНУТРЕННИХ потребителей ядра (таймер).
+//! ABI-инвариант диспетчера: стаб IDT получает в RDI вектор и в RSI
+//! указатель на кадр IRQ → irq_vector_dispatch → линия → хуки порта →
+//! пробуждение ждущих (kernel_base::task::irq_wait) → EOI → хвост
+//! преемпции: если тик таймера в этом же прерывании выбрал другую
+//! задачу, а прерван был ring3 — кадр уходит в TCB, управление —
+//! следующей задаче (cswitch::irq_preempt_tail). Обработчики НЕ
+//! регистрируются per-line в этом файле для юзерспейс-линий: единственный
+//! механизм доставки задачам — cap-нотификации irq_wait; хуки здесь —
+//! для ВНУТРЕННИХ потребителей ядра (таймер).
 
 use kernel_base::irqsafe::IrqSafeSpinMutex;
 use kernel_base::traits::ArchImplementation as _;
@@ -349,9 +352,13 @@ fn mask_line_for_teardown(line: u32) {
 
 // ─── Хуки внутренних потребителей (таймер и т.п.) ────────────────────────────
 
-/// Хук линии ядра: (номер линии, per-core lctl). Вызывается из
-/// IDT-диспетчера с отключёнными прерываниями — обязан быть коротким.
-pub type IrqLineHook = fn(line: u32, lctl: &mut LocalKernelCTL<X86Umap>);
+/// Хук линии ядра: (номер линии, per-core lctl, прерван ли ring3).
+/// Вызывается из IDT-диспетчера с отключёнными прерываниями — обязан
+/// быть коротким. Флаг from_user — решение о контексте прерывания: тик
+/// таймера крутит карусель планировщика ТОЛЬКО когда заставший контекст
+/// — ring3 (ротация на ядерном контексте разъехалась бы с семантикой
+/// «текущей» середи́ны сисколла).
+pub type IrqLineHook = fn(line: u32, lctl: &mut LocalKernelCTL<X86Umap>, from_user: bool);
 
 /// Реестр хуков ПОРТА (внутренние потребители, не юзерспейс-линии).
 /// Фиксированный массив — потребители ядра перечислимы (сегодня: таймер);
@@ -379,7 +386,13 @@ pub fn register_line_hook(line: u32, hook: IrqLineHook) -> Result<(), &'static s
 
 /// Точка входа IDT-диспетчеризации (cswitch::irq_common; прерывания
 /// выключены, GS base ядерный): вектор → линия → хуки → ждущие → EOI.
-pub fn irq_vector_dispatch(vector: u8, lctl: &mut LocalKernelCTL<X86Umap>) {
+/// `from_user` — прерван ring3 (по CS кадра): единственный контекст,
+/// где тик таймера имеет право крутить карусель планировщика.
+pub fn irq_vector_dispatch(
+    vector: u8,
+    lctl: &mut LocalKernelCTL<X86Umap>,
+    from_user: bool,
+) {
     // Спурьё LAPIC: EOI не нужен, линия не назначена.
     if vector == crate::apic::SPURIOUS_VECTOR {
         return;
@@ -422,13 +435,14 @@ pub fn irq_vector_dispatch(vector: u8, lctl: &mut LocalKernelCTL<X86Umap>) {
         }
     };
 
-    // Хуки внутренних потребителей (таймер: учёт кванта + дедлайны).
+    // Хуки внутренних потребителей (таймер: учёт кванта + дедлайны +
+    // карусель планировщика на ring3-тиках).
     {
         let hooks = LINE_HOOKS.lock();
         for (l, h) in hooks.iter() {
             if *l == line {
                 if let Some(hook) = h {
-                    hook(line, lctl);
+                    hook(line, lctl, from_user);
                 }
             }
         }
@@ -450,12 +464,26 @@ pub fn irq_vector_dispatch(vector: u8, lctl: &mut LocalKernelCTL<X86Umap>) {
 }
 
 /// naked-мост из cswitch::irq_common: GS base уже ядерный (условный
-/// swapgs выполнен стабом), номер вектора — в RDI. Берёт per-CPU lctl
-/// через GS base и уходит в диспетчеризацию.
-pub(crate) unsafe extern "C" fn irq_vector_dispatch_erased(vector: u8) {
+/// swapgs выполнен стабом), номер вектора — в RDI, кадр IrqFrame — в
+/// RSI. Берёт per-CPU lctl через GS base, уходит в диспетчеризацию, а
+/// для ring3-входов выполняет хвост преемпции (тики таймера откладывают
+/// решение в lctl.preempt_next; здесь оно исполняется над кадром).
+pub(crate) unsafe extern "C" fn irq_vector_dispatch_erased(
+    vector: u8,
+    frame: *mut crate::cswitch::IrqFrame,
+) {
+    // SAFETY: контракт irq_common — кадр лежит на текущем стеке (низ
+    // кадра = RSP на момент call), валиден до возврата моста.
+    let from_user = unsafe { (*frame).cs } & 3 == 3;
     // SAFETY: контракт irq_common — GS base ядерный на момент вызова.
     let lctl = crate::X86Backend::get_local_base();
-    irq_vector_dispatch(vector, lctl);
+    irq_vector_dispatch(vector, lctl, from_user);
+    // Хвост преемпции: только ring3-входы (для ядерных тик не крутит
+    // карусель — флаг всегда пуст, но берём безусловно для симметрии).
+    if from_user {
+        // SAFETY: кадр всё ещё валиден (тот же стек, мы не возвращались).
+        crate::cswitch::irq_preempt_tail(unsafe { &mut *frame });
+    }
 }
 
 // ─── Хук page fault (вектор 14) ──────────────────────────────────────────────
@@ -541,7 +569,7 @@ mod tests {
 
     #[test]
     fn line_hook_registration_and_replacement() {
-        fn dummy(_line: u32, _lctl: &mut LocalKernelCTL<X86Umap>) {}
+        fn dummy(_line: u32, _lctl: &mut LocalKernelCTL<X86Umap>, _from_user: bool) {}
         // Хук первой линии — свободный слот; повторно — тот же слот.
         assert!(register_line_hook(999, dummy).is_ok());
         assert!(register_line_hook(999, dummy).is_ok());

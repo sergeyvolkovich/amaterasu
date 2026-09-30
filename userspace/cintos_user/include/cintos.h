@@ -146,7 +146,8 @@ typedef struct CintTaskStats {
     uint64_t blocks;
     uint64_t global_ticks; /* uptime системы (точное время ядра) */
     uint64_t tick_hz;      /* частота тика порта (0 — без таймера) */
-    uint64_t reserved[6];
+    uint64_t preempts;     /* вытеснений таймером */
+    uint64_t reserved[5];
 } CintTaskStats;
 
 /* Снапшот статистики: своей — без прав, чужой — право STATS_READ

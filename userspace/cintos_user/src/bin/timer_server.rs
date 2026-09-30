@@ -110,6 +110,8 @@ fn log_report(local: u64, s: &stats::TaskStats) {
     l.u64(s.cpu_ticks);
     l.str(b" yields=");
     l.u64(s.yields);
+    l.str(b" preempt=");
+    l.u64(s.preempts);
     l.str(b" ipc=");
     l.u64(s.ipc_sent + s.ipc_recv);
     l.str(b" blocks=");
