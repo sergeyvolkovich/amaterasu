@@ -1,4 +1,5 @@
 use core::{
+    cell::UnsafeCell,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -83,6 +84,72 @@ impl<Umap: MemoryInterfaceUserspace> GTcb<Umap> {
 /// ТОЛЬКО порт; kernel_base хранит их как непрозрачный массив.
 pub const RESUME_WORDS: usize = 24;
 
+/// Область FPU/SSE-состояния задачи: 512 байт в раскладке fxsave64
+/// (Intel SDM Vol.1 §10.3: FCW@0x00, FSW@0x02, MXCSR@0x18,
+/// ST/MM@0x20, XMM0..15@0xA0..0x1F0). Непрозрачна для kernel_base —
+/// пишет и читает её ТОЛЬКО архитектурный порт: fxsave при уходе
+/// задачи с процессора (сисколл-вход/фолт-вход, затем копия в TCB при
+/// переключении), fxrstor при входе в задачу.
+///
+/// Выравнивание 8 (достаточно для rep movsq/memcpy-копий): требование
+/// 16-байтового выравнивания операнда FXSAVE/FXRSTOR (#GP иначе) порт
+/// обеспечивает на своей стороне — bounce-скретч per-CPU, выровненный
+/// статически. Вклад в TCB: +512 Б на задачу.
+#[repr(C, align(8))]
+pub struct FpuArea {
+    bytes: UnsafeCell<[u8; Self::SIZE]>,
+}
+
+impl FpuArea {
+    /// Размер fxsave64-области (512 Б).
+    pub const SIZE: usize = 512;
+    /// Офсет MXCSR в fxsave64-раскладке.
+    pub const MXCSR_OFF: usize = 0x18;
+    /// Офсет FCW в fxsave64-раскладке.
+    pub const FCW_OFF: usize = 0x00;
+
+    /// Шаблон «свежая задача»: FCW = 0x037F (все x87-исключения
+    /// замаскированы), MXCSR = 0x1F80 (все SSE-исключения замаскированы,
+    /// округление к ближайшему), ST/MM/XMM — нули. Эквивалент
+    /// fninit + ldmxcsr 0x1F80: первый fxrstor задачи выдаёт
+    /// детерминированное состояние без единой исполняемой SIMD-инструкции
+    /// в ядре (шаблон — чистые байты).
+    pub const fn new() -> Self {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[Self::FCW_OFF] = 0x7F;
+        bytes[Self::FCW_OFF + 1] = 0x03;
+        bytes[Self::MXCSR_OFF] = 0x80;
+        bytes[Self::MXCSR_OFF + 1] = 0x1F;
+        Self {
+            bytes: UnsafeCell::new(bytes),
+        }
+    }
+
+    /// Сырой указатель для порт-кода (копии rep movsq / memcpy).
+    pub fn raw_ptr(&self) -> *mut u8 {
+        self.bytes.get().cast()
+    }
+
+    /// Перезаписать область копией `src` (порт: fxsave-скретч → TCB при
+    /// уходе задачи с CPU).
+    ///
+    /// # Safety
+    /// `src` валиден на [`Self::SIZE`] байт; вызов — только когда задача
+    /// не исполняется ни на одном ядре (уход с CPU / блокировка /
+    /// фолт-доставка): иначе гонка с fxrstor этого же ядра.
+    pub unsafe fn store_raw(&self, src: *const u8) {
+        // SAFETY: контракт вызова выше; области не пересекаются (TCB —
+        // ядерная память, скретч — per-CPU статика).
+        unsafe { core::ptr::copy_nonoverlapping(src, self.bytes.get().cast(), Self::SIZE) };
+    }
+}
+
+impl Default for FpuArea {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Слот возобновления задачи: сохранённый архитектурным портом кадр
 /// контекста (регистры + аппаратный кадр входа в ring3).
 ///
@@ -159,6 +226,10 @@ pub struct TCB<Umap: MemoryInterfaceUserspace> {
     /// Сохранённый кадр контекста (yield/усыпание): задача
     /// возобновляется с места остановки, а не с точки входа.
     resume: ResumeSlot,
+    /// FPU/SSE-состояние (fxsave64-раскладка, пишет/читает порт):
+    /// сохраняется при уходе задачи с CPU, восстанавливается при входе.
+    /// Шаблон при создании — см. [`FpuArea::new`].
+    fpu: FpuArea,
     /// Статистика задачи: ядро только СЧИТАЕТ события в момент их
     /// возникновения (единственное место, где они видны); отчётность
     /// и интерпретация перенесены в юзерспейс (сисколл TASK_STATS).
@@ -176,6 +247,7 @@ impl<Umap: MemoryInterfaceUserspace> TCB<Umap> {
             task_stack_size: AtomicU64::new(0),
             initial_stack_top: AtomicU64::new(0),
             resume: ResumeSlot::new(),
+            fpu: FpuArea::new(),
             stats: TaskStatsCell::new(),
         }
     }
@@ -195,6 +267,12 @@ impl<Umap: MemoryInterfaceUserspace> TCB<Umap> {
     /// планировщиком). None — кадра нет, задача входит с точки входа.
     pub fn take_resume(&self) -> Option<[u64; RESUME_WORDS]> {
         self.resume.take()
+    }
+
+    /// FPU/SSE-область задачи (fxsave64-раскладка; пишет порт при уходе
+    /// задачи с CPU, читает при входе — см. [`FpuArea`]).
+    pub fn fpu_area(&self) -> &FpuArea {
+        &self.fpu
     }
 
     /// Переписать слово в СОХРАНЁННОМ кадре возобновления задачи
@@ -276,5 +354,54 @@ impl<Umap: MemoryInterfaceUserspace> TCB<Umap> {
             self.task_code_size.load(Ordering::Acquire),
             self.task_stack_size.load(Ordering::Acquire),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Шаблон «свежая задача»: FCW/MXCSR — замаскированные исключения
+    /// (fxrstor нулевой задачи не поднимет #NM/#XM на первом же SSE-опе).
+    #[test]
+    fn fpu_area_template_masks_exceptions() {
+        let area = FpuArea::new();
+        let raw = area.raw_ptr();
+        // SAFETY: чтение собственной 512-байтной области шаблона.
+        let bytes = unsafe { core::slice::from_raw_parts(raw, FpuArea::SIZE) };
+        // FCW @0x00: 0x037F (little-endian) — все x87-исключения замаскированы.
+        assert_eq!(u16::from_le_bytes([bytes[0x00], bytes[0x01]]), 0x037F);
+        // MXCSR @0x18: 0x1F80 — все SSE-исключения замаскированы.
+        assert_eq!(
+            u32::from_le_bytes([
+                bytes[0x18],
+                bytes[0x19],
+                bytes[0x1A],
+                bytes[0x1B]
+            ]),
+            0x1F80
+        );
+        // Остальное (ST/MM/XMM, FSW/FOP/IP/DP) — нули: детерминированный старт.
+        for (i, b) in bytes.iter().enumerate() {
+            if i == 0x00 || i == 0x01 || (0x18..0x1C).contains(&i) {
+                continue;
+            }
+            assert_eq!(*b, 0, "байт {i:#x} шаблона обязан быть нулевым");
+        }
+    }
+
+    /// store_raw: побайтовая копия (порт кладёт fxsave-скретч в TCB).
+    #[test]
+    fn fpu_area_store_raw_copies_bytes() {
+        let area = FpuArea::new();
+        let mut src = [0xAAu8; FpuArea::SIZE];
+        src[0x18] = 0x1F;
+        // SAFETY: src — живой локальный буфер нужного размера.
+        unsafe { area.store_raw(src.as_ptr()) };
+        // SAFETY: чтение собственной области после записи.
+        let bytes = unsafe { core::slice::from_raw_parts(area.raw_ptr(), FpuArea::SIZE) };
+        assert!(bytes.iter().zip(src.iter()).all(|(a, b)| a == b));
+        // Выравнивание области — минимум 8 (гарантия repr).
+        assert_eq!(area.raw_ptr() as usize % 8, 0);
     }
 }

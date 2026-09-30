@@ -864,6 +864,11 @@ fn enter_task(next_id: u64) -> ! {
     let resume = tcb.take_resume();
     let (entry, _code, _stack) = tcb.runtime();
     let user_rsp = tcb.initial_stack_top() as usize;
+    // FPU/SSE-область TCB (fxsave64-раскладка): resume/dispatch
+    // восстановят из неё состояние задачи (для новой — шаблон масок).
+    // Указатель — до drop(tasks): адрес TCB стабилен (слэб), но
+    // заимствование tcb живёт только под локом.
+    let fpu_ptr = tcb.fpu_area().raw_ptr();
     lctl.set_current_task(NonNull::from(tcb));
     drop(tasks);
 
@@ -871,8 +876,8 @@ fn enter_task(next_id: u64) -> ! {
         Some(full) => {
             // Возобновление: ПОЛНЫЙ слот возобновления (слова 18/19 —
             // RCX/R11 для задач, упавших по фолту и возвращённых
-            // FAULT_REPLY; у сисколл-кадров — нули, безвредно).
-            cswitch::resume_user(root, &full)
+            // FAULT_REPLY; у сисколл-кадров — нули, безвредно) + FPU из TCB.
+            cswitch::resume_user(root, &full, fpu_ptr)
         }
         None => {
             kernel_log!(
@@ -881,7 +886,7 @@ fn enter_task(next_id: u64) -> ! {
                 entry,
                 user_rsp
             );
-            cswitch::dispatch_user(root, entry as usize, user_rsp)
+            cswitch::dispatch_user(root, entry as usize, user_rsp, fpu_ptr)
         }
     }
 }

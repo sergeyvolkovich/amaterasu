@@ -171,10 +171,13 @@ pub(crate) unsafe fn user_fault_entry(frame: &IntFrame) -> bool {
 
     // Доставка состоялась, упавшая блокирована на fault-объекте.
     // Сохраняем её РАСШИРЕННЫЙ кадр (SysFrame + RCX/R11 — повтор
-    // упавшей инструкции обязан видеть все регистры) и уходим в цикл
-    // планировщика: возобновит её FAULT_REPLY (enter_task → resume_user).
+    // упавшей инструкции обязан видеть все регистры) и FPU/SSE
+    // (fxsave стаба idt_common в скретче — переживёт переключение),
+    // уходим в цикл планировщика: возобновит её FAULT_REPLY
+    // (enter_task → resume_user — fxrstor из TCB).
     if let Some(tcb) = lctl.get_current_task() {
         tcb.save_resume(&fault_frame_words(frame));
+        cswitch::stash_fpu_to_tcb(lctl);
     }
     // SAFETY: контракт модуля cswitch — ядерный GS активен, локов не
     // держим (доставка завершилась), исключительный стек отбрасывается.

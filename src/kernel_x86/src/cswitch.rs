@@ -34,6 +34,18 @@
 //! покинутый кадр); следующий SYSCALL любой задачи начинает запись
 //! кадра с TOP — покинутые кадры перезатираются.
 //!
+//! FPU/SSE (eager-модель, БЕЗ CR0.TS-фолтов): XMM/x87-состояние
+//! сохраняется при КАЖДОМ входе из ring3 (SYSCALL/IRQ/исключение —
+//! fxsave64 в per-CPU скретч gs:[OFF_FPU]) и восстанавливается при
+//! выходе (SYSRET/iretq — fxrstor64). При переключении задач скретч
+//! копируется в FPU-область TCB уходящей задачи (stash_fpu_to_tcb —
+//! рядом с save_resume), при входе — fxrstor из TCB через bounce-копию
+//! в скретч (FXRSTOR требует 16-выровненный операнд; TCB-область —
+//! только 8-выровненная). В ядерном режиме FPU не сохраняется
+//! (IRQ/исключение из ring0 не трогают скретч — там может лежать ещё
+//! живое ring3-состояние сисколла; SSE-опасности ЯДРА — отдельная
+//! тема, см. docs/kernel.md).
+//!
 //! Порядок инициализации (важно!):
 //!   1. [`early_boot_init`] — ДО KernelCTL::new_and_init: загрузка GDT
 //!      (слот 0 BSP) перезагружает сегментные регистры, а `mov gs, ...`
@@ -87,6 +99,7 @@ pub const OFF_USER_RSP: usize = 0x08; // скретч: пользователь�
 pub const OFF_SCHED_STACK: usize = 0x10; // верх стека цикла планировщика
 pub const OFF_SCHED_LOOP: usize = 0x18; // адрес scheduler_loop_entry
 pub const OFF_ROOT: usize = 0x20; // физический корень таблицы ядра
+pub const OFF_FPU: usize = 0x28; // указатель на per-CPU FPU-скретч (fxsave/fxrstor)
 
 /// Fixed-часть per-CPU области: читается naked-стабами через GS.
 /// Раскладка ЗАФИКСИРОВАНА (офсеты — константы выше).
@@ -97,6 +110,9 @@ pub struct PerCpuFixed {
     pub sched_stack_top: u64,
     pub sched_loop_entry: u64,
     pub kernel_root_phys: u64,
+    /// Указатель на 512-байтный fxsave-скретч ЭТОГО ядра
+    /// ([`FpuScratch`]; 16-выровнен — требование FXSAVE/FXRSTOR).
+    pub fpu_scratch: u64,
 }
 
 const _: () = assert!(core::mem::offset_of!(PerCpuFixed, syscall_kstack_top) == OFF_KSTACK);
@@ -104,6 +120,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpuFixed, user_rsp_save) == OFF_U
 const _: () = assert!(core::mem::offset_of!(PerCpuFixed, sched_stack_top) == OFF_SCHED_STACK);
 const _: () = assert!(core::mem::offset_of!(PerCpuFixed, sched_loop_entry) == OFF_SCHED_LOOP);
 const _: () = assert!(core::mem::offset_of!(PerCpuFixed, kernel_root_phys) == OFF_ROOT);
+const _: () = assert!(core::mem::offset_of!(PerCpuFixed, fpu_scratch) == OFF_FPU);
 
 /// Per-CPU область ядра: GS base каждого ядра указывает сюда.
 /// fixed — для стабов; lctl — per-core блок ядра (LocalKernelCTL).
@@ -112,6 +129,16 @@ pub struct PerCpuArea {
     pub fixed: PerCpuFixed,
     pub lctl: LocalKernelCTL<crate::paging::X86Umap>,
 }
+
+/// Per-CPU FPU-скретч: цель fxsave64 стаба при входе из ring3 и
+/// источник fxrstor64 при возврате в ту же задачу; для входа в ДРУГУЮ
+/// задачу — bounce-буфер (копия из TCB, затем fxrstor — операнд
+/// FXRSTOR обязан быть 16-выровнен, TCB-область гарантирует только 8).
+#[repr(C, align(16))]
+pub struct FpuScratch(pub(crate) [u8; kernel_base::task::tcb::FpuArea::SIZE]);
+
+const _: () = assert!(core::mem::size_of::<FpuScratch>() == 512);
+const _: () = assert!(core::mem::align_of::<FpuScratch>() == 16);
 
 impl PerCpuArea {
     const fn zeroed() -> Self {
@@ -122,6 +149,7 @@ impl PerCpuArea {
                 sched_stack_top: 0,
                 sched_loop_entry: 0,
                 kernel_root_phys: 0,
+                fpu_scratch: 0,
             },
             lctl: LocalKernelCTL::new(),
         }
@@ -199,6 +227,11 @@ static mut PER_CPU_KSTACK: [KStack; MAX_CPUS] = [const { KStack([0; 32 * 1024]) 
 static mut PER_CPU_SCHED_STACK: [SStack; MAX_CPUS] =
     [const { SStack([0; 32 * 1024]) }; MAX_CPUS];
 static mut PER_CPU_AREAS: [PerCpuArea; MAX_CPUS] = [const { PerCpuArea::zeroed() }; MAX_CPUS];
+/// Per-CPU FPU-скретчи (fxsave/fxrstor; 16-выровнены статически —
+/// требование операнда FXSAVE/FXRSTOR, #GP иначе). Указатель на элемент
+/// слота кладётся в fixed.fpu_scratch (setup_cpu_area).
+static mut PER_CPU_FPU: [FpuScratch; MAX_CPUS] =
+    [const { FpuScratch([0; kernel_base::task::tcb::FpuArea::SIZE]) }; MAX_CPUS];
 
 /// Общий для всех ядер физический корень ядерной таблицы (AP читает до
 /// установки своего GS base — ещё на бут-таблицах).
@@ -249,6 +282,9 @@ pub fn setup_cpu_area(
     // Чтение адресов статических массивов (Rust-2024: addr_of! безопасен).
     let kbase = core::ptr::addr_of!(PER_CPU_KSTACK).cast::<u8>() as usize;
     let sbase = core::ptr::addr_of!(PER_CPU_SCHED_STACK).cast::<u8>() as usize;
+    // FPU-скретч слота: статический массив 16-выровненных областей.
+    let fpu_ptr = core::ptr::addr_of!(PER_CPU_FPU).cast::<FpuScratch>() as usize
+        + slot * core::mem::size_of::<FpuScratch>();
     area.fixed = PerCpuFixed {
         syscall_kstack_top: (kbase + slot * core::mem::size_of::<KStack>()
             + core::mem::size_of::<KStack>()) as u64,
@@ -257,6 +293,7 @@ pub fn setup_cpu_area(
             + core::mem::size_of::<SStack>()) as u64,
         sched_loop_entry: sched_loop,
         kernel_root_phys,
+        fpu_scratch: fpu_ptr as u64,
     };
     if paint {
         // SAFETY: слот валиден (per_cpu_area выше), массив — static mut с
@@ -929,6 +966,9 @@ unsafe extern "C" fn idt_common() -> ! {
         "test al, 3",
         "jz 1f",
         "swapgs",                       // GS ← ядерный per-CPU
+        // FPU/SSE: fxsave только для ring3-входов (как в irq_common).
+        "mov rbx, gs:[{fpu}]",
+        "fxsave64 [rbx]",
         "1:",
         "mov rdi, rsp",
         "call idt_c_handler",
@@ -938,6 +978,11 @@ unsafe extern "C" fn idt_common() -> ! {
         "mov rax, [rsp + 144]",
         "test al, 3",
         "jz 4f",
+        // FPU/SSE: вернуть пользовательское состояние ДО обратного swapgs
+        // (gs:[OFF_FPU] требует ядерного GS). Для ядерного входа (#PF
+        // demand-paging в ядре) скретч не наш — не трогаем.
+        "mov rbx, gs:[{fpu}]",
+        "fxrstor64 [rbx]",
         "swapgs",
         "4:",
         "pop r15", "pop r14", "pop r13", "pop r12",
@@ -947,6 +992,7 @@ unsafe extern "C" fn idt_common() -> ! {
         "iretq",
         "3:",
         "ud2",
+        fpu = const OFF_FPU,
     )
 }
 
@@ -1043,6 +1089,12 @@ unsafe extern "C" fn irq_common() -> ! {
         "test al, 3",
         "jz 1f",
         "swapgs",                       // GS ← ядерный per-CPU
+        // FPU/SSE: только для ring3-входов (при ядерном входе скретч
+        // может хранить ещё живое fxsave-состояние сисколла — трогать
+        // нельзя). rbx уже в кадре — безопасный скретч. При преемпции
+        // сюда-путь не дойдёт (диспетчер уйдёт в stash_fpu_to_tcb + hook).
+        "mov rbx, gs:[{fpu}]",
+        "fxsave64 [rbx]",
         "1:",
         "mov rdi, [rsp + 120]",         // nr (вектор)
         "mov rsi, rsp",                 // кадр IrqFrame (низ кадра)
@@ -1050,6 +1102,11 @@ unsafe extern "C" fn irq_common() -> ! {
         "mov rax, [rsp + 136]",
         "test al, 3",
         "jz 2f",
+        // FPU/SSE: вернуть пользовательское состояние (GS ещё ядерный;
+        // rbx ещё не восстановлен — скретч). Пропуск для ядерного входа:
+        // скретч не наш (см. вход).
+        "mov rbx, gs:[{fpu}]",
+        "fxrstor64 [rbx]",
         "swapgs",                       // GS ← пользовательский
         "2:",
         // Восстановление: 15 GPR + nr (кода ошибки нет), iretq.
@@ -1059,6 +1116,7 @@ unsafe extern "C" fn irq_common() -> ! {
         "add rsp, 8",
         "iretq",
         dispatch = sym crate::irq::irq_vector_dispatch_erased,
+        fpu = const OFF_FPU,
     )
 }
 
@@ -1140,9 +1198,11 @@ pub(crate) fn irq_preempt_tail(frame: &mut IrqFrame) {
         );
         return;
     }
-    // Кадр вытесненной задачи — в её TCB (возобновление с места тика).
+    // Кадр вытесненной задачи — в её TCB (возобновление с места тика);
+    // FPU/SSE — тоже (fxsave стаба в скретче, копия — сюда).
     if let Some(tcb) = lctl.get_current_task() {
         tcb.save_resume(&irq_frame_resume_words(frame));
+        stash_fpu_to_tcb(lctl);
     }
     kernel_base::task::stats::count_preempt(lctl);
     // Управление — выбранной планировщиком задаче (не возвращается).
@@ -1206,6 +1266,15 @@ extern "C" fn syscall_entry() -> ! {
         "push r15", "push r14", "push r13", "push r12",
         "push r10", "push r9", "push r8", "push rbp",
         "push rbx", "push rax", "push rdx", "push rsi", "push rdi",
+        // FPU/SSE: fxsave в per-CPU скретч. ПОСЛЕ сохранения кадра:
+        // все 15 GPR уже в памяти, регистр-скретч (rbx) можно портить —
+        // свободных регистров до этого нет (кадр хранит ВСЕ GPR, а
+        // RCX/R11 заняты RIP/RFLAGS). До любого Rust-кода: компилятор
+        // вправе генерировать SSE — на входе в Rust пользовательские
+        // XMM уже спасены. Возврат: syscall_return (fxrstor отсюда) или
+        // stash_fpu_to_tcb (копия в TCB при переключении задач).
+        "mov rbx, gs:[{fpu}]",
+        "fxsave64 [rbx]",
         // 5*8 + 13*8 = 144 байта от 16-выровненного TOP: RSP%16==0 —
         // вызов по SysV корректен (callee видит rsp%16==8).
         "mov rdi, rsp",
@@ -1213,6 +1282,7 @@ extern "C" fn syscall_entry() -> ! {
         "ud2",
         user_rsp = const OFF_USER_RSP,
         kstack = const OFF_KSTACK,
+        fpu = const OFF_FPU,
     )
 }
 
@@ -1250,6 +1320,39 @@ fn frame_words(frame: &SysFrame) -> [u64; SYSFRAME_WORDS] {
     // SAFETY: чтение тех же байтов другим указателем POD-типа той же
     // раскладки (assert размера выше).
     unsafe { core::ptr::read(frame as *const SysFrame as *const [u64; SYSFRAME_WORDS]) }
+}
+
+/// FPU-скретч ТЕКУЩЕГО ядра (Rust-пути: bounce-копия перед fxrstor в
+/// dispatch_user, stash_fpu_to_tcb). Указатель берётся из fixed-поля
+/// (gs:[OFF_FPU] — тем же путём, что и стабы).
+fn current_fpu_scratch() -> &'static mut FpuScratch {
+    let Some(slot) = gs_base_slot() else {
+        panic!("cswitch: FPU-скретч без per-CPU GS base (ранний бут?)");
+    };
+    // SAFETY: слот закреплён за текущим ядром (gs_base_slot).
+    let area = unsafe { per_cpu_area(slot) }.expect("слот в диапазоне по построению");
+    let ptr = area.fixed.fpu_scratch as *mut FpuScratch;
+    assert!(
+        !ptr.is_null(),
+        "cswitch: FPU-скретч слота не настроен (setup_cpu_area)"
+    );
+    // SAFETY: указатель из области своего слота (16-выровнен по построению).
+    unsafe { &mut *ptr }
+}
+
+/// Складывает fxsave-состояние из per-CPU скретча в FPU-область TCB
+/// уходящей задачи. Вызывается в путях переключения (сисколл-свитч,
+/// IRQ-преемпция, фолт-доставка) РЯДОМ с save_resume: скретч будет
+/// перезаписан следующим входом из ring3, а состояние задачи обязано
+/// пережить переключение (fxrstor при её следующем входе).
+pub(crate) fn stash_fpu_to_tcb(lctl: &LocalKernelCTL<crate::paging::X86Umap>) {
+    let Some(tcb) = lctl.get_current_task() else {
+        return; // задачи нет (self-exit/ранний бут) — сохранять нечего
+    };
+    let scratch = current_fpu_scratch();
+    // SAFETY: задача уходит с CPU (единственный легальный момент записи
+    // её FPU-области); источник — скретч ЭТОГО же ядра (512 Б, валиден).
+    unsafe { tcb.fpu_area().store_raw(scratch.0.as_ptr()) };
 }
 
 /// Хук входа в задачу, выбранную планировщиком (ставит фронтенд порта —
@@ -1327,9 +1430,11 @@ extern "C" fn syscall_frame_dispatch(frame: *mut SysFrame) -> ! {
     // Текущая уступила/уснула: кадр — в её TCB (возобновление с места
     // остановки, а не с точки входа). TCB жив: destroy чистит ОБА поля
     // lctl (id и указатель) до нашего сведения — раз id был Some, жив и
-    // указатель.
+    // указатель. FPU/SSE — тоже в TCB (скретч перезапишется следующим
+    // SYSCALL; состояние задачи обязано пережить переключение).
     if let Some(tcb) = lctl.get_current_task() {
         tcb.save_resume(&frame_words(frame));
+        stash_fpu_to_tcb(lctl);
     }
 
     match sched_cur {
@@ -1357,6 +1462,12 @@ extern "C" fn syscall_frame_dispatch(frame: *mut SysFrame) -> ! {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_return(_frame: *mut SysFrame) -> ! {
     naked_asm!(
+        // FPU/SSE: вернуть пользовательское состояние из скретча (fxsave
+        // syscall_entry). GS ещё ядерный — gs:[OFF_FPU] валиден; rax —
+        // скретч (ниже перезаписывается из кадра). До загрузки GPR:
+        // fxrstor GPR не трогает.
+        "mov rax, gs:[{fpu}]",
+        "fxrstor64 [rax]",
         // Порядок: сначала всё, что читает старый RDI, последним —
         // смена RSP; rdi восстанавливается уже после (источник ещё
         // валиден — перезапись rsp его не трогает).
@@ -1384,6 +1495,7 @@ unsafe extern "C" fn syscall_return(_frame: *mut SysFrame) -> ! {
         "cli",
         "swapgs",
         "sysretq",
+        fpu = const OFF_FPU,
     )
 }
 
@@ -1419,7 +1531,20 @@ pub unsafe extern "C" fn return_to_scheduler() -> ! {
 ///
 /// После вызова ядро не получает управление, пока задача не сделает
 /// SYSCALL (или не упадёт по исключению — см. IDT).
-pub fn dispatch_user(task_cr3: usize, entry: usize, user_rsp: usize) -> ! {
+///
+/// `fpu` — FPU-область TCB ([`kernel_base::task::tcb::FpuArea`]; для
+/// новой задачи — шаблон масок): копируется в per-CPU скретч и
+/// восстанавливается оттуда (FXRSTOR требует 16-выровненный операнд —
+/// TCB-область гарантирует лишь 8). До смены CR3: TCB — ядерная память
+/// (верхняя половина), ядерный CR3 её мапит гарантированно.
+pub fn dispatch_user(task_cr3: usize, entry: usize, user_rsp: usize, fpu: *mut u8) -> ! {
+    // Bounce: область задачи → per-CPU скретч (16-выровнен, см. FpuScratch).
+    let scratch = current_fpu_scratch().0.as_mut_ptr();
+    // SAFETY: обе области живы на 512 Б; не пересекаются (TCB-слэб vs
+    // per-CPU статика); задача только создаётся — никто не читает FPU.
+    unsafe {
+        core::ptr::copy_nonoverlapping(fpu.cast::<u8>(), scratch, kernel_base::task::tcb::FpuArea::SIZE)
+    };
     unsafe {
         asm!(
             // Окно смены CR3 открывается УЖЕ с IF=0: тик в нём бежал бы
@@ -1427,6 +1552,9 @@ pub fn dispatch_user(task_cr3: usize, entry: usize, user_rsp: usize) -> ! {
             // никакое прерывание не должно стоять между решением «уходим
             // в ring3» и iretq.
             "cli",
+            // FPU/SSE: детерминированный старт (шаблон масок). До смены
+            // CR3: скретч — ядерная память.
+            "fxrstor64 [{scratch}]",
             "mov cr3, {cr3}",
             // Окно swapgs→iretq с IF=0: иначе тик IRQ посреди окна видит
             // ядерный CS кадра, стаб НЕ swapgs-ит — и обработчик уходит
@@ -1442,23 +1570,38 @@ pub fn dispatch_user(task_cr3: usize, entry: usize, user_rsp: usize) -> ! {
             cr3 = in(reg) task_cr3,
             rsp = in(reg) user_rsp,
             rip = in(reg) entry,
+            scratch = in(reg) scratch,
             options(noreturn)
         )
     }
 }
 
 /// naked-ядро возобновления: rdi = CR3 задачи, rsi = *const SysFrame
-/// (ядерная память — верхняя половина, валидна после смены CR3).
+/// (ядерная память — верхняя половина, валидна после смены CR3),
+/// rdx = FPU-область TCB (kernel_base::task::tcb::FpuArea::raw_ptr()).
 /// Читает и слова 18/19 (RCX/R11 — расширение фолт-доставки, см.
 /// SYSFRAME_RCX_WORD): кадр берётся из ПОЛНОГО слота возобновления
 /// TCB, у сисколл-кадра там нули.
 #[unsafe(naked)]
-unsafe extern "C" fn resume_from_frame(cr3: usize, frame: *const SysFrame) -> ! {
+unsafe extern "C" fn resume_from_frame(cr3: usize, frame: *const SysFrame, fpu: *mut u8) -> ! {
     naked_asm!(
         // IF=0 ДО смены CR3 (см. dispatch_user): окно не должно ловить
         // прерываний.
         "cli",
         "mov cr3, rdi",
+        // FPU/SSE: bounce TCB-области (8-выровнена) → per-CPU скретч
+        // (16-выровнен) → fxrstor оттуда. rep movsq: rsi=источник (rdx),
+        // rdi=назначение (скретч из gs). rbx/rbp — временные хранилища
+        // (оба перезаписываются из кадра ниже); rdi/rsi/rcx — расходники
+        // копии, восстанавливаются позже тоже из кадра.
+        "mov rbx, rsi",            // кадр — сохранить
+        "mov rbp, rdx",            // источник FPU — сохранить
+        "mov rsi, rdx",            // rep movsq: источник
+        "mov rdi, gs:[{fpu}]",     // назначение — per-CPU скретч
+        "mov rcx, 64",             // 512 / 8
+        "rep movsq",
+        "fxrstor64 [rdi]",         // rdi ещё = скретч
+        "mov rsi, rbx",            // кадр обратно
         // GPR из кадра (rdi/rsi — последними: rsi ещё источник).
         "mov rax, [rsi + 24]",
         "mov rbx, [rsi + 32]",
@@ -1491,6 +1634,7 @@ unsafe extern "C" fn resume_from_frame(cr3: usize, frame: *const SysFrame) -> ! 
         "cli",
         "swapgs",
         "iretq",
+        fpu = const OFF_FPU,
     )
 }
 
@@ -1507,6 +1651,7 @@ unsafe extern "C" fn resume_from_frame(cr3: usize, frame: *const SysFrame) -> ! 
 pub fn resume_user(
     task_cr3: usize,
     words: &[u64; kernel_base::task::tcb::RESUME_WORDS],
+    fpu: *mut u8,
 ) -> ! {
     // Раскладка repr(C) SysFrame == первые SYSFRAME_WORDS слов слота
     // (assert в модуле): приведение указателя тождественно; хвост
@@ -1532,7 +1677,7 @@ pub fn resume_user(
         unsafe { crate::fault::kill_current_and_schedule() };
     }
     // SAFETY: naked-переход без возврата; контракт модуля.
-    unsafe { resume_from_frame(task_cr3, frame) }
+    unsafe { resume_from_frame(task_cr3, frame, fpu) }
 }
 
 // ─── Инициализация ───────────────────────────────────────────────────────────
@@ -1593,6 +1738,10 @@ pub fn sched_stack_top(slot: usize) -> Option<u64> {
     Some(area.fixed.sched_stack_top)
 }
 
+/// Начальный MXCSR (все SIMD-исключения замаскированы, округление к
+/// ближайшему) — то же значение, что и в байтовом шаблоне FpuArea::new.
+const MXCSR_INIT: u32 = 0x1F80;
+
 /// Включает FPU/SSE (CR0: EM=0 TS=0 MP=1; CR4: OSFXSR|OSXMMEXCPT) —
 /// rustc генерирует SSE даже в no_std (форматирование, копирование),
 /// и ring3-код задачи упадёт #UD без этих бит.
@@ -1601,14 +1750,24 @@ unsafe fn enable_fpu() {
         asm!(
             "mov rax, cr0",
             "and rax, ~(1 << 2)",   // CR0.EM = 0
-            "and rax, ~(1 << 3)",   // CR0.TS = 0
+            "and rax, ~(1 << 3)",   // CR0.TS = 0 (eager-модель: без #NM-фолтов)
             "or rax, (1 << 1)",     // CR0.MP = 1
             "mov cr0, rax",
             "mov rax, cr4",
             "or rax, (1 << 9)",     // CR4.OSFXSR
             "or rax, (1 << 10)",    // CR4.OSXMMEXCPT
             "mov cr4, rax",
+            // Детерминированное начальное FPU-состояние ядра/первой
+            // задачи: полный сброс x87 (FCW=0x037F, стек пуст) + MXCSR
+            // = все исключения замаскированы. Шаблон новых задач —
+            // байтовый (FpuArea::new), поэтому это только для ядра.
+            // LDMXCSR в LLVM промоделирован ТОЛЬКО с операндом-памятью
+            // (r/m32-регистр не парсится) — через адрес локальной
+            // переменной.
+            "fninit",
+            "ldmxcsr [{mxcsr_ptr}]",
             out("rax") _,
+            mxcsr_ptr = in(reg) &MXCSR_INIT,
         );
     }
 }
