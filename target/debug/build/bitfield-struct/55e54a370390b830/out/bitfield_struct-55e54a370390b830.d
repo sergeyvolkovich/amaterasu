@@ -1,9 +1,0 @@
-/home/sergey/Documents/CintOS/amaterasu/target/debug/build/bitfield-struct/55e54a370390b830/out/bitfield_struct-55e54a370390b830.d: /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/lib.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/attr.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/bitenum.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/traits.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/../README.md
-
-/home/sergey/Documents/CintOS/amaterasu/target/debug/build/bitfield-struct/55e54a370390b830/out/libbitfield_struct-55e54a370390b830.so: /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/lib.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/attr.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/bitenum.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/traits.rs /home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/../README.md
-
-/home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/lib.rs:
-/home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/attr.rs:
-/home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/bitenum.rs:
-/home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/traits.rs:
-/home/sergey/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitfield-struct-0.13.0/src/../README.md:

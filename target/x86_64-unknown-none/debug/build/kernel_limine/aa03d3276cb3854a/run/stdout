@@ -1,3 +1,0 @@
-cargo:rustc-link-arg=-T/home/sergey/Documents/CintOS/amaterasu/src/kernel_limine/linker.ld
-cargo:rustc-link-arg=--no-pie
-cargo:rustc-link-arg=--no-relax
