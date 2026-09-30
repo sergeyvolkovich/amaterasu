@@ -12,7 +12,16 @@
 
 pub use crate::abi::nr;
 pub use crate::crt0::{args, argv_at, auxv_get, bootstrap, envp, exit, stack_base};
-pub use crate::{abi, crt0, dlog, fault, fb, flatbuf, init, ipc, shm, stats, syscall, task, timer};
+pub use crate::{
+    abi, arena, crt0, dlog, fault, fb, flatbuf, init, ipc, shm, stats, syscall, task, timer,
+};
+// heap — только на целевом target (GlobalAlloc с сисколлами).
+#[cfg(all(not(test), target_os = "none"))]
+pub use crate::heap;
+
+// Коллекции alloc-крейта поверх кучи (crate::heap: рост через
+// ALLOC_PAGES): бинам достаточно `use cintos_user::prelude::*`.
+pub use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
 // Макросы лога (macro_export кладёт их в корень крейта).
 #[allow(unused_imports)]

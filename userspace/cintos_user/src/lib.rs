@@ -31,13 +31,22 @@
 #![allow(internal_features)]
 #![feature(lang_items)]
 
+// Коллекции alloc-крейта (Vec/String/Box/...) поверх кучи crate::heap
+// (GlobalAlloc с ростом через ALLOC_PAGES); re-export'ы — в prelude.
+extern crate alloc;
+
 pub mod abi;
+pub mod arena;
 pub mod capi;
 pub mod crt0;
 pub mod dlog;
 pub mod fault;
 pub mod fb;
 pub mod flatbuf;
+// heap: GlobalAlloc с сисколлами — ТОЛЬКО для целевого target (в
+// хост-тестах он подменял бы аллокатор std-харнесса).
+#[cfg(all(not(test), target_os = "none"))]
+pub mod heap;
 pub mod init;
 pub mod ipc;
 pub mod prelude;

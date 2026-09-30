@@ -9,15 +9,26 @@
 //!      продолжить С МЕСТА блокировки — счётчик тиков идёт 4, 5, 6.
 //!      Перезапуск с точки входа выдал бы тик 1 снова — это и есть
 //!      главный проверяемый инвариант (слот возобновления в TCB).
-//!   4. Возврат из main — self-exit (SCHED_DESTROY_TASK): остальные
+//!   4. Куча (GlobalAlloc поверх ALLOC_PAGES, арена стартует пустой):
+//!      Vec 64 элементов со случайными значениями — sort + checksum;
+//!      логируются счётчики кучи (chunks/used): первый аллок задачи
+//!      обязан вызвать ALLOC_PAGES и добавить чанк.
+//!   5. Возврат из main — self-exit (SCHED_DESTROY_TASK): остальные
 //!      задачи обязаны продолжать жить.
 //!
 //! Строки собираются вручную (без core::fmt) — только целочисленные
-//! операции, никакого SSE-состояния между сисколлами.
+//! операции. (Контекст: ядро с FPU-моделью eager FXSAVE/FXRSTOR
+//! сохраняет XMM через сисколлы/IRQ/переключения, но испытатель
+//! сознательно остаётся целочисленным — меньше поверхности проверки.)
 
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use cintos_user::abi;
+use cintos_user::heap::KernelHeap;
 use cintos_user::syscall;
 
 /// Объект ожидания (договорённость с mt_waker).
@@ -42,7 +53,38 @@ fn main() {
         let _ = unsafe { syscall::syscall0(abi::nr::SCHED_YIELD) };
     }
 
-    // Фаза 4: self-exit — задача умирает, система живёт.
+    // Фаза 4: куча — GlobalAlloc поверх ALLOC_PAGES (арена стартует
+    // ПУСТОЙ: первый push обязан вызвать ALLOC_PAGES, добавить чанк и
+    // продолжить — отказ ALLOC_PAGES здесь означал бы панику/exit).
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..64u64 {
+        // Кнутх-мультипликативное перемешивание i — детерминированный набор.
+        v.push(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 1009);
+    }
+    v.sort_unstable();
+    let (mut sum, mut sorted) = (0u64, true);
+    for i in 0..v.len() {
+        sum = sum.wrapping_add(v[i]);
+        if i > 0 && v[i - 1] > v[i] {
+            sorted = false;
+        }
+    }
+    // Контроль целостности содержимого после sort: пересчёт суммы в обратном порядке.
+    let mut rsum = 0u64;
+    for i in (0..v.len()).rev() {
+        rsum = rsum.wrapping_add(v[i]);
+    }
+    log_line(b"mt_test: heap vec len ", v.len() as u64);
+    log_line(b"mt_test: heap vec sum ", sum);
+    log_line(b"mt_test: heap checksum ok ", (sum == rsum) as u64);
+    log_line(b"mt_test: heap sorted ", sorted as u64);
+    let hs = KernelHeap::current_stats();
+    log_line(b"mt_test: heap chunks ", hs.chunks as u64);
+    log_line(b"mt_test: heap used ", hs.used_bytes as u64);
+    log_line(b"mt_test: heap free ", hs.free_bytes as u64);
+    drop(v);
+
+    // Фаза 5: self-exit — задача умирает, система живёт.
     log_line(b"mt_test: done, self-exit", 0);
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
