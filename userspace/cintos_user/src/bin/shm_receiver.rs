@@ -12,15 +12,11 @@
 //!   5. SHM_DONE: отправляет контрольную сумму; self-exit.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc;
 use cintos_user::shm::{self, Consumer};
-
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
 
 /// Ожидаемая геометрия демо (согласована с shm_sender).
 const MSG_COUNT: usize = 16;
@@ -30,17 +26,12 @@ const SHM_PAGES: usize = 4;
 /// Приёмный слот capability (база приёмного окна IPC_WAIT).
 const RECV_SLOT: u64 = 16;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     dlog::log("shm_receiver: старт\n".as_bytes());
 
     let Some(sender_slot) = peer_slot_of(b"shm_sender") else {
         dlog::log("shm_receiver: shm_sender не найден в ростере\n".as_bytes());
-        return 1;
+        crt0::exit(1);
     };
 
     // 1. Предложение: capability (лёгла в наш приёмный слот) + глобальный id
@@ -56,9 +47,9 @@ pub extern "C" fn main(
             l.u64(r.label);
             l.nl();
             dlog::log(l.as_bytes());
-            return 1;
+            crt0::exit(1);
         }
-        Err(e) => return fail("shm_receiver: wait OFFER err ", code_of(e)),
+        Err(e) => fail("shm_receiver: wait OFFER err ", code_of(e)),
     };
 
     // 2. Монтирование общих фреймов (внешний маппинг) ПО ПРИЁМНОМУ СЛОТУ:
@@ -66,16 +57,16 @@ pub extern "C" fn main(
     //    источника реально запрещает монтирование.
     let va = match mount_cap_region(RECV_SLOT) {
         Ok(va) => va,
-        Err(code) => return fail("shm_receiver: MOUNT_CAP_REGION err ", code),
+        Err(code) => fail("shm_receiver: MOUNT_CAP_REGION err ", code),
     };
     let mut ring = match unsafe { Consumer::open(va as usize, SHM_PAGES) } {
         Some(c) => c,
-        None => return fail("shm_receiver: кольцо не открылось (magic?) ", 0),
+        None => fail("shm_receiver: кольцо не открылось (magic?) ", 0),
     };
 
     // 3. Готовность.
     if let Err(e) = ipc::send(sender_slot, shm::labels::SHM_READY, &[], &[]) {
-        return fail("shm_receiver: SHM_READY err ", code_of(e));
+        fail("shm_receiver: SHM_READY err ", code_of(e));
     }
 
     // 4. Приём: дверь → кадр из кольца → сумма → ACK.
@@ -97,7 +88,7 @@ pub extern "C" fn main(
                     l.u64(seq);
                     l.nl();
                     dlog::log(l.as_bytes());
-                    return 1;
+                    crt0::exit(1);
                 }
             }
             Ok(r) => {
@@ -106,17 +97,17 @@ pub extern "C" fn main(
                 l.u64(r.label);
                 l.nl();
                 dlog::log(l.as_bytes());
-                return 1;
+                crt0::exit(1);
             }
-            Err(e) => return fail("shm_receiver: wait DATA err ", code_of(e)),
+            Err(e) => fail("shm_receiver: wait DATA err ", code_of(e)),
         }
         // Данные — из общих страниц, МИМО ядра.
         let n = match ring.pop(&mut msg) {
             Some(n) => n,
-            None => return fail("shm_receiver: кольцо пусто на двери DATA ", expected as u64),
+            None => fail("shm_receiver: кольцо пусто на двери DATA ", expected as u64),
         };
         if n != MSG_LEN {
-            return fail("shm_receiver: кадр неожиданной длины ", n as u64);
+            fail("shm_receiver: кадр неожиданной длины ", n as u64);
         }
         checksum = checksum.wrapping_add(msg.iter().fold(0u64, |a, b| a.wrapping_add(*b as u64)));
         if let Err(e) = ipc::send(
@@ -125,7 +116,7 @@ pub extern "C" fn main(
             &(n as u64).to_le_bytes(),
             &[],
         ) {
-            return fail("shm_receiver: ACK err ", code_of(e));
+            fail("shm_receiver: ACK err ", code_of(e));
         }
     }
 
@@ -136,7 +127,7 @@ pub extern "C" fn main(
         &checksum.to_le_bytes(),
         &[],
     ) {
-        return fail("shm_receiver: DONE err ", code_of(e));
+        fail("shm_receiver: DONE err ", code_of(e));
     }
 
     let mut l = Line::new();
@@ -146,7 +137,7 @@ pub extern "C" fn main(
     l.u64(checksum);
     l.str(b", self-exit\n");
     dlog::log(l.as_bytes());
-    0
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 fn mount_cap_region(cap_slot: u64) -> Result<u64, u64> {
@@ -189,11 +180,12 @@ fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     }
 }
 
-fn fail(prefix: &str, code: u64) -> i32 {
+/// Диагностика + аварийный self-exit (код ядром игнорируется).
+fn fail(prefix: &str, code: u64) -> ! {
     let mut l = Line::new();
     l.str(prefix.as_bytes());
     l.u64(code);
     l.nl();
     dlog::log(l.as_bytes());
-    1
+    crt0::exit(1)
 }

@@ -12,7 +12,6 @@
 //! (слот peer = 2 + i; см. kernel_exec::spawn).
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::flatbuf::MessageRef;
@@ -25,15 +24,7 @@ pub const LABEL_PONG: u64 = 0xC1A0_0002;
 /// Число обслуживаемых сообщений (ipc_sender + ipc_cdemo).
 const ROUNDS: usize = 2;
 
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     log(b"ipc_receiver: waiting for msg (open wait)\n");
 
     for round in 1..=ROUNDS {
@@ -42,7 +33,7 @@ pub extern "C" fn main(
             Ok(r) => r,
             Err(e) => {
                 log_code(b"ipc_receiver: wait err ", code_of(e));
-                return 1;
+                crt0::exit(1);
             }
         };
 
@@ -73,7 +64,7 @@ pub extern "C" fn main(
     }
 
     log(b"ipc_receiver: done, self-exit\n");
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 /// Имя отправителя из payload "имя:текст" (до ':').

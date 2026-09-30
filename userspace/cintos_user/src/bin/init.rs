@@ -11,26 +11,15 @@
 //! (маркер NOMAD; ядро отклоняет чужие ELF — см. kernel_exec::elf).
 
 #![no_std]
-#![no_main]
 
 use cintos_user::abi::nr;
-use cintos_user::crt0;
 use cintos_user::fb::FbInfo;
 use cintos_user::init::{feed_console, fb_info_from_aux, make_console, read_log_delta};
 use cintos_user::syscall;
 
-/// Явная ссылка на точку входа: линкер тянет crt0::_start из rlib
-/// (ENTRY() сам по себе не грузит член архива).
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
-/// main системного сервера (вызывается crt0; контракт: argc/argv/envp).
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+/// main системного сервера (зовётся crt0 через start lang item;
+/// argc/argv при необходимости — crt0::args()/argv_at()).
+fn main() {
     match fb_info_from_aux() {
         Some(info) => console_loop(&info),
         None => headless_loop(),

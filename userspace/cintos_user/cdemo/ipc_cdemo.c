@@ -10,7 +10,9 @@
  *   4. Возврат из main → crt0 делает self-exit.
  *
  * Точка входа — _start из staticlib (crt0), main зовётся им же:
- * подпись main(argc, argv, envp) совпадает с Rust-серверами.
+ * подпись main(argc, argv) — та же 2-арговая, что у Rust-бинов без
+ * #![no_main] (шима rustc); envp не передаётся — auxv через
+ * cint_auxv_get.
  */
 
 #include "cintos.h"
@@ -69,9 +71,8 @@ static uint64_t peer_slot(const char *name, long argc, char **argv)
     return 0;
 }
 
-int main(long argc, char **argv, char **envp)
+int main(long argc, char **argv)
 {
-    (void)envp;
     say("ipc_cdemo: start (pure C code)\n");
 
     uint64_t recv_slot = peer_slot("ipc_receiver", argc, argv);

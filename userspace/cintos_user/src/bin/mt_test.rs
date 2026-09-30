@@ -16,25 +16,14 @@
 //! операции, никакого SSE-состояния между сисколлами.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::abi;
-use cintos_user::crt0;
 use cintos_user::syscall;
-
-/// Явная ссылка на точку входа: линкер тянет crt0::_start из rlib.
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
 
 /// Объект ожидания (договорённость с mt_waker).
 const WAKE_OBJECT: u64 = 0xAA;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     // Фаза 1: карусель — тик и уступка кванта.
     for i in 1..=3u64 {
         log_line(b"mt_test: tick ", i);
@@ -55,7 +44,7 @@ pub extern "C" fn main(
 
     // Фаза 4: self-exit — задача умирает, система живёт.
     log_line(b"mt_test: done, self-exit", 0);
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 /// Строка-префикс + десятичное число + перевод строки -> DBG_LOG_WRITE.

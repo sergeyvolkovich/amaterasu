@@ -12,25 +12,14 @@
 //! mt_test выдал бы все тики подряд без паузы на mt_waker.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::abi;
-use cintos_user::crt0;
 use cintos_user::syscall;
-
-/// Явная ссылка на точку входа: линкер тянет crt0::_start из rlib.
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
 
 /// Объект ожидания (договорённость с mt_test).
 const WAKE_OBJECT: u64 = 0xAA;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     for i in 1..=8u64 {
         log_line(b"mt_waker: spin ", i);
         let _ = unsafe { syscall::syscall0(abi::nr::SCHED_YIELD) };
@@ -48,7 +37,7 @@ pub extern "C" fn main(
     }
 
     log_line(b"mt_waker: done, self-exit", 0);
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 /// Строка-префикс + десятичное число + перевод строки -> DBG_LOG_WRITE.

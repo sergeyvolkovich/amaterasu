@@ -10,25 +10,16 @@
 //!   4. Self-exit.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::ipc::{self, CapDesc};
 
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     log(b"ipc_sender: start\n");
 
     let Some(receiver_slot) = peer_slot_of(b"ipc_receiver") else {
         log(b"ipc_sender: ipc_receiver not found in roster\n");
-        return 1;
+        crt0::exit(1);
     };
 
     // 1. PING + пересылка capability: свой слот 1 (неймспейс) → свободный
@@ -40,7 +31,7 @@ pub extern "C" fn main(
         Ok(()) => log(b"ipc_sender: ping delivered (rendezvous)\n"),
         Err(e) => {
             log_code(b"ipc_sender: send err ", code_of(e));
-            return 1;
+            crt0::exit(1);
         }
     }
 
@@ -55,7 +46,7 @@ pub extern "C" fn main(
     }
 
     log(b"ipc_sender: done, self-exit\n");
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 pub const LABEL_PING: u64 = 0xC1A0_0001;

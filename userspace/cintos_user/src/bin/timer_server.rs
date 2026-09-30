@@ -16,25 +16,16 @@
 //! форматирует; ядро лишь отдаёт сырые атомарные счётчики.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::stats;
 use cintos_user::timer;
 
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
 /// Логировать статистику раз в столько тиков (0.5 c при 100 Гц).
 const REPORT_EVERY: u64 = 50;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     let self_cap = crt0::auxv_get(cintos_user::abi::auxv::AT_CINTOS_SELF_CAP).unwrap_or(u64::MAX);
 
     // Линия тика — от ядра (TASK_STATS: слово [10]); на IO-APIC-платформе

@@ -14,7 +14,6 @@
 //! (слот peer = 2 + i; см. kernel_exec::spawn).
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::fault::{self, FaultInfo};
@@ -31,31 +30,23 @@ const LABEL_BOUND_ACK: u64 = 0xFA17_0002;
 /// Число фолтов fault_child, которые обслуживаем.
 const FAULT_ROUNDS: usize = 2;
 
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     log(b"fault_keeper: creating fault endpoint (slot 17)\n");
     if let Err(e) = fault::create_endpoint(FAULT_EP_SLOT) {
         log_code(b"fault_keeper: create err ", code_of(e));
-        return 1;
+        crt0::exit(1);
     }
 
     // Привязка к fault_child (peer-слот по ростеру argv).
     let Some(child_slot) = peer_slot_of(b"fault_child") else {
         log(b"fault_keeper: fault_child not in roster\n");
-        return 1;
+        crt0::exit(1);
     };
     match fault::set_endpoint(FAULT_EP_SLOT, child_slot) {
         Ok(()) => log(b"fault_keeper: endpoint bound to fault_child\n"),
         Err(e) => {
             log_code(b"fault_keeper: bind err ", code_of(e));
-            return 1;
+            crt0::exit(1);
         }
     }
 
@@ -66,7 +57,7 @@ pub extern "C" fn main(
             Ok(r) => r,
             Err(e) => {
                 log_code(b"fault_keeper: wait err ", code_of(e));
-                return 1;
+                crt0::exit(1);
             }
         };
 
@@ -84,7 +75,7 @@ pub extern "C" fn main(
     }
 
     log(b"fault_keeper: done, self-exit\n");
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 /// Обработка фолта: лог + FAULT_REPLY. #UD на ud2 (2 байта) —

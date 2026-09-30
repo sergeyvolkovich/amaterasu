@@ -4,6 +4,12 @@
 //! Десятичные u64 без fmt-механизмов Rust (профиль panic=abort, размер
 //! образа важнее удобства). [`Line`] — растущая в фиксированном буфере
 //! строка: str/ch/u64/nl + as_bytes.
+//!
+//! Для серверов без дефицита размера — макросы `log!`/`logln!`
+//! (core::fmt поверх Line: форматные строки, {:x} и пр.); Line при
+//! этом остаётся безаллокативным ручным путём.
+
+use core::fmt;
 
 use crate::abi;
 use crate::syscall;
@@ -97,4 +103,37 @@ impl Default for Line {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// core::fmt::Write поверх Line: записи без аллокаций, буфер те же
+// 192 байта (лишнее молча обрезается в str()).
+impl fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.str(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Лог с форматированием core::fmt: `log!("тик {}: стат {}", n, s)`.
+/// Одна посылка DBG_LOG_WRITE (буфер 192 байта, лишнее обрезается).
+/// Тянет fmt-механику core (единицы КБ на образ) — размерокритичным
+/// бинам дешевле ручной [`Line`].
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        let mut line = $crate::dlog::Line::new();
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!($($arg)*));
+        $crate::dlog::log(line.as_bytes());
+    }};
+}
+
+/// Как [`log!`], но с переводом строки в конце.
+#[macro_export]
+macro_rules! logln {
+    ($($arg:tt)*) => {{
+        let mut line = $crate::dlog::Line::new();
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!($($arg)*));
+        line.nl();
+        $crate::dlog::log(line.as_bytes());
+    }};
 }

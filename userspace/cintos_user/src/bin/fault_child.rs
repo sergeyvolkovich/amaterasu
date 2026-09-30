@@ -14,7 +14,6 @@
 //! фолт.
 
 #![no_std]
-#![no_main]
 
 use core::arch::asm;
 
@@ -25,36 +24,28 @@ use cintos_user::ipc::{self, WAIT_ANY};
 const LABEL_ASK_BOUND: u64 = 0xFA17_0001;
 const LABEL_BOUND_ACK: u64 = 0xFA17_0002;
 
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     // Handshake: спросить fault_keeper, готова ли привязка. Без него
     // гонка старта (child фолтнет раньше bind'а) остановила бы машину.
     let Some(keeper_slot) = peer_slot_of(b"fault_keeper") else {
         log(b"fault_child: fault_keeper not in roster\n");
-        return 1;
+        crt0::exit(1);
     };
     log(b"fault_child: handshake\n");
     if let Err(e) = ipc::send(keeper_slot, LABEL_ASK_BOUND, b"ask", &[]) {
         log_code(b"fault_child: ask err ", code_of(e));
-        return 1;
+        crt0::exit(1);
     }
     let mut buf = ipc::recv_buffer();
     match ipc::wait(WAIT_ANY, ipc::RECV_NONE, &mut buf) {
         Ok(r) if r.label == LABEL_BOUND_ACK => log(b"fault_child: bound confirmed\n"),
         Ok(r) => {
             log_code(b"fault_child: unexpected label ", r.label);
-            return 1;
+            crt0::exit(1);
         }
         Err(e) => {
             log_code(b"fault_child: wait err ", code_of(e));
-            return 1;
+            crt0::exit(1);
         }
     }
 
@@ -74,7 +65,7 @@ pub extern "C" fn main(
     log(b"fault_child: survived #2\n");
 
     log(b"fault_child: done, self-exit\n");
-    0 // crt0: SCHED_DESTROY_TASK(self_cap)
+    // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 /// Слот peer-TaskTCB по имени (ростер argv: [0]=своё имя, [1+i]=i-й).

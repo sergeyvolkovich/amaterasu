@@ -3,9 +3,15 @@
 //! Ядро при создании задачи строит стартовый стек (раскладка —
 //! kernel_x86::exec::build_initial_stack) и ставит начальный RSP на
 //! ячейку argc. `_start` сохраняет указатель стека, парсит
-//! argc/argv/envp/auxv, публикует их в статике (доступ через [`args()`]
-//! и [`bootstrap()`]) и вызывает `main(argc, argv, envp)` бинаря.
-//! Возврат из main = self-exit через SCHED_DESTROY_TASK со своим cap id.
+//! argc/argv/envp/auxv ([`parse_initial_stack`]), публикует их в
+//! статике (доступ через [`args()`], [`envp()`], [`auxv_get()`] и
+//! [`bootstrap()`]) и зовёт C-шиму `main(argc, argv)`, которую rustc
+//! генерирует для бина БЕЗ `#![no_main]`; шима ведёт к [`lang_start`]
+//! (`start` lang item) и пользовательскому `fn main()`. Возврат из
+//! main = self-exit через SCHED_DESTROY_TASK со своим cap id.
+//!
+//! C-путь (staticlib): C-сервер определяет main(long argc, char** argv)
+//! — та же 2-арговая сигнатура (include/cintos.h); envp не передаётся.
 //!
 //! Bootstrap-capability системного сервера (см. AT_CINTOS_* в abi::auxv):
 //!   слот 0 cspace — TaskTCB самой задачи;
@@ -20,6 +26,7 @@ use crate::syscall;
 /// Состояние, собранное `_start` (единственный раз до main).
 struct RuntimeState {
     stack: AtomicPtr<u64>,
+    envp: AtomicPtr<*const u8>,
     self_cap: AtomicU64,
     ns_cap: AtomicU64,
     page_size: AtomicU64,
@@ -29,6 +36,7 @@ struct RuntimeState {
 
 static STATE: RuntimeState = RuntimeState {
     stack: AtomicPtr::new(core::ptr::null_mut()),
+    envp: AtomicPtr::new(core::ptr::null_mut()),
     self_cap: AtomicU64::new(0),
     ns_cap: AtomicU64::new(0),
     page_size: AtomicU64::new(0),
@@ -57,37 +65,51 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Rust-вход: разбор стека, публикация состояния, вызов main, self-exit.
-unsafe extern "C" fn crt_entry(stack: *mut u64) -> ! {
-    // ── Разбор стартового стека ──
-    // [argc][argv0..argvN][NULL][envp0..envpM][NULL][auxv pairs...]
-    let argc = unsafe { *stack } as usize;
+/// Разобранный начальный стек задачи (сырые указатели; валидны, пока
+/// жив начальный стек — он ядром не переиспользуется).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitialStack {
+    pub argc: usize,
+    pub argv: *const *const u8,
+    pub envp: *const *const u8,
+    pub auxv: *const u64,
+}
 
-    // auxv: после envp NULL. Ищем с конца массивов: envp-NULL идёт за
-    // argv-NULL; позиции вычисляем проходом.
-    let mut p = unsafe { stack.add(1) };
-    let argv: *const *const u8 = p.cast();
-    // SAFETY: ядро гарантированно NUL-терминирует массив.
+/// Чистый разбор раскладки ядра:
+/// `[argc][argv..NULL][envp..NULL][auxv-пары..AT_NULL]`.
+/// Указатели — в начальный стек задачи; строки не материализуются.
+/// Чистая функция — тестируется на хосте.
+pub fn parse_initial_stack(stack: *mut u64) -> InitialStack {
+    // SAFETY: раскладка гарантирована ядром (kernel_x86::exec);
+    // argv/envp NUL-терминированы, auxv завершён AT_NULL.
     unsafe {
+        let argc = *stack as usize;
+        let mut p = stack.add(1);
+        let argv = p as *const *const u8;
         while *p != 0 {
             p = p.add(1);
         }
-    }
-    let envp: *const *const u8 = unsafe { p.add(1).cast() };
-    let auxv: *const u64 = {
-        let mut q: *const u64 = envp.cast();
-        // SAFETY: envp-массив NUL-терминирован ядром.
-        unsafe {
-            while *q != 0 {
-                q = q.add(1);
-            }
-            q.add(1)
+        let envp = p.add(1) as *const *const u8;
+        let mut q = envp as *const u64;
+        while *q != 0 {
+            q = q.add(1);
         }
-    };
+        InitialStack {
+            argc,
+            argv,
+            envp,
+            auxv: q.add(1),
+        }
+    }
+}
 
-    // Публикация состояния.
+/// Rust-вход: разбор стека, публикация состояния, вызов main, self-exit.
+unsafe extern "C" fn crt_entry(stack: *mut u64) -> ! {
+    // ── Разбор стартового стека и публикация состояния ──
+    let init = parse_initial_stack(stack);
     STATE.stack.store(stack, Ordering::Release);
-    let aux = unsafe { scan_auxv(auxv) };
+    STATE.envp.store(init.envp.cast_mut(), Ordering::Release);
+    let aux = unsafe { scan_auxv(init.auxv) };
     STATE.self_cap.store(aux.self_cap, Ordering::Release);
     STATE.ns_cap.store(aux.namespace_cap, Ordering::Release);
     STATE.page_size.store(aux.page_size, Ordering::Release);
@@ -99,13 +121,74 @@ unsafe extern "C" fn crt_entry(stack: *mut u64) -> ! {
     FB_STATE.height.store(aux.fb_height, Ordering::Release);
     FB_STATE.bpp.store(aux.fb_bpp, Ordering::Release);
 
-    // ── main(argc, argv, envp) ──
+    // ── main(argc, argv) ──
+    // Бин БЕЗ `#![no_main]`: rustc генерирует C-шиму main, которая
+    // зовёт `start` lang item ([lang_start]) с пользовательским main
+    // (Termination применён rustc). envp доступен через envp(),
+    // auxv — через auxv_get(). C-серверы определяют main с той же
+    // 2-арговой сигнатурой (include/cintos.h).
     unsafe extern "C" {
-        // Бинарная обвязка обязана определить: main(argc, argv, envp) -> i32.
-        fn main(argc: usize, argv: *const *const u8, envp: *const *const u8) -> i32;
+        fn main(argc: i32, argv: *const *const u8) -> i32;
     }
-    let code = unsafe { main(argc, argv, envp) };
+    let code = unsafe { main(init.argc as i32, init.argv) };
     exit(code);
+}
+
+/// no_std-замена `std::process::Termination` (в текущем nightly трейт
+/// переехал в std — из core удалён, а `start` lang item требует его
+/// как границу generic'а). Определяем `termination` lang item сами:
+/// `report` возвращает ГОТОВЫЙ код выхода i32 (std-версия возвращает
+/// ExitCode; ядро коды выхода пока игнорирует — см. exit).
+/// Бины могут писать `fn main()`, `fn main() -> i32`, `-> u32`;
+/// свои типы — имплементируйте этот трейт.
+#[cfg(not(test))]
+#[lang = "termination"]
+pub trait Termination {
+    fn report(self) -> i32;
+}
+
+#[cfg(not(test))]
+impl Termination for () {
+    fn report(self) -> i32 {
+        0
+    }
+}
+
+#[cfg(not(test))]
+impl Termination for i32 {
+    fn report(self) -> i32 {
+        self
+    }
+}
+
+#[cfg(not(test))]
+impl Termination for u32 {
+    fn report(self) -> i32 {
+        self as i32
+    }
+}
+
+/// `start` lang item: rustc для бина без `#![no_main]` генерирует
+/// C-шиму main(argc, argv), вызывающую эту функцию с пользовательским
+/// main. Требование компилятора (E0718): функция ОБЯЗАНА быть generic
+/// с одним параметром, ограниченным `termination` lang item — по нему
+/// rustc адаптирует сигнатуру main. Форма зеркалирует std::rt
+/// (включая сигPIPE-заглушку: наш runtime ничего не делает с
+/// сигналами). argc/argv уже опубликованы crt_entry в STATE — здесь
+/// не нужны; код выхода — Termination::report.
+///
+/// cfg(not(test)): в хост-тестах `start`/`termination` несёт сам std —
+/// второй lang item соборку не пропустит (паттерн паник-хендлера ниже).
+#[cfg(not(test))]
+#[lang = "start"]
+fn lang_start<T: Termination + 'static>(
+    main: fn() -> T,
+    argc: isize,
+    argv: *const *const u8,
+    sigpipe: u8,
+) -> isize {
+    let _ = (argc, argv, sigpipe);
+    exit(main().report())
 }
 
 /// Читает auxv-срез (пары tag/val до AT_NULL): возвращает
@@ -211,6 +294,19 @@ pub fn argv_at(i: usize) -> Option<*const u8> {
     }
     // SAFETY: argv начинается на [stack+1]; слот валиден.
     Some(unsafe { *stack.add(1 + i) } as *const u8)
+}
+
+/// envp текущей задачи: массив указателей на NUL-строки, завершённый
+/// NULL (None — до `_start`; пустое окружение — валидный ненулевой
+/// указатель на NULL-слот). В main НЕ передаётся (шима rustc
+/// 2-арговая) — берите отсюда.
+pub fn envp() -> Option<*const *const u8> {
+    let p = STATE.envp.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 /// Значение auxv-тега (None — до `_start` либо тег отсутствует).
@@ -383,5 +479,54 @@ mod tests {
     fn bootstrap_gates_on_self_cap() {
         // bootstrap() в тестах на хосте: STATE пуст — None.
         assert!(bootstrap().is_none());
+    }
+
+    #[test]
+    fn parse_initial_stack_layout() {
+        // Имитация раскладки ядра: argc=2, два argv, NULL, envp из одной
+        // строки, NULL, пара AT_PAGESZ, AT_NULL. «Указатели» на строки —
+        // произвольные ненулевые u64 (парсер содержимое строк не читает).
+        let mut buf: [u64; 10] = [0; 10];
+        buf[0] = 2;
+        buf[1] = 0x1000;
+        buf[2] = 0x2000;
+        // buf[3] — argv-NULL (0 из инициализации)
+        buf[4] = 0x3000;
+        // buf[5] — envp-NULL
+        buf[6] = auxv::AT_PAGESZ;
+        buf[7] = 4096;
+        buf[8] = auxv::AT_NULL;
+        let base = buf.as_mut_ptr();
+        let init = parse_initial_stack(base);
+        assert_eq!(init.argc, 2);
+        // SAFETY: смещения в пределах buf (10 ячеек).
+        let (argv, envp, auxvp) = unsafe { (base.add(1), base.add(4), base.add(6)) };
+        assert_eq!(init.argv, argv as *const *const u8);
+        assert_eq!(init.envp, envp as *const *const u8);
+        assert_eq!(init.auxv, auxvp as *const u64);
+        let aux = unsafe { scan_auxv(init.auxv) };
+        assert_eq!(aux.page_size, 4096);
+    }
+
+    #[test]
+    fn parse_initial_stack_empty_envp() {
+        // argc=1, envp пуст (NULL сразу за argv-NULL), auxv с SELF_CAP.
+        let buf: [u64; 8] = [
+            1,      // argc
+            0x1000, // argv[0]
+            0,      // argv NULL
+            0,      // envp NULL (пустое окружение)
+            auxv::AT_CINTOS_SELF_CAP,
+            0x2A,
+            auxv::AT_NULL,
+            0,
+        ];
+        let init = parse_initial_stack(buf.as_ptr() as *mut u64);
+        assert_eq!(init.argc, 1);
+        // SAFETY: envp указывает на NULL-слот массива buf.
+        let empty = unsafe { (*init.envp).is_null() };
+        assert!(empty);
+        let aux = unsafe { scan_auxv(init.auxv) };
+        assert_eq!(aux.self_cap, 0x2A);
     }
 }

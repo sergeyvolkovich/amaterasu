@@ -15,15 +15,11 @@
 //!      своей, логирует сводку «данные vs. байты через ядро»; self-exit.
 
 #![no_std]
-#![no_main]
 
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc::{self, CapDesc};
 use cintos_user::shm::{self, Producer};
-
-#[used]
-static _FORCE_ENTRY: unsafe extern "C" fn() -> ! = crt0::_start;
 
 /// Страниц под разделяемый регион.
 const SHM_PAGES: u64 = 4;
@@ -35,33 +31,28 @@ const MSG_LEN: usize = 1024;
 /// над peer-диапазоном 2..2+N).
 const SLOT_SHM_CAP: u64 = 16;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main(
-    _argc: usize,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
-) -> i32 {
+fn main() {
     dlog::log("shm_sender: старт\n".as_bytes());
 
     let Some(receiver_slot) = peer_slot_of(b"shm_receiver") else {
         dlog::log("shm_sender: shm_receiver не найден в ростере\n".as_bytes());
-        return 1;
+        crt0::exit(1);
     };
 
     // 1. Собственный регион + кольцо.
     let va = match alloc_pages(SHM_PAGES) {
         Ok(va) => va,
-        Err(code) => return fail("shm_sender: ALLOC_PAGES err ", code),
+        Err(code) => fail("shm_sender: ALLOC_PAGES err ", code),
     };
     let mut ring = match unsafe { Producer::init(va as usize, SHM_PAGES as usize) } {
         Some(p) => p,
-        None => return fail("shm_sender: кольцо не инициализировано ", 0),
+        None => fail("shm_sender: кольцо не инициализировано ", 0),
     };
 
     // 2. Capability на регион + предложение получателю.
     let cap_id = match cap_create_shared(va, SHM_PAGES, SLOT_SHM_CAP) {
         Ok(id) => id,
-        Err(code) => return fail("shm_sender: CAP_CREATE_SHARED err ", code),
+        Err(code) => fail("shm_sender: CAP_CREATE_SHARED err ", code),
     };
     let offer = cap_id.to_le_bytes();
     let caps = [CapDesc::new(SLOT_SHM_CAP, SLOT_SHM_CAP, ipc::rights::SEND)];
@@ -72,7 +63,7 @@ pub extern "C" fn main(
         &caps,
     ) {
         Ok(n) => n,
-        Err(e) => return fail("shm_sender: SHM_OFFER err ", code_of(e)),
+        Err(e) => fail("shm_sender: SHM_OFFER err ", code_of(e)),
     };
 
     // 3. Готовность получателя.
@@ -87,9 +78,9 @@ pub extern "C" fn main(
             l.u64(r.label);
             l.nl();
             dlog::log(l.as_bytes());
-            return 1;
+            crt0::exit(1);
         }
-        Err(e) => return fail("shm_sender: wait READY err ", code_of(e)),
+        Err(e) => fail("shm_sender: wait READY err ", code_of(e)),
     }
 
     // 4. Поток сообщений: push в кольцо + дверь; контрольная сумма по
@@ -102,7 +93,7 @@ pub extern "C" fn main(
         }
         checksum = checksum.wrapping_add(sum(&msg));
         if !ring.push(&msg) {
-            return fail("shm_sender: кольцо переполнено (ACK потерян?) ", seq as u64);
+            fail("shm_sender: кольцо переполнено (ACK потерян?) ", seq as u64);
         }
         kernel_bytes += match ipc::send_cost(
             receiver_slot,
@@ -111,7 +102,7 @@ pub extern "C" fn main(
             &[],
         ) {
             Ok(n) => n,
-            Err(e) => return fail("shm_sender: SHM_DATA err ", code_of(e)),
+            Err(e) => fail("shm_sender: SHM_DATA err ", code_of(e)),
         };
         // ACK-дверь: получатель освободил кадр (ping-pong — кольцо
         // не переполняется даже при ёмкости в одно сообщение).
@@ -123,9 +114,9 @@ pub extern "C" fn main(
                 l.u64(r.label);
                 l.nl();
                 dlog::log(l.as_bytes());
-                return 1;
+                crt0::exit(1);
             }
-            Err(e) => return fail("shm_sender: wait ACK err ", code_of(e)),
+            Err(e) => fail("shm_sender: wait ACK err ", code_of(e)),
         }
     }
 
@@ -140,9 +131,9 @@ pub extern "C" fn main(
             l.u64(r.label);
             l.nl();
             dlog::log(l.as_bytes());
-            return 1;
+            crt0::exit(1);
         }
-        Err(e) => return fail("shm_sender: wait DONE err ", code_of(e)),
+        Err(e) => fail("shm_sender: wait DONE err ", code_of(e)),
     };
 
     let data_bytes = (MSG_COUNT * MSG_LEN) as u64;
@@ -159,7 +150,6 @@ pub extern "C" fn main(
         l.nl();
         dlog::log(l.as_bytes());
         dlog::log("shm_sender: готово, self-exit\n".as_bytes());
-        0
     } else {
         l.str("shm_sender: КОНТРОЛЬНЫЕ СУММЫ РАЗОШЛИСЬ: лок ".as_bytes());
         l.u64(checksum);
@@ -167,7 +157,9 @@ pub extern "C" fn main(
         l.u64(remote_sum);
         l.nl();
         dlog::log(l.as_bytes());
-        1
+        // Расхождение сумм (старый «код возврата 1») — аварийный
+        // self-exit сразу.
+        crt0::exit(1)
     }
 }
 
@@ -224,11 +216,12 @@ fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     }
 }
 
-fn fail(prefix: &str, code: u64) -> i32 {
+/// Диагностика + аварийный self-exit (код ядром игнорируется).
+fn fail(prefix: &str, code: u64) -> ! {
     let mut l = Line::new();
     l.str(prefix.as_bytes());
     l.u64(code);
     l.nl();
     dlog::log(l.as_bytes());
-    1
+    crt0::exit(1)
 }

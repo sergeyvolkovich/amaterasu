@@ -3,8 +3,10 @@
  *
  * С-совместимость юзерспейса: компонуйтесь с libcintos_user.a
  * (staticlib-сборка крейта cintos-user) и определяйте
- *   void main(long argc, char **argv, char **envp);
- * точка входа — cint_crt0_start (e_entry образа).
+ *   void main(long argc, char **argv);
+ * точка входа — _start из crt0 (e_entry образа). envp в main не
+ * передаётся (шима 2-арговая и у Rust-бинов без #![no_main]);
+ * auxv-теги — cint_auxv_get.
  *
  * Конвенция возврата ошибок — как в ядре: старший бит u64 = ошибка
  * (CINT_E_FLAG), младшие — код (CINT_E_*).
@@ -184,7 +186,7 @@ uint64_t cint_shm_pop(uint64_t va, uint64_t pages,
 /* Символ _start живёт в staticlib (crt0). Линковка C-бинарника:
  *   gcc -nostdlib -static -Wl,-T,init.ld -Wl,-e,_start \
  *       ipc_cdemo.o libcintos_user.a -o ipc_cdemo
- * main(argc, argv, envp) вызывается crt0; возврат из main → self-exit. */
+ * main(argc, argv) вызывается crt0; возврат из main → self-exit. */
 void _start(void) __attribute__((noreturn));
 
 #ifdef __cplusplus
