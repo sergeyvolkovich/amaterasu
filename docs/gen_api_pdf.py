@@ -136,7 +136,7 @@ el.append(tbl(["NR", "Имя", "Аргументы (по порядку)", "Во
 # ------------------------------------------------------------------ 4
 el.append(Paragraph("4. Модель прав", st_h1))
 el.append(Paragraph("<b>Высокогранулярные права capability</b> (DirectCapabilityRights, биты маски в CapMint): Clone=1, Mint=2, Send=4. Send — передача через IPC map item'ы. <b>Групповые права неймспейса</b> (NamespaceRights, битмаска rights в CapCreateNamespace, u64) — потолок для всех потоков группы: TASK_CREATE=1, MEMORY_ALLOC=2, MMIO_MAP=4, IRQ_BIND=8, IPC_SEND=16, CAP_TRANSFER=32, CAP_MINT=64, CAP_MANAGE=128, DMA_ATTACH=256, STATS_READ=512, FAULT_HANDLE=1024. Неизвестные биты ядро отбрасывает, права ребёнка всегда ⊆ прав создателя.", st_body))
-el.append(Paragraph("Отказ неймспейса имеет приоритет: даже корректная capability не даст доступ, если группового права нет. Разрешение объекта — потолок класса: MemoryIPCPool→MEMORY_ALLOC, MMIO→MMIO_MAP, IrqLine→IRQ_BIND, TaskTCB/TaskImage→TASK_CREATE, Namespace→CAP_MANAGE, Iommu*/Pasid*→DMA_ATTACH, FaultEndpoint→FAULT_HANDLE.", st_body))
+el.append(Paragraph("Отказ неймспейса имеет приоритет: даже корректная capability не даст доступ, если группового права нет. Разрешение объекта — потолок класса: MemoryIPCPool→MEMORY_ALLOC, MMIO→MMIO_MAP, IrqLine→IRQ_BIND, TaskTCB/TaskImage→TASK_CREATE, Namespace→CAP_MANAGE, Iommu*/Pasid*→DMA_ATTACH, FaultEndpoint→FAULT_HANDLE. Юзерспейс-хелперы: <b>cintos_user::cap</b> — типизированные обёртки (create_namespace/ipc_pool/mmio/irq/shared/fault_endpoint, mint/clone/revoke/destroy, mount_region/unmount_region, типы Rights/NamespaceRights/IrqTrigger) и <b>cintos_user::mem</b> (alloc_pages/free_pages); C-эквиваленты — nomad_cap_* в nomad.h.", st_body))
 
 # ------------------------------------------------------------------ 5
 el.append(Paragraph("5. Память и куча userspace", st_h1))
@@ -173,9 +173,10 @@ el.append(tbl(["Операция", "Как"], [
     ["Выход", "вернуть код из main (crt0 делает self-exit) или crt0::exit(N)"],
     ["Лог в serial ядра", "log! / logln! из prelude (DBG_LOG_WRITE)"],
     ["Куча (Vec/String/Box)", "use cintos_user::prelude::* — рост через ALLOC_PAGES, арена пустая до первого аллокa"],
-    ["Сырая память", "AllocPages(pages) -> VA; FreePages(vaddr)"],
-    ["MMIO", "CapCreateMmio + MountCapRegion (VA из возврата)"],
-    ["Shared memory", "CapCreateShared у владельца, капа — через IPC map items, монтаж получателем MountCapRegion"],
+    ["Сырая память", "mem::alloc_pages(pages) -> VA, mem::free_pages(vaddr) (NR 5/6)"],
+    ["MMIO", "cap::create_mmio(owner, phys, pages, slot) → cap::mount_region(cap_slot) -> VA (NR 18/7); снять — cap::unmount_region"],
+    ["Производные капы", "cap::mint/clone (обе стороны — TaskTCB-капы в cspace вызывающего), revoke/destroy; права — типы cap::Rights / cap::NamespaceRights"],
+    ["Shared memory", "mem::alloc_pages → cap::create_shared → капа через IPC map items → получатель cap::mount_region (слот из приёмного окна)"],
     ["Создать задачу", "TaskCreate (образ boot-модуля) или TaskCreateFromMem (ELF из своей памяти)"],
     ["Драйвер устройства", "CapCreateMmio (ядро) + IOMMU-инвокации 32..45; DMA из своей памяти — IommuMapDmaVa (50)"],
     ["SVA (свои указатели в DMA)", "IommuCreatePasidSpace mode=1 + IommuAllocPasid + BindPasidDevice + MapVa"],

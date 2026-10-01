@@ -18,6 +18,7 @@ use cintos_user::dlog::{self, Line};
 use cintos_user::ipc;
 use cintos_user::shm::{self, Consumer};
 use cintos_user::task;
+use cintos_user::cap;
 
 /// Ожидаемая геометрия демо (согласована с shm_sender).
 const MSG_COUNT: usize = 16;
@@ -56,9 +57,9 @@ fn main() {
     // 2. Монтирование общих фреймов (внешний маппинг) ПО ПРИЁМНОМУ СЛОТУ:
     //    ядро резолвит capability через мембраны/поколения — ревок
     //    источника реально запрещает монтирование.
-    let va = match mount_cap_region(RECV_SLOT) {
+    let va = match cap::mount_region(RECV_SLOT) {
         Ok(va) => va,
-        Err(code) => fail("shm_receiver: MOUNT_CAP_REGION err ", code),
+        Err(e) => fail("shm_receiver: MOUNT_CAP_REGION err ", code_of(e)),
     };
     let mut ring = match unsafe { Consumer::open(va as usize, SHM_PAGES) } {
         Some(c) => c,
@@ -139,17 +140,6 @@ fn main() {
     l.str(", self-exit\n");
     dlog::log(l.as_str());
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
-}
-
-fn mount_cap_region(cap_slot: u64) -> Result<u64, u64> {
-    // MOUNT_CAP_REGION адресуется СЛОТОМ cspace (capability в нашем
-    // приёмном окне), а не голым глобальным id из payload: слот ядро
-    // резолвит через мембраны/поколения — ревок источника реально
-    // запрещает монтирование.
-    let code = unsafe {
-        cintos_user::syscall::syscall1(cintos_user::abi::nr::MOUNT_CAP_REGION, cap_slot)
-    };
-    cintos_user::syscall::check(code).map_err(code_of)
 }
 
 fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {

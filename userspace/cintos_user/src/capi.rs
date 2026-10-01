@@ -76,6 +76,140 @@ pub extern "C" fn nomad_free_pages(vaddr: u64) -> u64 {
     unsafe { crate::syscall::syscall1(abi::nr::FREE_PAGES, vaddr) }
 }
 
+// ─── Capability ─────────────────────────────────────────────────────────────
+// Возврат всех функций — код сисколла (старший бит = ошибка; у create_* —
+// id созданной капы, у mount — VA). Права: NOMAD_CAP_* (прямые),
+// NOMAD_NS_* (неймспейс). Mint/clone адресуют ОБЕ стороны TaskTCB-капами
+// в cspace вызывающего — голые task_cap-id ядро отклоняет (E_RIGHTS_DENIED).
+
+/// Создать неймспейс (группу задач) + корневую капу в dst_slot
+/// вызывающего. rights_mask — NOMAD_NS_*; max_cap_objects — квота
+/// cspace-записей/мембран (капы бессмертны — tombstone/recycle).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_create_namespace(
+    dst_slot: u64,
+    max_task_count: u64,
+    max_memory_bytes: u64,
+    persistency_badge: u64,
+    rights_mask: u64,
+    max_cap_objects: u64,
+) -> u64 {
+    unsafe {
+        crate::syscall::syscall6(
+            abi::nr::CAP_CREATE_NAMESPACE,
+            dst_slot,
+            max_task_count,
+            max_memory_bytes,
+            persistency_badge,
+            rights_mask,
+            max_cap_objects,
+        )
+    }
+}
+
+/// Капа на пул памяти IPC задачи owner_task_cap → её dst_slot.
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_create_ipc_pool(owner_task_cap: u64, dst_slot: u64) -> u64 {
+    unsafe { crate::syscall::syscall2(abi::nr::CAP_CREATE_IPC_POOL, owner_task_cap, dst_slot) }
+}
+
+/// Капа на диапазон физики [phys_origin, phys_origin + page_count*PAGE)
+/// → dst_slot owner'а; диапазон обязан быть в allow-list ядра. Монтаж —
+/// nomad_mount_cap_region.
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_create_mmio(
+    owner_task_cap: u64,
+    phys_origin: u64,
+    page_count: u64,
+    dst_slot: u64,
+) -> u64 {
+    unsafe {
+        crate::syscall::syscall4(
+            abi::nr::CAP_CREATE_MMIO,
+            owner_task_cap,
+            dst_slot,
+            phys_origin,
+            page_count,
+        )
+    }
+}
+
+/// Капа на логическую линию (GSI/MSI): trigger 0=edge, 1=level; линия
+/// обязана быть свободна (иначе E_BUSY), до первого WaitIrq — маскирована.
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_create_irq(
+    owner_task_cap: u64,
+    dst_slot: u64,
+    line: u64,
+    trigger: u64,
+) -> u64 {
+    unsafe {
+        crate::syscall::syscall4(
+            abi::nr::CAP_CREATE_IRQ,
+            owner_task_cap,
+            dst_slot,
+            line,
+            trigger,
+        )
+    }
+}
+
+/// Mint: производная копия (src_task_cap, src_slot) → (dst_task_cap,
+/// dst_slot) с правами ⊆ источника (биты NOMAD_CAP_*).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_mint(
+    src_task_cap: u64,
+    src_slot: u64,
+    dst_task_cap: u64,
+    dst_slot: u64,
+    rights: u64,
+) -> u64 {
+    unsafe {
+        crate::syscall::syscall5(
+            abi::nr::CAP_MINT,
+            src_task_cap,
+            src_slot,
+            dst_task_cap,
+            dst_slot,
+            rights,
+        )
+    }
+}
+
+/// Clone: копия в той же мембране (право Clone у источника).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_clone(
+    src_task_cap: u64,
+    src_slot: u64,
+    dst_task_cap: u64,
+    dst_slot: u64,
+) -> u64 {
+    unsafe {
+        crate::syscall::syscall4(abi::nr::CAP_CLONE, src_task_cap, src_slot, dst_task_cap, dst_slot)
+    }
+}
+
+/// Ревок мембраны слота: протухают запись и все производные (слот
+/// остаётся занятым).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_revoke(task_cap: u64, slot: u64) -> u64 {
+    unsafe { crate::syscall::syscall2(abi::nr::CAP_REVOKE, task_cap, slot) }
+}
+
+/// Ревок + tombstone записи НА МЕСТЕ (слот переиспользуется через
+/// recycle при следующей установке).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_cap_destroy(task_cap: u64, slot: u64) -> u64 {
+    unsafe { crate::syscall::syscall2(abi::nr::CAP_DESTROY, task_cap, slot) }
+}
+
+/// Снять отображение capability-региона по базовому VA (возврат
+/// nomad_mount_cap_region).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_unmount_cap_region(vaddr: u64) -> u64 {
+    unsafe { crate::syscall::syscall1(abi::nr::UNMOUNT_CAP_REGION, vaddr) }
+}
+
 // ─── IPC ────────────────────────────────────────────────────────────────────
 
 /// Дескриптор пересылки capability для C (L4 map item): 24 байта,
@@ -321,7 +455,6 @@ pub extern "C" fn nomad_wait_tick(buf: *mut u64) -> u64 {
     match lazy_claim_tick() {
         Ok(()) => {}
         Err(crate::syscall::SyscallError::Kernel(code)) => return code,
-        Err(_) => return abi::result::E_INTERNAL,
     }
     let caps = crate::timer::tick_caps_buf();
     match crate::timer::wait_tick(arr, &caps) {

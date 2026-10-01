@@ -90,9 +90,11 @@ pub mod nr {
     pub const CAP_MINT: u64 = 20;
     /// Capability: clone (копия в той же мембране).
     pub const CAP_CLONE: u64 = 21;
-    /// Capability: revoke слота.
+    /// Capability: revoke мембраны слота (запись + все производные;
+    /// аргументы: task_cap, slot — TaskTCB-капа в cspace вызывающего).
     pub const CAP_REVOKE: u64 = 22;
-    /// Capability: снять запись со слота.
+    /// Capability: ревок + tombstone записи на месте (аргументы:
+    /// task_cap, slot; слот переиспользуется через recycle).
     pub const CAP_DESTROY: u64 = 23;
     /// [ЗАРЕЗЕРВИРОВАНО] Бывший CAP_TRANSFER: удалён — ambient authority
     /// (голые task_cap-id отправителя/получателя). Пересылка capability

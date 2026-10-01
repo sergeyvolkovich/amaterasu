@@ -156,6 +156,59 @@ typedef struct NomadTaskStats {
  * у группы. 0 — out заполнен; иначе NOMAD_E_*. */
 uint64_t nomad_task_stats(uint64_t task_cap_id, NomadTaskStats *out);
 
+/* ── Capability (создание / производные / монтаж) ────────────────────── */
+
+/* Прямые права капы — NOMAD_CAP_CLONE/MINT/SEND (см. секцию IPC).
+ * Групповые права неймспейса (NamespaceRights; потолок — свои права): */
+#define NOMAD_NS_TASK_CREATE   (1u << 0)
+#define NOMAD_NS_MEMORY_ALLOC  (1u << 1)
+#define NOMAD_NS_MMIO_MAP      (1u << 2)
+#define NOMAD_NS_IRQ_BIND      (1u << 3)
+#define NOMAD_NS_IPC_SEND      (1u << 4)
+#define NOMAD_NS_CAP_TRANSFER  (1u << 5)
+#define NOMAD_NS_CAP_MINT      (1u << 6)
+#define NOMAD_NS_CAP_MANAGE    (1u << 7)
+#define NOMAD_NS_DMA_ATTACH    (1u << 8)
+#define NOMAD_NS_STATS_READ    (1u << 9)
+#define NOMAD_NS_FAULT_HANDLE  (1u << 10)
+#define NOMAD_NS_ALL           0x7FFu
+
+/* Возврат всех функций ниже — код сисколла (старший бит — ошибка; у
+ * create_* — id созданной капы, у mount — VA). Mint/clone адресуют
+ * ОБЕ стороны TaskTCB-капами в cspace вызывающего (ambient authority
+ * закрыт); пересылка кап между задачами — только IPC map items. */
+
+/* Неймспейс (группа задач) + корневая капа в dst_slot вызывающего;
+ * max_cap_objects — квота cspace-записей/мембран (капы бессмертны). */
+uint64_t nomad_cap_create_namespace(uint64_t dst_slot, uint64_t max_task_count,
+                                    uint64_t max_memory_bytes,
+                                    uint64_t persistency_badge,
+                                    uint64_t rights_mask,
+                                    uint64_t max_cap_objects);
+/* Капа на пул памяти IPC задачи owner_task_cap → её dst_slot. */
+uint64_t nomad_cap_create_ipc_pool(uint64_t owner_task_cap, uint64_t dst_slot);
+/* Капа на диапазон физики [phys_origin, phys_origin+page_count*PAGE)
+ * → dst_slot owner'а; диапазон обязан быть в allow-list ядра. */
+uint64_t nomad_cap_create_mmio(uint64_t owner_task_cap, uint64_t phys_origin,
+                               uint64_t page_count, uint64_t dst_slot);
+/* Капа на логическую линию (GSI/MSI): trigger 0=edge, 1=level;
+ * занятая линия — E_BUSY, до первого WaitIrq капа маскирована. */
+uint64_t nomad_cap_create_irq(uint64_t owner_task_cap, uint64_t dst_slot,
+                              uint64_t line, uint64_t trigger);
+/* Mint: производная копия с правами ⊆ источника (NOMAD_CAP_*). */
+uint64_t nomad_cap_mint(uint64_t src_task_cap, uint64_t src_slot,
+                        uint64_t dst_task_cap, uint64_t dst_slot,
+                        uint64_t rights);
+/* Clone: копия в той же мембране (право Clone у источника). */
+uint64_t nomad_cap_clone(uint64_t src_task_cap, uint64_t src_slot,
+                         uint64_t dst_task_cap, uint64_t dst_slot);
+/* Ревок мембраны слота (протухают запись и производные). */
+uint64_t nomad_cap_revoke(uint64_t task_cap, uint64_t slot);
+/* Ревок + tombstone записи на месте (слот — через recycle). */
+uint64_t nomad_cap_destroy(uint64_t task_cap, uint64_t slot);
+/* Снять отображение capability-региона по базовому VA. */
+uint64_t nomad_unmount_cap_region(uint64_t vaddr);
+
 /* ── Разделяемая память (длинные IPC; датапуть МИМО ядра) ────────────── */
 
 /* Создать capability на разделяемый регион СОБСТВЕННОЙ памяти
@@ -163,8 +216,9 @@ uint64_t nomad_task_stats(uint64_t task_cap_id, NomadTaskStats *out);
  * capability (старший бит — ошибка). */
 uint64_t nomad_cap_create_shared(uint64_t src_vaddr, uint64_t pages,
                                 uint64_t dst_slot);
-/* Смонтировать capability-регион в своё пространство (возврат — VA). */
-uint64_t nomad_mount_cap_region(uint64_t cap_id);
+/* Смонтировать capability-регион из СВОЕГО cspace (капа, пришедшая по
+ * IPC map item'у, лежит в слоте приёмного окна) — возврат VA. */
+uint64_t nomad_mount_cap_region(uint64_t cap_slot);
 
 /* Волшебное слово SPSC-кольца в разделяемых страницах. */
 #define NOMAD_SHM_RING_MAGIC 0x53484D3100000001ULL

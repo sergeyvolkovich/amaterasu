@@ -11,6 +11,8 @@
 //!   - [`flatbuf`] — мини-FlatBuffers-рантайм (сериализация IPC-сообщений:
 //!     ЯДРО не разбирает payload — сериализация целиком в юзерспейсе);
 //!   - [`ipc`] — Rust-обвязка L4-транспорта (send/wait + map items);
+//!   - [`cap`]/[`mem`] — capability-операции (create_*/mint/clone/
+//!     revoke/destroy, монтаж регионов) и сырая память задачи;
 //!   - [`task`] — динамический спавн задач (TASK_CREATE по TaskImage-
 //!     капе / TASK_CREATE_FROM_MEM — exec ELF из читаемой памяти);
 //!   - [`capi`] — C-совместимый ABI (extern "C" + #[repr(C)]; заголовок
@@ -37,6 +39,7 @@ extern crate alloc;
 
 pub mod abi;
 pub mod arena;
+pub mod cap;
 pub mod capi;
 pub mod crt0;
 pub mod dlog;
@@ -49,6 +52,7 @@ pub mod flatbuf;
 pub mod heap;
 pub mod init;
 pub mod ipc;
+pub mod mem;
 pub mod prelude;
 pub mod shm;
 pub mod stats;

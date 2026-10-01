@@ -13,7 +13,8 @@
 pub use crate::abi::nr;
 pub use crate::crt0::{args, argv_at, auxv_get, bootstrap, envp, exit, stack_base};
 pub use crate::{
-    abi, arena, crt0, dlog, fault, fb, flatbuf, init, ipc, shm, stats, syscall, task, timer,
+    abi, arena, cap, crt0, dlog, fault, fb, flatbuf, init, ipc, mem, shm, stats, syscall, task,
+    timer,
 };
 // heap — только на целевом target (GlobalAlloc с сисколлами).
 #[cfg(all(not(test), target_os = "none"))]

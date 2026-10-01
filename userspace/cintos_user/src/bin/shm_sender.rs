@@ -21,6 +21,7 @@ use cintos_user::dlog::{self, Line};
 use cintos_user::ipc::{self, CapDesc};
 use cintos_user::shm::{self, Producer};
 use cintos_user::task;
+use cintos_user::{cap, mem};
 
 /// Страниц под разделяемый регион.
 const SHM_PAGES: u64 = 4;
@@ -41,9 +42,9 @@ fn main() {
     };
 
     // 1. Собственный регион + кольцо.
-    let va = match alloc_pages(SHM_PAGES) {
+    let va = match mem::alloc_pages(SHM_PAGES) {
         Ok(va) => va,
-        Err(code) => fail("shm_sender: ALLOC_PAGES err ", code),
+        Err(e) => fail("shm_sender: ALLOC_PAGES err ", code_of(e)),
     };
     let mut ring = match unsafe { Producer::init(va as usize, SHM_PAGES as usize) } {
         Some(p) => p,
@@ -51,9 +52,9 @@ fn main() {
     };
 
     // 2. Capability на регион + предложение получателю.
-    let cap_id = match cap_create_shared(va, SHM_PAGES, SLOT_SHM_CAP) {
+    let cap_id = match cap::create_shared(va, SHM_PAGES, SLOT_SHM_CAP) {
         Ok(id) => id,
-        Err(code) => fail("shm_sender: CAP_CREATE_SHARED err ", code),
+        Err(e) => fail("shm_sender: CAP_CREATE_SHARED err ", code_of(e)),
     };
     let offer = cap_id.to_le_bytes();
     let caps = [CapDesc::new(SLOT_SHM_CAP, SLOT_SHM_CAP, ipc::rights::SEND)];
@@ -165,24 +166,6 @@ fn main() {
 }
 
 // ─── Сисколл-обёртки демо ─────────────────────────────────────────────────────
-
-fn alloc_pages(pages: u64) -> Result<u64, u64> {
-    let code =
-        unsafe { cintos_user::syscall::syscall1(cintos_user::abi::nr::ALLOC_PAGES, pages) };
-    cintos_user::syscall::check(code).map_err(code_of)
-}
-
-fn cap_create_shared(vaddr: u64, pages: u64, dst_slot: u64) -> Result<u64, u64> {
-    let code = unsafe {
-        cintos_user::syscall::syscall3(
-            cintos_user::abi::nr::CAP_CREATE_SHARED,
-            vaddr,
-            pages,
-            dst_slot,
-        )
-    };
-    cintos_user::syscall::check(code).map_err(code_of)
-}
 
 fn sum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0u64, |acc, b| acc.wrapping_add(*b as u64))
