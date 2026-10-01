@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Генератор docs/kernel-api.pdf — справочник API ядра NOMAD (кириллица)."""
+"""Генератор docs/kernel-api.pdf — справочник API ядра NOMAD (кириллица).
+
+Содержимое синхронизировано с ABI userspace/cintos_user/src/abi.rs
+(раскладка NR: sched/mem 0..8, ipc 10/11, cap 16..26, fault 27/30,
+irq 28/51/52, stats 29, IOMMU 32..45+50, log 46/47, exec 48/49).
+"""
+import os
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Preformatted)
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Preformatted)
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-FONT = "/usr/share/fonts/TTF/Hack-Regular.ttf"
-FONT_B = "/usr/share/fonts/TTF/Hack-Bold.ttf"
-pdfmetrics.registerFont(TTFont("Hack", FONT))
-pdfmetrics.registerFont(TTFont("HackB", FONT_B))
+# Шрифты: моноширинные с полной кириллицей; первая существующая пара побеждает.
+FONT_PAIRS = [
+    ("/usr/share/fonts/TTF/Hack-Regular.ttf", "/usr/share/fonts/TTF/Hack-Bold.ttf"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf"),
+]
+for reg, bold in FONT_PAIRS:
+    if os.path.exists(reg) and os.path.exists(bold):
+        pdfmetrics.registerFont(TTFont("Hack", reg))
+        pdfmetrics.registerFont(TTFont("HackB", bold))
+        break
+else:
+    raise SystemExit("не найден моноширинный шрифт с кириллицей (Hack/DejaVu/Liberation)")
 
 ACCENT = colors.HexColor("#1a4d7a")
 LIGHT = colors.HexColor("#eef3f8")
 
 st_title = ParagraphStyle("t", fontName="HackB", fontSize=22, leading=28, textColor=ACCENT, spaceAfter=6)
 st_h1 = ParagraphStyle("h1", fontName="HackB", fontSize=14, leading=18, textColor=ACCENT, spaceBefore=14, spaceAfter=6)
-st_h2 = ParagraphStyle("h2", fontName="HackB", fontSize=11, leading=14, spaceBefore=8, spaceAfter=4)
 st_body = ParagraphStyle("b", fontName="Hack", fontSize=9, leading=13, spaceAfter=4)
 st_code = ParagraphStyle("c", fontName="Hack", fontSize=8, leading=11, backColor=LIGHT, borderPadding=4, leftIndent=4)
 st_cell = ParagraphStyle("cell", fontName="Hack", fontSize=8, leading=10)
@@ -47,11 +61,14 @@ doc = SimpleDocTemplate("docs/kernel-api.pdf", pagesize=A4,
 el = []
 
 el.append(Paragraph("NOMAD — справочник API ядра", st_title))
-el.append(Paragraph("Системные вызовы, capability-модель, формат исполняемых файлов и crt0. Версия соответствует workspace kernel_base 0.1 / kernel_x86 0.1 / cintos-user 0.1.", st_body))
+el.append(Paragraph("Системные вызовы, capability-модель, память и куча userspace, FPU-семантика, SMP/IPI, формат исполняемых файлов и crt0. Синхронизировано с abi.rs (workspace 0.1), октябрь 2026.", st_body))
 
+# ------------------------------------------------------------------ 1
 el.append(Paragraph("1. Архитектура", st_h1))
-el.append(Paragraph("Ядро разделено на архитектурно-независимый слой <b>kernel_base</b> (capability-менеджер, планировочные интерфейсы, трейты памяти/IOMMU/прерываний, exec-слой), платформенный <b>kernel_x86</b> (страничные таблицы x86_64, драйверы VT-d/AMD-Vi, ACPI, загрузчик образов, entry-регистрация) и userspace-библиотеку <b>cintos-user</b> (ABI-обёртки, crt0). Все ресурсы доступны задачам только через capability; групповые права неймспейса являются потолком для прав отдельных потоков.", st_body))
+el.append(Paragraph("Ядро разделено на архитектурно-независимый слой <b>kernel_base</b> (capability-менеджер, трейты памяти/IOMMU/прерываний/IPI, exec-слой, TCB), платформенный <b>kernel_x86</b> (страничные таблицы, LAPIC/IPI, IRQ-диспетчер, entry-стабы cswitch), планировщик <b>kernel_sched</b>, exec-домен <b>kernel_exec</b> (ELF, spawn, auxv), загрузчик <b>kernel_limine</b> (bin <b>cintos_kernel</b>) и proc-macro <b>syscall_macros</b>. Userspace: библиотека <b>cintos-user</b> (ABI-обёртки, crt0, куча, mini-FlatBuffers, C ABI) и каркас init-сервера <b>init_system</b>.", st_body))
+el.append(Paragraph("Дисциплина ядра — <b>slab-first</b>: все аллокации через SlabBox (включая SlabBox&lt;[T]&gt; с учётом weak-семантики), реестры — с per-entry блокировкой. Загрузка — Limine (BIOS+UEFI), ELF-модули boot-ростера получают peer-слоты cspace <b>2+i</b> по порядку в limine.conf. Ядро SMP: AP просыпаются через SIPI, таймер AP — локальный LVT LAPIC, межъядерные события — IPI (см. §7).", st_body))
 
+# ------------------------------------------------------------------ 2
 el.append(Paragraph("2. Конвенция системного вызова (x86_64)", st_h1))
 el.append(tbl(["Элемент", "Значение"], [
     ["Номер сисколла", "RAX"],
@@ -62,73 +79,115 @@ el.append(tbl(["Элемент", "Значение"], [
     ["Успех с результатом", "например, id созданной capability; id 0 валиден — различение по старшему биту"],
 ], [40*mm, 130*mm]))
 el.append(Spacer(1, 4))
-el.append(Paragraph("Коды ошибок: 1 NO_CURRENT_TASK, 2 RIGHTS_DENIED (отказ групповых прав неймспейса), 3 NOT_FOUND, 4 SLOT_OCCUPIED, 5 SLOT_EMPTY, 6 CAP_REVOKED, 7 RIGHTS_EXCEEDED, 8 SLAB, 9 QUOTA, 10 IDS_EXHAUSTED, 11 INVALID_ARG, 12 INTERNAL (константы в traits::syscall::syscall_result и cintos-user::abi::result).", st_body))
+el.append(Paragraph("Коды ошибок (константы в kernel_base::traits::syscall и cintos_user::abi::result): 1 NO_CURRENT_TASK, 2 RIGHTS_DENIED (отказ групповых прав неймспейса), 3 NOT_FOUND, 4 SLOT_OCCUPIED, 5 SLOT_EMPTY, 6 CAP_REVOKED, 7 RIGHTS_EXCEEDED, 8 SLAB, 9 QUOTA, 10 IDS_EXHAUSTED, 11 INVALID_ARG, 12 INTERNAL, 13 NOT_IMPLEMENTED (сисколл известен, но не реализован), 14 BUSY (ресурс занят: линия IRQ занята, FREE_PAGES под IOMMU-пином), 15 TIMEOUT (истёк дедлайн IPC_WAIT).", st_body))
 
+# ------------------------------------------------------------------ 3
 el.append(Paragraph("3. Таблица системных вызовов (плоская нумерация)", st_h1))
 el.append(tbl(["NR", "Имя", "Аргументы (по порядку)", "Возврат/семантика"], [
     ["0", "SchedYield", "—", "добровольная передача ядра"],
     ["1", "SchedRegisterTask", "entry, code_size, stack_size, task_cap", "регистрация runtime-метаданных; ок — задача готова к запуску"],
-    ["2", "SchedDestroyTask", "task_cap", "уничтожение задачи; для self-exit задача передаёт собственный id (crt0::exit)"],
+    ["2", "SchedDestroyTask", "task_cap", "уничтожение задачи; self-exit — задача передаёт собственный id (crt0::exit)"],
     ["3", "SchedBlockOnObject", "object_id", "сон на объекте ожидания (OneShot)"],
     ["4", "SchedReleaseObject", "object_id", "пробуждение ожидающих объект"],
-    ["5..8", "Memory: Extend/Decrease/MountCap/UnmountCap", "—", "зарезервировано (заглушки)"],
-    ["10/11", "IpcSend/IpcWait", "cap_id, msg_ptr, msg_size | cap_id, tgt_ptr, max", "транспорт сообщений (заглушки); пересылка капабилити — NR 24"],
-    ["16", "CapCreateNamespace", "dst_slot, max_tasks, max_mem, badge, rights", "создание неймспейса; возвращает id capability; требует CAP_MANAGE"],
+    ["5", "AllocPages", "pages", "выделить страницы СВОЕЙ задаче; ядро само мапит их в AS; возврат — VA; MEMORY_ALLOC + квота группы; окна между вызовами НЕ смежны"],
+    ["6", "FreePages", "vaddr", "снять аллокацию по базовому VA; E_BUSY, если регион запинен IOMMU (DMA-buf)"],
+    ["7", "MountCapRegion", "регион по capability", "смонтировать MMIO- или shm-регион в AS; возврат — VA; MMIO_MAP"],
+    ["8", "UnmountCapRegion", "vaddr", "снять смонтированный регион"],
+    ["10", "IpcSend", "слот получателя, msg, размер, caps-массив, число caps", "синхронный rendezvous; пересылка capability — map item'ами (внутри сообщения)"],
+    ["11", "IpcWait", "слот отправителя | ANY, буфер, ёмкость, база приёмного окна, размер окна", "open/closed wait; приём map item'ов в окно; дедлайн — иначе E_TIMEOUT"],
+    ["16", "CapCreateNamespace", "dst_slot, max_tasks, max_mem, badge, rights", "создание неймспейса (группы); возвращает id capability; требует CAP_MANAGE"],
     ["17", "CapCreateIpcPool", "owner_task, dst_slot", "capability на пул IPC-памяти; CAP_MANAGE|MEMORY_ALLOC"],
-    ["18", "CapCreateMmio", "owner_task, dst_slot, phys, pages", "capability на MMIO-регион; CAP_MANAGE|MMIO_MAP"],
-    ["19", "CapCreateIrq", "owner_task, dst_slot, cpu, vector", "capability на IRQ; CAP_MANAGE|IRQ_BIND"],
-    ["20", "CapMint", "src_task, src_slot, dst_task, dst_slot, rights", "производная копия (права ⊆ источника); требует CAP_MINT + право Mint"],
+    ["18", "CapCreateMmio", "owner_task, dst_slot, phys, pages", "capability на MMIO-регион (phys_guard: acpi-allow-list для ACPI-диапазонов); CAP_MANAGE|MMIO_MAP"],
+    ["19", "CapCreateIrq", "owner_task, dst_slot, line, trigger", "IRQ v2: капа на ЛОГИЧЕСКУЮ линию (GSI/MSI), trigger: 0=edge, 1=level; линия обязана быть свободна (иначе E_BUSY); успех — занята владельцем, замаскирована"],
+    ["20", "CapMint", "src_task, src_slot, dst_task, dst_slot, rights", "производная копия (права ⊆ источника); требует CAP_MINT + право Mint у капы"],
     ["21", "CapClone", "src_task, src_slot, dst_task, dst_slot", "копия в той же мембране; требует право Clone"],
     ["22", "CapRevoke", "task, slot", "ревок мембраны слота — протухают все производные"],
     ["23", "CapDestroy", "task, slot", "ревок + снятие записи"],
-    ["24", "CapTransfer", "sender, receiver, src_slot, dst_slot, rights", "пересылка capability через IPC; обе стороны проверяются"],
-    ["26", "CapCreateFaultEndpoint", "dst_slot", "фолт-эндпоинт (seL4/KeyKOS): фиксирует ТЕКУЩУЮ задачу как обработчика фолтов; CAP_MANAGE|FAULT_HANDLE; возврат — id capability"],
+    ["24", "— (удалён)", "—", "бывший CapTransfer удалён (ambient authority); пересылка capability живёт в IPC map item'ах; НОМЕР НЕ ПЕРЕИСПОЛЬЗОВАТЬ"],
+    ["25", "CapCreateShared", "owner_task, dst_slot", "капа на разделяемый регион СОБСТВЕННОЙ памяти (shm); физику резолвит ядро; получатель монтирует через NR 7"],
+    ["26", "CapCreateFaultEndpoint", "dst_slot", "фолт-эндпоинт: фиксирует ТЕКУЩУЮ задачу как обработчика фолтов; CAP_MANAGE|FAULT_HANDLE"],
     ["27", "FaultSetEndpoint", "ep_slot, target_slot", "привязка обработчика к задаче-цели (её TaskTCB-слот, право Send); TASK_CREATE|FAULT_HANDLE; повтор — замена"],
-    ["28", "IrqWait", "lines_mask, mask_ptr, mask_slots", "сон до срабатывания линий; ядро пишет [count][line0..] в userspace-массив; требует IRQ_BIND"],
-    ["30", "FaultReply", "target_task_cap, new_rip, new_rsp", "resume упавшей (аналог KeyKOS resume-ключа): 0/0 — повторить упавшую инструкцию; иначе — продолжить с нового адреса/стека; FAULT_HANDLE; только зарегистрированному обработчику ПОСЛЕ приёма сообщения"],
-    ["32", "IommuCreateDomain", "dst_slot", "DMA-домен; требует DMA_ATTACH; возвращает id capability"],
+    ["28", "IrqWait", "caps_ptr, caps_len (1..=8), mask_ptr", "IRQ v2: сон до срабатывания линий; линии адресуются капами IrqLine (слоты cspace); ядро пишет [count][line0..] в mask_ptr; WAIT размаскирует набор (claim маскирует)"],
+    ["29", "TaskStats", "буфер", "снапшот счётчиков задачи + глобальные тики/частота; самоинспекция без прав (STATS_READ для чужих)"],
+    ["30", "FaultReply", "target_task_cap, new_rip, new_rsp", "resume упавшей: 0/0 — повторить упавшую инструкцию; иначе продолжить с нового адреса/стека; FAULT_HANDLE; только зарегистрированному обработчику после приёма сообщения"],
+    ["32", "IommuCreateDomain", "dst_slot", "DMA-домен; DMA_ATTACH; возвращает id capability"],
     ["33", "IommuAttachDevice", "task, slot, bus, dev, func", "присоединение PCIe-устройства (BDF от userspace)"],
     ["34", "IommuMapDma", "task, slot, iova, phys, pages, prot", "DMA-маппинг (second-stage)"],
-    ["35", "IommuUnmapDma", "task, slot, iova, pages", "снятие DMA-маппинга"],
+    ["35", "IommuUnmapDma", "task, slot, iova, pages", "снятие DMA-маппинга (снимает пин DMA-buf)"],
     ["36", "IommuCreatePasidSpace", "domain_task, domain_slot, mode, dst_slot", "PASID-пространство; mode: 0=Dedicated, 1=OwnAddressSpace (SVA)"],
-    ["37", "IommuAttachPasid", "domain_task/slot, space_task/slot, BDF", "привязка (device, PASID) -> first-stage AS"],
-    ["38", "IommuDetachPasid", "domain_task/slot, space_task/slot", "отвязка устройства"],
-    ["39", "IommuMapVa", "space_task, slot, gva, phys, pages, prot", "маппинг first-stage (dedicated-режим)"],
-    ["40", "IommuUnmapVa", "space_task, slot, gva, pages", "снятие first-stage"],
-    ["41", "IommuDestroyPasidSpace", "space_task, slot", "уничтожение (авто-отвязка)"],
-], [12*mm, 34*mm, 62*mm, 62*mm]))
+    ["37", "IommuAllocPasid", "space_task, slot, ceiling, dst_slot", "выделить PASID-капабилити с потолком одновременных пользователей (сверх — E_QUOTA)"],
+    ["38", "IommuFreePasid", "pasid_task, slot", "уничтожить PASID, сняв все привязки устройств"],
+    ["39", "IommuBindPasidDevice", "pasid_task/slot, dev BDF", "устройство-пользователь в PASID (квота — E_QUOTA)"],
+    ["40", "IommuUnbindPasidDevice", "pasid_task/slot, dev BDF", "отвязать устройство от PASID"],
+    ["41", "IommuMapVa", "pasid_task, slot, gva, phys, pages, prot", "first-stage маппинг через PASID-капабилити (dedicated-режим)"],
+    ["42", "IommuUnmapVa", "pasid_task, slot, gva, pages", "снятие first-stage маппинга"],
+    ["43", "IommuDestroyPasidSpace", "space_task, slot", "уничтожение пространства (только без живых PASID)"],
+    ["44", "IommuDestroyDomain", "domain_task, slot", "уничтожение DMA-домена"],
+    ["45", "IommuDetachDevice", "domain_task, slot, BDF", "отвязка устройства от домена"],
+    ["46", "DbgLogRead", "буфер", "чтение дельты лога ядра (консоль init-сервера)"],
+    ["47", "DbgLogWrite", "ptr, len", "запись строки задачи в лог ядра (serial + кольцевой буфер); база log!/logln!"],
+    ["48", "TaskCreate", "ns_cap, image_slot, dst_slot, ...", "спавн ELF-образа boot-модуля в неймспейс; authority: капа неймспейса + капа TaskImage; возврат — task_cap_id ребёнка (и в dst_slot создателя)"],
+    ["49", "TaskCreateFromMem", "ns_cap, ptr, size, dst_slot, ...", "exec ELF из ЧИТАЕМОЙ памяти вызывающего (бинарь от файлового сервера map item'ом или ALLOC_PAGES-буфер); ядро снимает снапшот ДО разбора; TASK_CREATE у ОБОИХ неймспейсов"],
+    ["50", "IommuMapDmaVa", "домен task/slot, iova, va, pages, prot", "DMA-buf: маппинг ИЗ памяти вызывающего; ядро резолвит VA-физику по VmapRegion и пинит регион (FREE_PAGES пина — E_BUSY); va обязан лежать в одной ALLOC_PAGES-аллокации"],
+    ["51", "IrqMsiAlloc", "count, first_dst_slot, msgs_ptr", "выделить count MSI-линий (message-backed); корневые капы в слоты; MSI-сообщения [line, address, data, trigger] в буфер; линия замаскирована до первого WAIT"],
+    ["52", "IrqRelease", "slot", "владелец возвращает линию платформе (маска + снятие записи + тумбстоун капы)"],
+], [12*mm, 32*mm, 60*mm, 66*mm]))
 
+# ------------------------------------------------------------------ 4
 el.append(Paragraph("4. Модель прав", st_h1))
-el.append(Paragraph("<b>Высокогранулярные права capability</b> (биты маски в CapMint/CapTransfer): Clone=1, Mint=2, Send=4. <b>Групповые права неймспейса</b> (битмаска rights в CapCreateNamespace) — потолок для всех потоков группы: TASK_CREATE=1, MEMORY_ALLOC=2, MMIO_MAP=4, IRQ_BIND=8, IPC_SEND=16, CAP_TRANSFER=32, CAP_MINT=64, CAP_MANAGE=128, DMA_ATTACH=256, STATS_READ=512, FAULT_HANDLE=1024. Отказ неймспейса имеет приоритет: даже корректная capability не даст доступ, если группового права нет.", st_body))
+el.append(Paragraph("<b>Высокогранулярные права capability</b> (DirectCapabilityRights, биты маски в CapMint): Clone=1, Mint=2, Send=4. Send — передача через IPC map item'ы. <b>Групповые права неймспейса</b> (NamespaceRights, битмаска rights в CapCreateNamespace, u64) — потолок для всех потоков группы: TASK_CREATE=1, MEMORY_ALLOC=2, MMIO_MAP=4, IRQ_BIND=8, IPC_SEND=16, CAP_TRANSFER=32, CAP_MINT=64, CAP_MANAGE=128, DMA_ATTACH=256, STATS_READ=512, FAULT_HANDLE=1024. Неизвестные биты ядро отбрасывает, права ребёнка всегда ⊆ прав создателя.", st_body))
+el.append(Paragraph("Отказ неймспейса имеет приоритет: даже корректная capability не даст доступ, если группового права нет. Разрешение объекта — потолок класса: MemoryIPCPool→MEMORY_ALLOC, MMIO→MMIO_MAP, IrqLine→IRQ_BIND, TaskTCB/TaskImage→TASK_CREATE, Namespace→CAP_MANAGE, Iommu*/Pasid*→DMA_ATTACH, FaultEndpoint→FAULT_HANDLE.", st_body))
 
-el.append(Paragraph("5. Формат исполняемых файлов и crt0", st_h1))
-el.append(Paragraph("Образы системных серверов — ELF64 c <b>EI_OSABI = 0xC1 (NOMAD)</b>, ET_EXEC, e_machine = EM_X86_64 (62). Обычные Linux-ELF отклоняются гейтом OS ABI. Формат подключаем: трейт ExecFormat (probe/parse) в kernel_base::exec; нейтральное ImageInfo (entry + сегменты vaddr/file/flags) — загрузчику arch-слоя неважно, что внутри. Новый формат = регистрация ещё одного ExecFormat в реестре.", st_body))
-el.append(Paragraph("Раскладка стартового стека (начальный RSP указывает на argc, кратен 16):", st_body))
+# ------------------------------------------------------------------ 5
+el.append(Paragraph("5. Память и куча userspace", st_h1))
+el.append(Paragraph("Ядро НЕ экспортирует mmap: задача запрашивает <b>AllocPages(pages)</b> (NR 5) и получает VA — отображение ядро выполняет само; окна между вызовами не обязаны быть смежными. <b>FreePages</b> (NR 6) снимает аллокацию по базовому VA; регион, запиненный под DMA-buf (NR 50), освобождается ошибкой E_BUSY до IommuUnmapDma. Монтирование чужих регионов (MMIO, shm) — только по capability: MountCapRegion/UnmountCapRegion (NR 7/8). Квоты группы ограничивают суммарную память; исчерпание — E_QUOTA.", st_body))
+el.append(Paragraph("Куча userspace (<b>cintos_user::heap</b>): #[global_allocator] KernelHeap поверх ALLOC_PAGES — арена стартует ПУСТОЙ (нулевой резерв), первый аллок растит её вызовом AllocPages(max(4 страницы, потребность)) и добавляет чанк в address-ordered free-list со слиянием соседей. Размер страницы — из auxv AT_PAGESZ. Обратного пути нет: FREE_PAGES у кучей не вызывается, вся память возвращается ядру при SCHED_DESTROY_TASK. Диагностика — KernelHeap::current_stats() (chunks/used/free). В prelude экспортированы Box/String/Vec/vec!/format! из alloc — бинам достаточно use cintos_user::prelude::*.", st_body))
+
+# ------------------------------------------------------------------ 6
+el.append(Paragraph("6. FPU/SSE: eager FXSAVE/FXRSTOR", st_h1))
+el.append(Paragraph("Ядро включает CR4.OSFXSR|OSXMMEXCPT и сохраняет FPU-состояние <b>eager</b> — без lazy-фолта #NM: fxsave64 при каждом входе из ring3 (syscall после записи кадра, IRQ/фолт — только для ring3-входов), fxrstor64 при каждом возврате в ring3. Скретч — per-CPU FpuScratch 512 Б, выравнивание 16 (указатель в PerCpuFixed, gs:[0x28]); постоянное хранилище — FpuArea 512 Б в TCB (перекачка rep movsq при переключении задач). x86_64 baseline гарантирует SSE2, поэтому CPUID-gate не нужен.", st_body))
+el.append(Paragraph("Контракт userspace: регистры x87/MMX/XMM <b>переживают сисколлы, прерывания, фолты и переключения задач</b> — core::fmt и любой SSE-код можно применять вокруг syscall'ов. Новая задача стартует детерминированно: fninit + ldmxcsr 0x1F80 (шаблон TCB: FCW=0x037F — все x87-исключения замаскированы, MXCSR=0x1F80 — все SSE-исключения замаскированы).", st_body))
+
+# ------------------------------------------------------------------ 7
+el.append(Paragraph("7. SMP и межъядерные прерывания", st_h1))
+el.append(Paragraph("IPI-контроллер (kernel_x86::ipi, X86IpiController в ArchImplementation) реализует переносимый контракт kernel_base::traits::ipi поверх LAPIC ICR (xAPIC MMIO / x2APIC MSR). Служебные векторы IDT (не пересекаются с линиями 32+GSI и MSI-пулом): <b>250</b> — локальный LVT-таймер LAPIC (тик AP), <b>252</b> — TLB-shootdown, <b>253</b> — Halt (зарезервирован), <b>254</b> — Reschedule (кик цикла планировщика).", st_body))
+el.append(Paragraph("Протокол TLB-shootdown — синхронный, без аллокаций: отправитель после очистки PTE и локального invlpg кладёт запись {root, virt, pages} в очередь фиксированной ёмкости, увеличивает поколение и шлёт IPI 252 онлайновым ядрам; получатель вычищает invlpg только записи с корнем, совпадающим с ТЕКУЩИМ CR3 (GLOBAL не ставится, смена CR3 чистит TLB целиком), и подтверждает Release-записью наблюдаемого поколения. Диапазоны сверх капы INVLPg и переполнение очереди вырождаются в полную вычистку (перезапись CR3). Отправитель ждёт acked-поколений (bounded-спин с re-send); по таймауту — громкий лог и выход, не hang.", st_body))
+
+# ------------------------------------------------------------------ 8
+el.append(Paragraph("8. Формат исполняемых файлов и crt0", st_h1))
+el.append(Paragraph("Образы — ELF64 c <b>EI_OSABI = 0xC1 (NOMAD)</b>, ET_EXEC, e_machine = EM_X86_64 (62); Linux-ELF отклоняются гейтом OS ABI (патч ставит scripts/patch_osabi.py). Формат подключаемый: трейт ExecFormat (probe/parse), нейтральное ImageInfo (entry + сегменты) — загрузчику arch-слоя всё равно, что внутри. Раскладка стартового стека (начальный RSP указывает на argc, кратен 16):", st_body))
 el.append(Preformatted(
 """stack_top (высокие адреса)
   строки argv/envp (NUL-терминированные)
-  auxv: (tag,val)*16B ... AT_NULL
+  auxv: (tag,val)*16Б ... AT_NULL
   envp: указатели, NULL
   argv: указатели, NULL
   argc: u64            <- начальный RSP (кратен 16)""", st_code))
-el.append(Paragraph("AUXV: 7=PAGESZ, 9=ENTRY, 0xC170_0001=SELF_CAP (id TaskTCB), 0xC170_0002=NS_CAP (id корневой capability неймспейса). Bootstrap-слоты cspace: <b>0</b> = self-TCB (полные права), <b>1</b> = корневой неймспейс.", st_body))
-el.append(Paragraph("crt0 (cintos_user::crt0): _start читает стек, публикует args()/bootstrap(), вызывает main(argc, argv, envp) бинаря; возврат из main = self-exit (SCHED_DESTROY_TASK со своим cap). Паник-хендлер — аварийный self-exit.", st_body))
+el.append(Paragraph("AUXV: 7=PAGESZ, 9=ENTRY, 0xC170_0001=SELF_CAP, 0xC170_0002=NS_CAP, 0xC170_0003..0007=FB_ADDR/PITCH/WIDTH/HEIGHT/BPP (кадровый буфер), 0xC170_0008=ACPI_RSDP (физадрес; ACPI-диапазоны монтируются CAP_CREATE_MMIO из acpi-allow-list ядра). Bootstrap-слоты cspace: <b>0</b> = self-TCB (полные права), <b>1</b> = корневой неймспейс, <b>2+i</b> = peer-TCB boot-ростера (у динамической задачи слот 2 — родитель), <b>32+j</b> = капы TaskImage boot-образов у init.", st_body))
+el.append(Paragraph("crt0 несёт lang-items #[lang=\"start\"] и #[lang=\"termination\"]: бин — обычный <b>#![no_std] fn main()</b>, без no_main-бойлерплейта. Возврат из main (Termination для ()/i32/u32) = self-exit через SCHED_DESTROY_TASK со своим капом; паник-хендлер — аварийный self-exit. Аксессоры: args(), argv_at(i), envp(), auxv_get(tag), bootstrap() → {self_cap, namespace_cap, page_size, entry}, acpi_rsdp_phys(), fb_aux(), stack_base(), exit(code). C-совместимость: staticlib libcintos_user.a + cintos.h (C-main = main(long argc, char** argv)).", st_body))
 
-el.append(Paragraph("6. Доступ к ресурсам из userspace", st_h1))
+# ------------------------------------------------------------------ 9
+el.append(Paragraph("9. Доступ к ресурсам из userspace", st_h1))
 el.append(tbl(["Операция", "Как"], [
     ["Узнать себя", "crt0::bootstrap() -> { self_cap, namespace_cap, page_size, entry }"],
-    ["Выход", "вернуть код из main (crt0 делает self-exit)"],
-    ["Создать группу задач", "CapCreateNamespace; права — битмаска групповых прав"],
-    ["Создать задачу", "kernel-internal на старте; syscall в roadmap"],
-    ["Память под IPC", "CapCreateIpcPool + CapTransfer получателю"],
-    ["Отдать capability", "CapTransfer (проверки обеих сторон: Send у отправителя, право класса ресурса у получателя)"],
-    ["Драйвер устройства", "CapCreateMmio (ядро) + IOMMU-инвокации 32..41 (устройство к домену, DMA-маппинг)"],
-    ["SVA (свои указатели в DMA)", "IommuCreatePasidSpace mode=1 (OwnAddressSpace) + AttachPasid; first-stage root = CR3 процесса"],
-    ["Ждать IRQ", "IrqWait(lines_mask, массив): после пробуждения массив содержит count и номера линий"],
+    ["Выход", "вернуть код из main (crt0 делает self-exit) или crt0::exit(N)"],
+    ["Лог в serial ядра", "log! / logln! из prelude (DBG_LOG_WRITE)"],
+    ["Куча (Vec/String/Box)", "use cintos_user::prelude::* — рост через ALLOC_PAGES, арена пустая до первого аллокa"],
+    ["Сырая память", "AllocPages(pages) -> VA; FreePages(vaddr)"],
+    ["MMIO", "CapCreateMmio + MountCapRegion (VA из возврата)"],
+    ["Shared memory", "CapCreateShared у владельца, капа — через IPC map items, монтаж получателем MountCapRegion"],
+    ["Создать задачу", "TaskCreate (образ boot-модуля) или TaskCreateFromMem (ELF из своей памяти)"],
+    ["Драйвер устройства", "CapCreateMmio (ядро) + IOMMU-инвокации 32..45; DMA из своей памяти — IommuMapDmaVa (50)"],
+    ["SVA (свои указатели в DMA)", "IommuCreatePasidSpace mode=1 + IommuAllocPasid + BindPasidDevice + MapVa"],
+    ["Ждать IRQ", "CapCreateIrq (линия) + IrqWait([слоты], буфер): после пробуждения [count][line...]; MSI — IrqMsiAlloc"],
+    ["Обработчик фолтов", "CapCreateFaultEndpoint + FaultSetEndpoint; фолты #DE/#BP/#OF/#UD/#GP/#PF/#MF/#AC/#XF приходят через IPC; ответ — FaultReply (0/0 = повтор инструкции)"],
+    ["Статистика", "TaskStats — счётчики задачи + тики/частота ядра"],
+    ["ACPI", "crt0::acpi_rsdp_phys() + CapCreateMmio по allow-list (XSDT, MCFG, DRHD)"],
 ], [50*mm, 120*mm]))
 
-el.append(Paragraph("7. Ограничения текущей версии", st_h1))
-el.append(Paragraph("Memory-домен (5..8) и IPC-транспорт (10/11) — заглушки; entry-стаб SYSCALL/SYSRET и планировщик живут в порту; код возврата main не сохраняется при self-exit; PASID ограничен 512 на юнит; Intel QI и AMD GN-инвалидации требуют верификации на QEMU. Фолт-эндпоинты (26/27/30) доставляют #DE/#BP/#OF/#UD/#GP/#PF/#MF/#AC/#XF из ring3 обработчику через IPC-транспорт; маппинг страниц из обработчика фолта (пейджер) — дорожная карта. Дорожная карта: TaskCreate/MemMap сисколлы, таймауты ожидания, Endpoint-capability.", st_body))
+# ------------------------------------------------------------------ 10
+el.append(Paragraph("10. Ограничения текущей версии", st_h1))
+el.append(Paragraph("SchedRegisterTask (NR 1) — kernel-internal регистрация runtime; nr 24 удалён навсегда (ambient authority). Таймауты: дедлайн есть у IPC_WAIT (E_TIMEOUT); SchedBlockOnObject и IrqWait ждут неограниченно. PASID ограничен 512 на юнит; Intel QI и AMD GN-инвалидации требуют верификации на QEMU. Фолт-эндпоинты доставляют фолты ring3 обработчику через IPC-транспорт; маппинг страниц ИЗ обработчика (пейджер) — дорожная карта. init_system — каркас: веха 0.1-beta забирает у kernel_limine регистрацию серверов (spawn_boot_servers) — ядро спавнит только init, остальное init раскатывает сам по ростеру boot-модулей. Дорожная карта: расширение ExecFormat, Endpoint-capability для IPC.", st_body))
 
 doc.build(el)
 print("PDF built: docs/kernel-api.pdf")
