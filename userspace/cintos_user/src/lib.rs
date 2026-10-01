@@ -13,6 +13,9 @@
 //!   - [`ipc`] — Rust-обвязка L4-транспорта (send/wait + map items);
 //!   - [`cap`]/[`mem`] — capability-операции (create_*/mint/clone/
 //!     revoke/destroy, монтаж регионов) и сырая память задачи;
+//!   - [`handle`] — типизированные хендлы поверх u64 (Slot/CapId/
+//!     TaskCap/Va/Phys/Pages): перепутать слот с капой — ошибка
+//!     компиляции;
 //!   - [`task`] — динамический спавн задач (TASK_CREATE по TaskImage-
 //!     капе / TASK_CREATE_FROM_MEM — exec ELF из читаемой памяти);
 //!   - [`capi`] — C-совместимый ABI (extern "C" + #[repr(C)]; заголовок
@@ -46,6 +49,7 @@ pub mod dlog;
 pub mod fault;
 pub mod fb;
 pub mod flatbuf;
+pub mod handle;
 // heap: GlobalAlloc с сисколлами — ТОЛЬКО для целевого target (в
 // хост-тестах он подменял бы аллокатор std-харнесса).
 #[cfg(all(not(test), target_os = "none"))]

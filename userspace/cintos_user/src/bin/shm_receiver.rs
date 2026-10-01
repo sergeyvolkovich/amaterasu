@@ -17,8 +17,9 @@ use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc;
 use cintos_user::shm::{self, Consumer};
-use cintos_user::task;
 use cintos_user::cap;
+use cintos_user::handle::{Slot, Va};
+use cintos_user::task;
 
 /// Ожидаемая геометрия демо (согласована с shm_sender).
 const MSG_COUNT: usize = 16;
@@ -26,7 +27,7 @@ const MSG_LEN: usize = 1024;
 const SHM_PAGES: usize = 4;
 
 /// Приёмный слот capability (база приёмного окна IPC_WAIT).
-const RECV_SLOT: u64 = 16;
+const RECV_SLOT: Slot = Slot::new(16);
 
 fn main() {
     dlog::log("shm_receiver: старт\n");
@@ -39,7 +40,8 @@ fn main() {
     // 1. Предложение: capability (лёгла в наш приёмный слот) + глобальный id
     //    (в payload — только для журналирования; монтируем ПО СЛОТУ).
     let mut buf = ipc::recv_buffer();
-    let _cap_id = match ipc::wait(ipc::WAIT_ANY, ipc::recv_window(RECV_SLOT, 2), &mut buf) {
+    let _cap_id = match ipc::wait(ipc::WaitFrom::Any, ipc::recv_window(RECV_SLOT, 2), &mut buf)
+    {
         Ok(r) if r.label == shm::labels::SHM_OFFER && r.payload.len() == 8 => {
             u64::from_le_bytes(r.payload[..8].try_into().unwrap())
         }
@@ -57,11 +59,12 @@ fn main() {
     // 2. Монтирование общих фреймов (внешний маппинг) ПО ПРИЁМНОМУ СЛОТУ:
     //    ядро резолвит capability через мембраны/поколения — ревок
     //    источника реально запрещает монтирование.
-    let va = match cap::mount_region(RECV_SLOT) {
+    let va: Va = match cap::mount_region(RECV_SLOT) {
         Ok(va) => va,
         Err(e) => fail("shm_receiver: MOUNT_CAP_REGION err ", code_of(e)),
     };
-    let mut ring = match unsafe { Consumer::open(va as usize, SHM_PAGES) } {
+    let mut ring =
+        match unsafe { Consumer::open(va.raw() as usize, SHM_PAGES) } {
         Some(c) => c,
         None => fail("shm_receiver: кольцо не открылось (magic?) ", 0),
     };
@@ -75,7 +78,7 @@ fn main() {
     let mut msg = [0u8; MSG_LEN];
     let mut checksum: u64 = 0;
     for expected in 0..MSG_COUNT {
-        match ipc::wait(sender_slot, ipc::RECV_NONE, &mut buf) {
+        match ipc::wait(ipc::WaitFrom::Slot(sender_slot), ipc::RECV_NONE, &mut buf) {
             Ok(r) if r.label == shm::labels::SHM_DATA => {
                 let seq = if r.payload.len() == 8 {
                     u64::from_le_bytes(r.payload[..8].try_into().unwrap())

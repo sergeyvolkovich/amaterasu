@@ -9,6 +9,7 @@
 //! STATS_READ у группы задачи (namespace-потолок).
 
 use crate::abi;
+use crate::handle::TaskCap;
 use crate::syscall::{self, SyscallResult};
 
 /// Слов в wire-блоке статистики (зеркало kernel_base).
@@ -51,13 +52,13 @@ pub const fn stats_buf() -> StatsBuf {
     [0; STATS_WORDS]
 }
 
-/// Забрать снапшот статистики задачи `task_cap_id` (свой id — из
-/// auxv AT_NOMAD_SELF_CAP, см. crt0). Буфер перезаписывается.
-pub fn task_stats(task_cap_id: u64, buf: &mut StatsBuf) -> SyscallResult<TaskStats> {
+/// Забрать снапшот статистики задачи `task` (свой — из auxv
+/// AT_NOMAD_SELF_CAP через bootstrap(), см. crt0). Буфер перезаписывается.
+pub fn task_stats(task: TaskCap, buf: &mut StatsBuf) -> SyscallResult<TaskStats> {
     let code = unsafe {
         syscall::syscall3(
             abi::nr::TASK_STATS,
-            task_cap_id,
+            task.raw(),
             buf.as_mut_ptr() as u64,
             (STATS_WORDS * 8) as u64,
         )

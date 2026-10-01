@@ -18,7 +18,8 @@
 use core::arch::asm;
 
 use cintos_user::crt0;
-use cintos_user::ipc::{self, WAIT_ANY};
+use cintos_user::ipc;
+use cintos_user::task;
 
 /// Лейблы handshake (зеркало fault_keeper).
 const LABEL_ASK_BOUND: u64 = 0xFA17_0001;
@@ -27,7 +28,7 @@ const LABEL_BOUND_ACK: u64 = 0xFA17_0002;
 fn main() {
     // Handshake: спросить fault_keeper, готова ли привязка. Без него
     // гонка старта (child фолтнет раньше bind'а) остановила бы машину.
-    let Some(keeper_slot) = peer_slot_of(b"fault_keeper") else {
+    let Some(keeper_slot) = task::peer_slot_of("fault_keeper") else {
         log(b"fault_child: fault_keeper not in roster\n");
         crt0::exit(1);
     };
@@ -37,7 +38,7 @@ fn main() {
         crt0::exit(1);
     }
     let mut buf = ipc::recv_buffer();
-    match ipc::wait(WAIT_ANY, ipc::RECV_NONE, &mut buf) {
+    match ipc::wait(ipc::WaitFrom::Any, ipc::RECV_NONE, &mut buf) {
         Ok(r) if r.label == LABEL_BOUND_ACK => log(b"fault_child: bound confirmed\n"),
         Ok(r) => {
             log_code(b"fault_child: unexpected label ", r.label);
@@ -66,29 +67,6 @@ fn main() {
 
     log(b"fault_child: done, self-exit\n");
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
-}
-
-/// Слот peer-TaskTCB по имени (ростер argv: [0]=своё имя, [1+i]=i-й).
-fn peer_slot_of(name: &[u8]) -> Option<u64> {
-    let argc = crt0::args()?;
-    for i in 1..argc {
-        let p = crt0::argv_at(i)?;
-        let mut len = 0usize;
-        unsafe {
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
-        let base = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &bytes[pos + 1..],
-            None => bytes,
-        };
-        if base == name {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
-        }
-    }
-    None
 }
 
 // ─── Логирование (без fmt/аллокаций) ────────────────────────────────────────

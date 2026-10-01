@@ -11,8 +11,10 @@
 
 #![no_std]
 
+use cintos_user::cap::Rights;
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
+use cintos_user::handle::Slot;
 use cintos_user::ipc::{self, CapDesc};
 use cintos_user::task;
 
@@ -28,7 +30,7 @@ fn main() {
     //    слот получателя (TRANSFER_SLOT — выше peer-диапазона), право SEND
     //    (сужение: у источника все права).
     //    Payload: "имя:текст" — приёмник отвечает по имени.
-    let caps = [CapDesc::new(1, ipc::TRANSFER_SLOT, ipc::rights::SEND)];
+    let caps = [CapDesc::new(Slot::new(1), ipc::TRANSFER_SLOT, Rights::SEND)];
     match ipc::send(receiver_slot, LABEL_PING, b"ipc_sender:ping-1", &caps) {
         Ok(()) => dlog::log("ipc_sender: ping delivered (rendezvous)\n"),
         Err(e) => {
@@ -39,7 +41,7 @@ fn main() {
 
     // 2. Ждём PONG строго от получателя (closed wait на его слот).
     let mut buf = ipc::recv_buffer();
-    match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
+    match ipc::wait(ipc::WaitFrom::Slot(receiver_slot), ipc::RECV_NONE, &mut buf) {
         Ok(r) => {
             log_code("ipc_sender: label=", r.label);
             log_bytes("ipc_sender: payload=", r.payload);

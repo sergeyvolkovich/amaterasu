@@ -20,6 +20,7 @@
 //! и сфолтят уже без обработчика (фатальный дамп, видно в serial).
 
 use crate::abi;
+use crate::handle::{Slot, TaskCap};
 use crate::ipc::Received;
 use crate::syscall::{self, SyscallError};
 
@@ -67,31 +68,31 @@ pub struct FaultInfo {
 }
 
 /// Создать фолт-эндпоинт: текущая задача становится обработчиком,
-/// capability кладётся в `dst_slot` её cspace. Требует прав группы
+/// capability кладётся в `dst` её cspace. Требует прав группы
 /// CAP_MANAGE|FAULT_HANDLE.
-pub fn create_endpoint(dst_slot: u64) -> Result<(), SyscallError> {
-    let code = unsafe { syscall::syscall1(abi::nr::CAP_CREATE_FAULT_ENDPOINT, dst_slot) };
+pub fn create_endpoint(dst: Slot) -> Result<(), SyscallError> {
+    let code = unsafe { syscall::syscall1(abi::nr::CAP_CREATE_FAULT_ENDPOINT, dst.raw()) };
     syscall::check(code).map(|_| ())
 }
 
-/// Привязать эндпоинт (слот `ep_slot` текущей задачи) к цели (её
-/// TaskTCB-слот `target_slot`): фолты ЦЕЛИ пойдут обработчику.
+/// Привязать эндпоинт (слот `ep` текущей задачи) к цели (её
+/// TaskTCB-слот `target`): фолты ЦЕЛИ пойдут обработчику.
 /// Требует прав TASK_CREATE|FAULT_HANDLE; повторная привязка
 /// заменяет прежнюю.
-pub fn set_endpoint(ep_slot: u64, target_slot: u64) -> Result<(), SyscallError> {
-    let code = unsafe { syscall::syscall2(abi::nr::FAULT_SET_ENDPOINT, ep_slot, target_slot) };
+pub fn set_endpoint(ep: Slot, target: Slot) -> Result<(), SyscallError> {
+    let code = unsafe { syscall::syscall2(abi::nr::FAULT_SET_ENDPOINT, ep.raw(), target.raw()) };
     syscall::check(code).map(|_| ())
 }
 
 /// Ответить на фолт (resume-инвокация): разбудить упавшую задачу
-/// `target_task_cap` (task_cap_id — sender принятого сообщения).
+/// `target` ([`TaskCap`] — sender принятого сообщения).
 /// `new_rip`/`new_rsp` = 0 — повторить упавшую инструкцию с прежним
 /// стеком; иначе — продолжить с нового адреса/стека.
-pub fn reply(target_task_cap: u64, new_rip: u64, new_rsp: u64) -> Result<(), SyscallError> {
+pub fn reply(target: TaskCap, new_rip: u64, new_rsp: u64) -> Result<(), SyscallError> {
     let code = unsafe {
         syscall::syscall3(
             abi::nr::FAULT_REPLY,
-            target_task_cap,
+            target.raw(),
             new_rip,
             new_rsp,
         )
@@ -170,8 +171,8 @@ mod tests {
         // parse_fault по распарсенному сообщению.
         // (Received собираем вручную: parse_fault читает label/payload.)
         let received = Received {
-            sender: 42,
-            cap_slots: [0; crate::ipc::MAX_CAPS],
+            sender: TaskCap::new(42),
+            cap_slots: [Slot::new(0); crate::ipc::MAX_CAPS],
             caps_len: 0,
             label: msg.label(),
             payload: msg.payload(),
@@ -179,8 +180,8 @@ mod tests {
         assert_eq!(parse_fault(&received), Some(info));
         // Чужой label — не фолт.
         let other = Received {
-            sender: 42,
-            cap_slots: [0; crate::ipc::MAX_CAPS],
+            sender: TaskCap::new(42),
+            cap_slots: [Slot::new(0); crate::ipc::MAX_CAPS],
             caps_len: 0,
             label: 0xC1A0_0001,
             payload: msg.payload(),

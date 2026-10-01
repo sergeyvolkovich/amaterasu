@@ -20,6 +20,8 @@
 use core::ffi::c_void;
 
 use crate::abi;
+use crate::cap::Rights;
+use crate::handle::Slot;
 use crate::ipc::{self, HEADER_WORDS, MAX_CAPS};
 
 // ─── Общие ──────────────────────────────────────────────────────────────────
@@ -247,7 +249,11 @@ pub extern "C" fn nomad_ipc_send(
     let payload = unsafe {
         core::slice::from_raw_parts(payload, payload_len as usize)
     };
-    let mut rust_caps = [ipc::CapDesc::new(0, 0, 0); MAX_CAPS];
+    let mut rust_caps = [ipc::CapDesc::new(
+        Slot::new(0),
+        Slot::new(0),
+        Rights::from_bits(0),
+    ); MAX_CAPS];
     let n = (caps_len as usize).min(MAX_CAPS);
     // SAFETY: caps — валидный массив NomadCapDesc×caps_len (контракт).
     let src = if caps.is_null() || n == 0 {
@@ -256,9 +262,13 @@ pub extern "C" fn nomad_ipc_send(
         unsafe { core::slice::from_raw_parts(caps.cast::<NomadCapDesc>(), n) }
     };
     for (dst, s) in rust_caps.iter_mut().zip(src.iter()) {
-        *dst = ipc::CapDesc::new(s.src_slot, s.dst_slot, s.rights);
+        *dst = ipc::CapDesc::new(
+            Slot::new(s.src_slot),
+            Slot::new(s.dst_slot),
+            Rights::from_bits(s.rights),
+        );
     }
-    match ipc::send(slot, label, payload, &rust_caps[..n]) {
+    match ipc::send(Slot::new(slot), label, payload, &rust_caps[..n]) {
         Ok(()) => 0,
         Err(crate::syscall::SyscallError::Kernel(code)) => code,
     }
@@ -284,14 +294,26 @@ pub extern "C" fn nomad_ipc_wait(
     }
     // SAFETY: buf — валидная память вызывающего на buf_len байт.
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, buf_len as usize) };
-    match ipc::wait(from, ipc::RecvWindow { base: recv_base, count: recv_count }, slice) {
+    let from = if from == u64::MAX {
+        ipc::WaitFrom::Any
+    } else {
+        ipc::WaitFrom::Slot(Slot::new(from))
+    };
+    match ipc::wait(
+        from,
+        ipc::RecvWindow {
+            base: Slot::new(recv_base),
+            count: recv_count,
+        },
+        slice,
+    ) {
         Ok(_) => 0,
         Err(crate::syscall::SyscallError::Kernel(code)) => code,
     }
 }
 
-/// Слот «ждать от кого угодно» (open wait).
-pub const NOMAD_IPC_WAIT_ANY: u64 = ipc::WAIT_ANY;
+/// Слот «ждать от кого угодно» (open wait) — wire-значение u64::MAX.
+pub const NOMAD_IPC_WAIT_ANY: u64 = u64::MAX;
 
 // ─── Разбор принятого сообщения (нулевые копии: указатели в buf) ───────────
 
@@ -366,11 +388,17 @@ fn msg_view(buf: *const u8, buf_len: u64) -> Option<MsgView> {
     // (указатель отдаётся вызывающему, время жизни — его буфер).
     let payload: &'static [u8] = unsafe { core::mem::transmute(parsed.payload) };
     Some(MsgView {
-        sender: parsed.sender,
+        sender: parsed.sender.raw(),
         label: parsed.label,
         payload,
         caps_len: parsed.caps_len,
-        cap_slots: parsed.cap_slots,
+        cap_slots: {
+            let mut raw = [0u64; MAX_CAPS];
+            for (r, s) in raw.iter_mut().zip(parsed.cap_slots.iter()) {
+                *r = s.raw();
+            }
+            raw
+        },
     })
 }
 
@@ -471,7 +499,10 @@ fn lazy_claim_tick() -> Result<(), crate::syscall::SyscallError> {
         return Ok(());
     }
     let self_cap = crate::crt0::auxv_get(crate::abi::auxv::AT_NOMAD_SELF_CAP)
-        .unwrap_or(u64::MAX);
+        .map_or_else(
+            || crate::handle::TaskCap::new(u64::MAX),
+            crate::handle::TaskCap::new,
+        );
     let mut sbuf = crate::stats::stats_buf();
     let line = crate::stats::task_stats(self_cap, &mut sbuf)
         .map(|s| s.timer_line)
@@ -513,7 +544,7 @@ pub extern "C" fn nomad_task_stats(task_cap_id: u64, out: *mut NomadTaskStats) -
         return abi::result::E_INVALID_ARG;
     }
     let mut buf = crate::stats::stats_buf();
-    match crate::stats::task_stats(task_cap_id, &mut buf) {
+    match crate::stats::task_stats(crate::handle::TaskCap::new(task_cap_id), &mut buf) {
         Ok(_) => {
             // SAFETY: out — валидная память на размер структуры; wire-
             // блок побайтово совместим (assert размера выше).
@@ -628,7 +659,7 @@ const _: () = assert!(core::mem::size_of::<NomadFaultInfo>() == 5 * 8);
 /// 0 — ок; иначе NOMAD_E_*.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomad_fault_create_endpoint(dst_slot: u64) -> u64 {
-    match crate::fault::create_endpoint(dst_slot) {
+    match crate::fault::create_endpoint(Slot::new(dst_slot)) {
         Ok(()) => 0,
         Err(e) => code_of(e),
     }
@@ -639,7 +670,7 @@ pub extern "C" fn nomad_fault_create_endpoint(dst_slot: u64) -> u64 {
 /// TASK_CREATE|FAULT_HANDLE; повторная привязка заменяет прежнюю.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomad_fault_set_endpoint(ep_slot: u64, target_slot: u64) -> u64 {
-    match crate::fault::set_endpoint(ep_slot, target_slot) {
+    match crate::fault::set_endpoint(Slot::new(ep_slot), Slot::new(target_slot)) {
         Ok(()) => 0,
         Err(e) => code_of(e),
     }
@@ -657,7 +688,7 @@ pub extern "C" fn nomad_fault_reply(
     new_rip: u64,
     new_rsp: u64,
 ) -> u64 {
-    match crate::fault::reply(target_task_cap, new_rip, new_rsp) {
+    match crate::fault::reply(crate::handle::TaskCap::new(target_task_cap), new_rip, new_rsp) {
         Ok(()) => 0,
         Err(e) => code_of(e),
     }

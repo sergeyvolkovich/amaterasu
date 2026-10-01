@@ -15,6 +15,7 @@
 //! [`crate::stats`] (TASK_STATS отдаёт global_ticks + tick_hz).
 
 use crate::abi;
+use crate::handle::{Slot, TaskCap};
 use crate::syscall::{self, SyscallResult};
 
 /// Частота тика, на которой бут запускает PIT (см. kernel_limine).
@@ -27,13 +28,13 @@ pub const FALLBACK_TIMER_LINE: u64 = 0;
 
 /// Слот cspace под капу линии тика (у сервера свой cspace; слот 40
 /// свободен — ростер кап монтируется с низких номеров).
-pub const TICK_CAP_SLOT: u64 = 40;
+pub const TICK_CAP_SLOT: Slot = Slot::new(40);
 
 /// Массив приёма WaitIrq: `[count: u64][line0: u64]` (ёмкость 1).
 pub type TickWaitBuf = [u64; 2];
 
 /// Массив кап-слотов для WAIT по одной линии: `[слот]`.
-pub type TickCapsBuf = [u64; 1];
+pub type TickCapsBuf = [Slot; 1];
 
 /// Свежий буфер ожидания тика.
 pub const fn tick_wait_buf() -> TickWaitBuf {
@@ -48,7 +49,7 @@ pub const fn tick_caps_buf() -> TickCapsBuf {
 /// Занять линию тика капой IrqLine (CAP_CREATE_IRQ). `timer_line` —
 /// логическая линия из TASK_STATS (`stats.timer_line`). Повторный вызов:
 /// если капа уже в слоте — успех без syscall (линия уже наша).
-pub fn claim_tick_line(self_cap: u64, timer_line: u64) -> SyscallResult<()> {
+pub fn claim_tick_line(self_cap: TaskCap, timer_line: u64) -> SyscallResult<()> {
     // u32::MAX (пилот не объявлен) — legacy-линия 0.
     let line = if timer_line == u64::from(u32::MAX) {
         FALLBACK_TIMER_LINE
@@ -58,10 +59,10 @@ pub fn claim_tick_line(self_cap: u64, timer_line: u64) -> SyscallResult<()> {
     let code = unsafe {
         syscall::syscall4(
             abi::nr::CAP_CREATE_IRQ,
-            self_cap,      // owner_task_cap — сам сервер
-            TICK_CAP_SLOT, // dst_slot
-            line,          // line (GSI)
-            0,             // trigger: edge (PIT)
+            self_cap.raw(),   // owner_task_cap — сам сервер
+            TICK_CAP_SLOT.raw(), // dst_slot
+            line,             // line (GSI)
+            0,                // trigger: edge (PIT)
         )
     };
     syscall::check(code)?;
@@ -71,11 +72,13 @@ pub fn claim_tick_line(self_cap: u64, timer_line: u64) -> SyscallResult<()> {
 /// Уснуть до ближайшего тика таймера (IRQ_WAIT v2 по капе в
 /// TICK_CAP_SLOT). Возврат — номер сработавшей линии.
 pub fn wait_tick(buf: &mut TickWaitBuf, caps: &TickCapsBuf) -> SyscallResult<u64> {
+    // Копия в raw-массив: у newtype нет гарантий layout для as_ptr.
+    let caps_raw = [caps[0].raw()];
     let code = unsafe {
         syscall::syscall4(
             abi::nr::IRQ_WAIT,
-            caps.as_ptr() as u64,
-            caps.len() as u64,
+            caps_raw.as_ptr() as u64,
+            caps_raw.len() as u64,
             buf.as_mut_ptr() as u64,
             1,
         )

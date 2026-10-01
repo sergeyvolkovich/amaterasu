@@ -28,19 +28,21 @@
 
 use crate::abi;
 use crate::crt0;
+use crate::handle::{Slot, TaskCap, Va};
 use crate::ipc;
 use crate::syscall::{self, SyscallError};
 
-/// Спавн boot-образа по TaskImage-капе в неймспейс `ns_slot`.
-/// Возврат — task_cap_id ребёнка (TaskTCB-капа ребёнка кладётся и в
-/// `dst_slot` cspace вызывающего — адресация IPC).
+/// Спавн boot-образа по TaskImage-капе в слоте `image_slot` неймспейса
+/// `ns_slot`. Возврат — TaskTCB-капа ребёнка ([`TaskCap`]; она кладётся
+/// и в `dst` cspace вызывающего — адресация IPC).
 pub fn create_from_boot_image(
-    ns_slot: u64,
-    image_slot: u64,
-    dst_slot: u64,
-) -> Result<u64, SyscallError> {
-    let code = unsafe { syscall::syscall3(abi::nr::TASK_CREATE, ns_slot, image_slot, dst_slot) };
-    syscall::check(code)
+    ns_slot: Slot,
+    image_slot: Slot,
+    dst: Slot,
+) -> Result<TaskCap, SyscallError> {
+    let code =
+        unsafe { syscall::syscall3(abi::nr::TASK_CREATE, ns_slot.raw(), image_slot.raw(), dst.raw()) };
+    syscall::check(code).map(TaskCap::new)
 }
 
 /// Exec ELF-образа `[image_va, image_va + image_size)` из ЧИТАЕМОЙ
@@ -52,33 +54,33 @@ pub fn create_from_boot_image(
 /// E_SLOT_EMPTY/E_CAP_REVOKED (капа неймспейса), E_QUOTA (квоты
 /// целевой группы), E_SLAB (кадры/слаб под снапшот).
 pub fn exec_from_memory(
-    ns_slot: u64,
-    image_va: u64,
+    ns_slot: Slot,
+    image_va: Va,
     image_size: u64,
-    dst_slot: u64,
-) -> Result<u64, SyscallError> {
+    dst: Slot,
+) -> Result<TaskCap, SyscallError> {
     let code = unsafe {
         syscall::syscall4(
             abi::nr::TASK_CREATE_FROM_MEM,
-            ns_slot,
-            image_va,
+            ns_slot.raw(),
+            image_va.raw(),
             image_size,
-            dst_slot,
+            dst.raw(),
         )
     };
-    syscall::check(code)
+    syscall::check(code).map(TaskCap::new)
 }
 
 /// Слот TaskImage-капы j-го образа реестра (есть только у init-сервера;
 /// j — порядковый номер boot-модуля = порядок Limine-модулей).
-pub const fn image_slot(j: u64) -> u64 {
-    abi::auxv::BOOT_SLOT_IMAGE_BASE + j
+pub const fn image_slot(j: u64) -> Slot {
+    Slot::new(abi::auxv::BOOT_SLOT_IMAGE_BASE + j)
 }
 
 /// Слот peer'а по имени из бут-ростера: argv задачи содержит имена всех
 /// boot-серверов (argv[0] — своё имя), i-е имя ростера — слот
 /// [`ipc::PEER_SLOT_BASE`] + (i-1). Общая точка вместо копий в демо.
-pub fn peer_slot_of(name: &str) -> Option<u64> {
+pub fn peer_slot_of(name: &str) -> Option<Slot> {
     let argc = crt0::args()?;
     for i in 1..argc {
         let p = crt0::argv_at(i)?;
@@ -95,7 +97,7 @@ pub fn peer_slot_of(name: &str) -> Option<u64> {
             None => bytes,
         };
         if base == name.as_bytes() {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
+            return Some(Slot::new(ipc::PEER_SLOT_BASE.raw() + (i - 1) as u64));
         }
     }
     None

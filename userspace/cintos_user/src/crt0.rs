@@ -21,6 +21,7 @@
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::abi;
+use crate::handle::{CapId, TaskCap};
 use crate::syscall;
 
 /// Состояние, собранное `_start` (единственный раз до main).
@@ -358,10 +359,10 @@ struct FbAux {
 /// Bootstrap-данные системного сервера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bootstrap {
-    /// id TaskTCB-капабилити этой задачи (self-exit).
-    pub self_cap: u64,
-    /// id корневой capability неймспейса.
-    pub namespace_cap: u64,
+    /// TaskTCB-капа этой задачи (self-exit).
+    pub self_cap: TaskCap,
+    /// Id корневой capability неймспейса.
+    pub namespace_cap: CapId,
     /// Размер страницы ядра (auxv AT_PAGESZ).
     pub page_size: u64,
     /// Адрес входа (auxv AT_ENTRY).
@@ -375,8 +376,8 @@ pub fn bootstrap() -> Option<Bootstrap> {
         return None;
     }
     Some(Bootstrap {
-        self_cap,
-        namespace_cap: STATE.ns_cap.load(Ordering::Acquire),
+        self_cap: TaskCap::new(self_cap),
+        namespace_cap: CapId::new(STATE.ns_cap.load(Ordering::Acquire)),
         page_size: STATE.page_size.load(Ordering::Acquire),
         entry: STATE.entry.load(Ordering::Acquire),
     })

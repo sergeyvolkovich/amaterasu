@@ -26,7 +26,11 @@ use cintos_user::timer;
 const REPORT_EVERY: u64 = 50;
 
 fn main() {
-    let self_cap = crt0::auxv_get(cintos_user::abi::auxv::AT_NOMAD_SELF_CAP).unwrap_or(u64::MAX);
+    let self_cap =
+        crt0::auxv_get(cintos_user::abi::auxv::AT_NOMAD_SELF_CAP).map_or_else(
+            || cintos_user::handle::TaskCap::new(u64::MAX),
+            cintos_user::handle::TaskCap::new,
+        );
 
     // Линия тика — от ядра (TASK_STATS: слово [10]); на IO-APIC-платформе
     // это GSI из MADT override (обычно 2), не «IRQ0».

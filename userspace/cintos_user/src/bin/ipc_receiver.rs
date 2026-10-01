@@ -16,7 +16,7 @@
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::flatbuf::MessageRef;
-use cintos_user::ipc::{self, Received, WAIT_ANY};
+use cintos_user::ipc::{self, Received};
 use cintos_user::task;
 
 /// Лейблы сообщений демо (FlatBuffers label).
@@ -31,7 +31,9 @@ fn main() {
 
     for round in 1..=ROUNDS {
         let mut buf = ipc::recv_buffer();
-        let received: Received = match ipc::wait(WAIT_ANY, ipc::recv_window(ipc::TRANSFER_SLOT, 4), &mut buf) {
+        let received: Received =
+            match ipc::wait(ipc::WaitFrom::Any, ipc::recv_window(ipc::TRANSFER_SLOT, 4), &mut buf)
+            {
             Ok(r) => r,
             Err(e) => {
                 log_code("ipc_receiver: wait err ", code_of(e));
@@ -40,11 +42,11 @@ fn main() {
         };
 
         log_code("ipc_receiver: [round ", round as u64);
-        log_hex("ipc_receiver: sender cap=", received.sender);
+        log_hex("ipc_receiver: sender cap=", received.sender.raw());
         log_code("ipc_receiver: label=", received.label);
         log_bytes("ipc_receiver: payload=", received.payload);
         for &slot in received.cap_slots.iter().take(received.caps_len) {
-            log_code("ipc_receiver: capability landed in slot ", slot);
+            log_code("ipc_receiver: capability landed in slot ", slot.raw());
         }
 
         // Ответ по слоту отправителя: payload либо сырой («имя:текст»),

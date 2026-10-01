@@ -17,11 +17,13 @@
 
 use cintos_user::crt0;
 use cintos_user::fault::{self, FaultInfo};
-use cintos_user::ipc::{self, Received, WAIT_ANY};
+use cintos_user::handle::Slot;
+use cintos_user::ipc::{self, Received};
+use cintos_user::task;
 
 /// Слот cspace под фолт-эндпоинт (выше peer-диапазона 2..14 и
 /// TRANSFER_SLOT=16 — см. ipc::TRANSFER_SLOT).
-const FAULT_EP_SLOT: u64 = 17;
+const FAULT_EP_SLOT: Slot = Slot::new(17);
 
 /// Лейблы handshake (FlatBuffers label; не NOMAD_FAULT_LABEL).
 const LABEL_ASK_BOUND: u64 = 0xFA17_0001;
@@ -38,7 +40,7 @@ fn main() {
     }
 
     // Привязка к fault_child (peer-слот по ростеру argv).
-    let Some(child_slot) = peer_slot_of(b"fault_child") else {
+    let Some(child_slot) = task::peer_slot_of("fault_child") else {
         log(b"fault_keeper: fault_child not in roster\n");
         crt0::exit(1);
     };
@@ -53,7 +55,7 @@ fn main() {
     // Цикл: handshake + фолты. Сообщения различаются label'ом.
     for round in 0..FAULT_ROUNDS + 1 {
         let mut buf = ipc::recv_buffer();
-        let received: Received = match ipc::wait(WAIT_ANY, ipc::RECV_NONE, &mut buf) {
+        let received: Received = match ipc::wait(ipc::WaitFrom::Any, ipc::RECV_NONE, &mut buf) {
             Ok(r) => r,
             Err(e) => {
                 log_code(b"fault_keeper: wait err ", code_of(e));
@@ -80,10 +82,10 @@ fn main() {
 
 /// Обработка фолта: лог + FAULT_REPLY. #UD на ud2 (2 байта) —
 /// пропускаем инструкцию: new_rip = ip + 2, стек прежний (new_rsp=0).
-fn handle_fault(round: usize, faulting: u64, f: &FaultInfo) {
+fn handle_fault(round: usize, faulting: cintos_user::handle::TaskCap, f: &FaultInfo) {
     log_code(b"fault_keeper: [fault ", round as u64);
     log_code(b"fault_keeper: kind=", f.kind);
-    log_hex(b"fault_keeper: faulting cap=", faulting);
+    log_hex(b"fault_keeper: faulting cap=", faulting.raw());
     log_hex(b"fault_keeper: ip=", f.ip);
     log_hex(b"fault_keeper: sp=", f.sp);
 
@@ -95,30 +97,6 @@ fn handle_fault(round: usize, faulting: u64, f: &FaultInfo) {
         Ok(()) => log(b"fault_keeper: replied (skip ud2)\n"),
         Err(e) => log_code(b"fault_keeper: reply err ", code_of(e)),
     }
-}
-
-/// Слот peer-TaskTCB по имени (ростер argv: [0]=своё имя, [1+i]=i-й).
-/// Имена модулей — ПУТИ (/boot/modules/X): сравниваем базовое имя.
-fn peer_slot_of(name: &[u8]) -> Option<u64> {
-    let argc = crt0::args()?;
-    for i in 1..argc {
-        let p = crt0::argv_at(i)?;
-        let mut len = 0usize;
-        unsafe {
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
-        let base = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &bytes[pos + 1..],
-            None => bytes,
-        };
-        if base == name {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
-        }
-    }
-    None
 }
 
 // ─── Логирование (без fmt/аллокаций; как у ipc_receiver) ────────────────────

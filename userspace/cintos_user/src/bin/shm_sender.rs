@@ -20,18 +20,20 @@ use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc::{self, CapDesc};
 use cintos_user::shm::{self, Producer};
+use cintos_user::cap::Rights;
+use cintos_user::handle::{Pages, Slot};
 use cintos_user::task;
 use cintos_user::{cap, mem};
 
 /// Страниц под разделяемый регион.
-const SHM_PAGES: u64 = 4;
+const SHM_PAGES: Pages = Pages::new(4);
 /// Сообщений в демо.
 const MSG_COUNT: usize = 16;
 /// Размер одного сообщения (байт) — больше MAX_MSG транспорта вдвое.
 const MSG_LEN: usize = 1024;
 /// Слот cspace под capability разделяемого региона (свой и получателя;
 /// над peer-диапазоном 2..2+N).
-const SLOT_SHM_CAP: u64 = 16;
+const SLOT_SHM_CAP: Slot = Slot::new(16);
 
 fn main() {
     dlog::log("shm_sender: старт\n");
@@ -46,7 +48,8 @@ fn main() {
         Ok(va) => va,
         Err(e) => fail("shm_sender: ALLOC_PAGES err ", code_of(e)),
     };
-    let mut ring = match unsafe { Producer::init(va as usize, SHM_PAGES as usize) } {
+    let mut ring =
+        match unsafe { Producer::init(va.raw() as usize, SHM_PAGES.raw() as usize) } {
         Some(p) => p,
         None => fail("shm_sender: кольцо не инициализировано ", 0),
     };
@@ -56,8 +59,8 @@ fn main() {
         Ok(id) => id,
         Err(e) => fail("shm_sender: CAP_CREATE_SHARED err ", code_of(e)),
     };
-    let offer = cap_id.to_le_bytes();
-    let caps = [CapDesc::new(SLOT_SHM_CAP, SLOT_SHM_CAP, ipc::rights::SEND)];
+    let offer = cap_id.raw().to_le_bytes();
+    let caps = [CapDesc::new(SLOT_SHM_CAP, SLOT_SHM_CAP, Rights::SEND)];
     let mut kernel_bytes = match ipc::send_cost(
         receiver_slot,
         shm::labels::SHM_OFFER,
@@ -70,7 +73,7 @@ fn main() {
 
     // 3. Готовность получателя.
     let mut buf = ipc::recv_buffer();
-    match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
+    match ipc::wait(ipc::WaitFrom::Slot(receiver_slot), ipc::RECV_NONE, &mut buf) {
         Ok(r) if r.label == shm::labels::SHM_READY => {
             dlog::log("shm_sender: получатель смонтировал регион\n");
         }
@@ -108,7 +111,7 @@ fn main() {
         };
         // ACK-дверь: получатель освободил кадр (ping-pong — кольцо
         // не переполняется даже при ёмкости в одно сообщение).
-        match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
+        match ipc::wait(ipc::WaitFrom::Slot(receiver_slot), ipc::RECV_NONE, &mut buf) {
             Ok(r) if r.label == shm::labels::SHM_ACK => {}
             Ok(r) => {
                 let mut l = Line::new();
@@ -123,7 +126,7 @@ fn main() {
     }
 
     // 5. Финал: контрольная сумма потребителя.
-    let remote_sum = match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
+    let remote_sum = match ipc::wait(ipc::WaitFrom::Slot(receiver_slot), ipc::RECV_NONE, &mut buf) {
         Ok(r) if r.label == shm::labels::SHM_DONE && r.payload.len() == 8 => {
             u64::from_le_bytes(r.payload[..8].try_into().unwrap())
         }
