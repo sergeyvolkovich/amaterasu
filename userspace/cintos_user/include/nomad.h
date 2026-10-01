@@ -75,7 +75,13 @@ uint64_t nomad_free_pages(uint64_t vaddr);
 #define NOMAD_AT_NS_CAP      0xC1700002
 #define NOMAD_AT_FB_ADDR     0xC1700003
 
-/* ── IPC (L4-транспорт; сериализация — mini-FlatBuffers внутри) ──────── */
+/* ── IPC (L4-транспорт; тело сообщения — фиксированный заголовок) ──── */
+
+/* Тело сообщения (little-endian): [label u64][payload_len u64][payload].
+ * label — тег типа сообщения; payload — непрозрачные байты (максимум
+ * NOMAD_MSG_MAX). Структура доставки в буфере wait:
+ * [sender u64][body_len u64][caps_count u64][слоты×caps_count][тело]. */
+#define NOMAD_MSG_MAX 512 /* максимум payload (зеркало ядра) */
 
 /* Дескриптор пересылки capability (L4 map item): 24 байта.
  * src_slot — слот ОТПРАВИТЕЛЯ, dst_slot — слот ПОЛУЧАТЕЛЯ. */
@@ -110,18 +116,6 @@ const uint8_t *nomad_ipc_msg_payload(const uint8_t *buf, uint64_t buf_len,
 uint64_t nomad_ipc_msg_caps_count(const uint8_t *buf, uint64_t buf_len);
 uint64_t nomad_ipc_msg_cap_slot(const uint8_t *buf, uint64_t buf_len, uint64_t i);
 
-/* ── FlatBuffers-сборка (тело сообщения) ──────────────────────────────── */
-
-/* Контекст сборщика: аллоцируйте по значению / в статику размера
- * NOMAD_FB_CTX_SIZE; аллокаций внутри нет. */
-#define NOMAD_FB_CTX_SIZE 536 /* sizeof(flatbuf::Builder) — синхронизировано */
-
-void nomad_fb_init(void *ctx);
-void nomad_fb_label(void *ctx, uint64_t label);
-void nomad_fb_payload(void *ctx, const uint8_t *ptr, uint64_t len);
-/* Возврат: указатель на готовое тело (в ctx) + размер в *out_len;
- * NULL — переполнение. */
-const uint8_t *nomad_fb_finish(void *ctx, uint64_t *out_len);
 
 /* ── Таймер (L4-модель: тик — линия IRQ0; uptime — ядро) ─────────────── */
 

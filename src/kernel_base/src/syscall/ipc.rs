@@ -1,8 +1,8 @@
 //! Домен IPC-сисколлов: синхронный транспорт сообщений (стиль Лидтке/L4).
 //!
 //! Ядро — ТОЛЬКО транспорт: payload непрозрачен (сериализация —
-//! FlatBuffers в юзерспейсе, см. cintos_user::flatbuf), capability
-//! пересылаются явными дескрипторами ([`CapItem`], аналог L4 map
+//! юзерспейс: тело {label, payload_len, payload}, см. cintos_user::ipc),
+//! capability пересылаются явными дескрипторами ([`CapItem`], аналог L4 map
 //! items). Rendezvous-логика — ipc::endpoint.
 //!
 //! ABI:
@@ -51,7 +51,7 @@ use crate::{
 pub struct SyscallIPCSend {
     /// Слот cspace текущей задачи с TaskTCB-капабилити получателя.
     slot: u64,
-    /// ВА непрозрачного тела сообщения (FlatBuffers и т.п.).
+    /// ВА непрозрачного тела сообщения (label + payload + данные).
     msg_ptr: u64,
     msg_size: u64,
     /// ВА массива дескрипторов пересылки (3×u64 на capability) или 0.

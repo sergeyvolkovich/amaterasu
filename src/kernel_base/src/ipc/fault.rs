@@ -26,9 +26,8 @@
 //!   1. Порт (idt-путь) проверяет: вектор доставляем, фолт из ring3,
 //!      у текущей задачи есть биндинг → [`deliver_fault`].
 //!   2. Выделяется слот активного фолта; собирается сообщение
-//!      (FlatBuffers IpcMessage{label=FAULT_LABEL, payload=5×u64} —
-//!      формат байт-в-байт совместим с юзерспейс-сериализацией, см.
-//!     [`FaultInfo::encode`]).
+//!      (тело проволочного формата ipc: label = FAULT_LABEL,
+//!      payload = 5×u64 — см. [`FaultInfo::encode`]).
 //!   3. Доставка: быстрый путь — обработчик уже спит в IPC_WAIT
 //!      (claim эндпоинта, запись в его буфер, пробуждение); медленный
 //!      путь — почтовый ящик (обработчик заберёт при следующем
@@ -88,7 +87,7 @@ pub const MAX_FAULT_SLOTS: usize = 16;
 /// Максимум биндингов «задача → обработчик».
 pub const MAX_FAULT_BINDINGS: usize = 32;
 
-/// Label фолт-сообщений (FlatBuffers label; «FA17» = fault). Ядро и
+/// Label (тег тела) фолт-сообщений («FA17» = fault). Ядро и
 /// юзерспейс обязаны соглашаться на это значение — зеркалится в
 /// cintos_user::fault.
 pub const FAULT_LABEL: u64 = 0xFA17_0000_0000_0001;
@@ -96,9 +95,9 @@ pub const FAULT_LABEL: u64 = 0xFA17_0000_0000_0001;
 /// Слов payload в фолт-сообщении (kind, addr, ip, sp, err).
 pub const FAULT_MSG_WORDS: usize = 5;
 
-/// Полный размер тела фолт-сообщения (FlatBuffers-обёртка IpcMessage).
-/// Раскладка — см. [`FaultInfo::encode`].
-pub const FAULT_MSG_LEN: usize = 76;
+/// Полный размер тела фолт-сообщения (заголовок {label, payload_len}
+/// + payload). Раскладка — см. [`FaultInfo::encode`].
+pub const FAULT_MSG_LEN: usize = 16 + FAULT_MSG_WORDS * 8;
 
 /// Объект ожидания упавшей задачи в слоте `slot`.
 pub fn fault_wait_object(slot: usize) -> usize {
@@ -168,38 +167,23 @@ impl FaultInfo {
         [self.kind, self.addr, self.ip, self.sp, self.err]
     }
 
-    /// Кодирует сообщение в FlatBuffers `IpcMessage{label, payload}` —
-    /// байт-в-байт формат `cintos_user::flatbuf::Builder` (канонический
-    /// FlatBuffers, little-endian), чтобы обработчик разбирал фолт тем
-    /// же `ipc::wait`/`parse_received`, что и обычные сообщения.
+    /// Кодирует тело фолт-сообщения в проволочном формате ipc
+    /// (fixed-заголовок; формат — зеркало `cintos_user::ipc`::BODY_HDR,
+    /// little-endian), чтобы обработчик разбирал фолт тем же
+    /// `ipc::wait`/`parse_received`, что и обычные сообщения.
     ///
-    /// Раскладка (76 байт, фиксированная — размер не зависит от данных):
+    /// Раскладка (56 байт, фиксированная — размер не зависит от данных):
     /// ```text
-    /// [ 0.. 4) root uoffset      = 12  (таблица сразу после)
-    /// [ 4..12) vtable            = {vt=8, table=20, label@8, payload@16}
-    /// [12..16) soffset таблицы   = 8   (vtable — на 8 байт ниже)
-    /// [16..20) паддинг выравнивания label
-    /// [20..28) label (u64)        = FAULT_LABEL
-    /// [28..32) uoffset payload   = 4   (вектор сразу после таблицы)
-    /// [32..36) длина вектора     = 40
-    /// [36..76) payload           = 5×u64 (le)
+    /// [ 0.. 8) label       (u64) = FAULT_LABEL
+    /// [ 8..16) payload_len (u64) = 5×8
+    /// [16..56) payload           = 5×u64 (le)
     /// ```
     pub fn encode(&self) -> [u8; FAULT_MSG_LEN] {
         let mut m = [0u8; FAULT_MSG_LEN];
-        m[0..4].copy_from_slice(&12u32.to_le_bytes());
-        // vtable
-        m[4..6].copy_from_slice(&8u16.to_le_bytes());
-        m[6..8].copy_from_slice(&20u16.to_le_bytes());
-        m[8..10].copy_from_slice(&8u16.to_le_bytes());
-        m[10..12].copy_from_slice(&16u16.to_le_bytes());
-        // таблица
-        m[12..16].copy_from_slice(&8i32.to_le_bytes());
-        // [16..20) — паддинг (0)
-        m[20..28].copy_from_slice(&FAULT_LABEL.to_le_bytes());
-        m[28..32].copy_from_slice(&4u32.to_le_bytes());
-        m[32..36].copy_from_slice(&(FAULT_MSG_WORDS as u32 * 8).to_le_bytes());
+        m[0..8].copy_from_slice(&FAULT_LABEL.to_le_bytes());
+        m[8..16].copy_from_slice(&((FAULT_MSG_WORDS * 8) as u64).to_le_bytes());
         for (i, w) in self.payload_words().iter().enumerate() {
-            m[36 + i * 8..44 + i * 8].copy_from_slice(&w.to_le_bytes());
+            m[16 + i * 8..24 + i * 8].copy_from_slice(&w.to_le_bytes());
         }
         m
     }
@@ -501,36 +485,21 @@ pub fn deliver_fault<A: ArchImplementation + 'static>(
 mod tests {
     use super::*;
 
-    /// Мини-верификатор формата (зеркало cintos_user::flatbuf::MessageRef
-    /// — канонический FlatBuffers IpcMessage): label по офсету vtable,
-    /// payload через uoffset-вектор.
-    fn parse_flatbuf(buf: &[u8]) -> Option<(u64, &[u8])> {
-        let rd32 = |at: usize| -> u32 {
-            u32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
-        };
-        let rd16 = |at: usize| -> u16 {
-            u16::from_le_bytes(buf[at..at + 2].try_into().unwrap())
-        };
-        let table = rd32(0) as usize;
-        let soffset = rd32(table) as i32 as usize;
-        let vtable = table - soffset;
-        let vt_size = rd16(vtable) as usize;
-        let label_off = rd16(vtable + 4) as usize;
-        let payload_off = rd16(vtable + 6) as usize;
-        assert_eq!(vt_size, 8);
-        let label = u64::from_le_bytes(
-            buf[table + label_off..table + label_off + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let field_at = table + payload_off;
-        let vec_at = field_at + rd32(field_at) as usize;
-        let len = rd32(vec_at) as usize;
-        Some((label, &buf[vec_at + 4..vec_at + 4 + len]))
+    /// Мини-верификатор проволочного формата ipc (зеркало
+    /// cintos_user::ipc::parse_received для тела): label + payload_len
+    /// + payload.
+    fn parse_body(buf: &[u8]) -> Option<(u64, &[u8])> {
+        if buf.len() < 16 {
+            return None;
+        }
+        let label = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let plen = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+        let payload = buf.get(16..16 + plen)?;
+        Some((label, payload))
     }
 
     #[test]
-    fn fault_msg_is_canonical_flatbuf() {
+    fn fault_msg_is_fixed_layout() {
         let info = FaultInfo {
             kind: fault_kind::PAGE_FAULT,
             addr: 0x1234_5678,
@@ -540,7 +509,8 @@ mod tests {
         };
         let msg = info.encode();
         assert_eq!(msg.len(), FAULT_MSG_LEN);
-        let (label, payload) = parse_flatbuf(&msg).expect("валидный IpcMessage");
+        assert_eq!(FAULT_MSG_LEN, 56);
+        let (label, payload) = parse_body(&msg).expect("валидное тело");
         assert_eq!(label, FAULT_LABEL);
         assert_eq!(payload.len(), FAULT_MSG_WORDS * 8);
         let word = |i: usize| -> u64 {

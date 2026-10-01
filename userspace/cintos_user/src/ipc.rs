@@ -4,16 +4,19 @@
 //!   - ЯДРО — только транспорт: rendezvous send/wait, пересылка
 //!     capability дескрипторами (аналог L4 map items). Payload ядро
 //!     НЕ разбирает.
-//!   - ЮЗЕРСПЕЙС — сериализация: тело сообщения кодируется мини-
-//!     FlatBuffers-рантаймом [`crate::flatbuf`] (IpcMessage{label,
-//!     payload}).
+//!   - ЮЗЕРСПЕЙС — сериализация: тело сообщения — фиксированный
+//!     заголовок + payload (seL4-стиль, без сериализационных
+//!     фреймворков; см. [`BODY_HDR`]).
 //!
 //! Проволочный формат доставки (буфер приёма wait, little-endian):
 //!   [0] task_cap_id отправителя        (u64)
-//!   [1] размер тела (FlatBuffers)      (u64, байт)
+//!   [1] размер тела                    (u64, байт)
 //!   [2] число доставленных capability  (u64, N)
 //!   [3..3+N] слоты ПОЛУЧАТЕЛЯ capability(u64 × N)
-//!   [3+N .. 3+N+size] тело сообщения   (FlatBuffers: label + payload)
+//!   [3+N ..] тело сообщения ([`BODY_HDR`]):
+//!     [0..8)   label       u64 — тег типа сообщения (MR0 у Лидтке)
+//!     [8..16)  payload_len u64 — байт payload
+//!     [16..)   payload (непрозрачные байты)
 //!
 //! Слоты cspace (bootstrap-раскладка spawn):
 //!   0 — self TaskTCB, 1 — неймспейс, 2+i — TaskTCB i-го boot-сервера
@@ -23,7 +26,6 @@
 
 use crate::abi;
 use crate::cap::Rights;
-use crate::flatbuf::{Builder, MessageRef};
 use crate::handle::{Slot, TaskCap};
 use crate::syscall::{self, SyscallError};
 
@@ -32,6 +34,16 @@ pub const HEADER_WORDS: usize = 3;
 
 /// Максимум capability в одном сообщении (зеркало ядра).
 pub const MAX_CAPS: usize = 8;
+
+/// Слов заголовка ТЕЛА сообщения: label + payload_len.
+pub const BODY_HDR_WORDS: usize = 2;
+
+/// Размер заголовка тела (байт).
+pub const BODY_HDR: usize = BODY_HDR_WORDS * 8;
+
+/// Максимум payload одного сообщения (байт) — транспортный лимит ядра
+/// (зеркало kernel_base::ipc::endpoint::MAX_MSG).
+pub const MAX_MSG: usize = 512;
 
 /// От кого ждать ([`wait`]): конкретный peer (closed wait) или кто
 /// угодно (open wait, L4 from-any). Замена сырого `WAIT_ANY = u64::MAX`.
@@ -113,10 +125,10 @@ pub const E_MSG_TOO_BIG: u64 = abi::SYSCALL_ERROR_FLAG | 100;
 
 /// Отправка сообщения (блокируется до приёма получателем — rendezvous).
 ///
-/// `slot` — слот cspace с TaskTCB-капабилити получателя;
-/// тело — FlatBuffers {label, payload}; caps — дескрипторы пересылки.
-/// `Err(SyscallError::Kernel(code))` — отказ транспорта (права,
-/// негабарит буфера получателя, смерть получателя).
+/// `slot` — слот cspace с TaskTCB-капабилити получателя; тело —
+/// {label, payload_len, payload} ([`BODY_HDR`]); caps — дескрипторы
+/// пересылки. `Err(SyscallError::Kernel(code))` — отказ транспорта
+/// (права, негабарит буфера получателя, смерть получателя).
 pub fn send(
     slot: Slot,
     label: u64,
@@ -137,13 +149,17 @@ pub fn send_cost(
     payload: &[u8],
     caps: &[CapDesc],
 ) -> Result<u64, SyscallError> {
-    let mut builder = Builder::new();
-    builder.label(label).payload(payload);
-    // Билдер жив до возврата из syscall — ядро копирует тело в момент
-    // вызова (быстрый путь) или в свой почтовый ящик (медленный).
-    let Some(wire) = builder.finish() else {
+    if payload.len() > MAX_MSG {
         return Err(SyscallError::Kernel(E_MSG_TOO_BIG));
-    };
+    }
+    // Тело собирается в стековый буфер и живёт до возврата из syscall —
+    // ядро копирует его в момент вызова (быстрый путь) или в свой
+    // почтовый ящик (медленный).
+    let mut wire = [0u8; BODY_HDR + MAX_MSG];
+    wire[0..8].copy_from_slice(&label.to_le_bytes());
+    wire[8..BODY_HDR].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    wire[BODY_HDR..BODY_HDR + payload.len()].copy_from_slice(payload);
+    let wire_len = BODY_HDR + payload.len();
 
     let mut caps_wire = [0u64; MAX_CAPS * 3];
     let n = caps.len().min(MAX_CAPS);
@@ -158,7 +174,7 @@ pub fn send_cost(
             abi::nr::IPC_SEND,
             slot.raw(),
             wire.as_ptr() as u64,
-            wire.len() as u64,
+            wire_len as u64,
             if n > 0 { caps_wire.as_ptr() as u64 } else { 0 },
             n as u64,
         )
@@ -166,10 +182,11 @@ pub fn send_cost(
     syscall::check(code)?;
     // Зеркало ядра (endpoint::delivery_bytes): 3 слова заголовка +
     // слот на capability + тело.
-    Ok(((HEADER_WORDS + n) * 8 + wire.len()) as u64)
+    Ok(((HEADER_WORDS + n) * 8 + wire_len) as u64)
 }
 
-/// Принятое сообщение: заголовок транспорта + разобранное FlatBuffers-тело.
+/// Принятое сообщение: заголовок транспорта + разобранное тело
+/// ([`BODY_HDR`]: label + payload_len + payload).
 #[derive(Debug)]
 pub struct Received<'a> {
     /// TaskTCB-капа отправителя (адресация ответа/фолт-reply).
@@ -177,9 +194,9 @@ pub struct Received<'a> {
     /// Слоты ПОЛУЧАТЕЛЯ, куда легли capability (первые caps_len).
     pub cap_slots: [Slot; MAX_CAPS],
     pub caps_len: usize,
-    /// Тег типа сообщения (FlatBuffers label).
+    /// Тег типа сообщения (label тела, MR0 у Лидтке).
     pub label: u64,
-    /// Непрозрачное тело (FlatBuffers payload).
+    /// Непрозрачный payload тела.
     pub payload: &'a [u8],
 }
 
@@ -256,14 +273,24 @@ pub fn parse_received(buf: &[u8]) -> Option<Received<'_>> {
     if body_end > buf.len() {
         return None;
     }
-    let body = &buf[body_at..body_end];
-    let msg = MessageRef::parse(body)?;
+    // Тело: [label u64][payload_len u64][payload]. Проверяем границы —
+    // payload заимствуем из буфера (zero-copy), хвост игнорируем.
+    if body_len < BODY_HDR {
+        return None;
+    }
+    let label = rd(body_at)?;
+    let plen = rd(body_at + 8)? as usize;
+    let payload_at = body_at + BODY_HDR;
+    let payload_end = payload_at.checked_add(plen)?;
+    if payload_end > body_at + body_len {
+        return None;
+    }
     Some(Received {
         sender: TaskCap::new(sender),
         cap_slots,
         caps_len,
-        label: msg.label(),
-        payload: msg.payload(),
+        label,
+        payload: &buf[payload_at..payload_end],
     })
 }
 
@@ -271,4 +298,74 @@ pub fn parse_received(buf: &[u8]) -> Option<Received<'_>> {
 /// заголовок читается unaligned-словами).
 pub fn recv_buffer() -> [u8; 1024] {
     [0; 1024]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Сборка доставочного буфера вручную (зеркало ядра — endpoint::
+    /// delivery: 3 слова заголовка + слоты capability + тело).
+    fn wire(sender: u64, label: u64, payload: &[u8], slots: &[u64]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&sender.to_le_bytes());
+        v.extend_from_slice(&((BODY_HDR + payload.len()) as u64).to_le_bytes());
+        v.extend_from_slice(&(slots.len() as u64).to_le_bytes());
+        for s in slots {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v.extend_from_slice(&label.to_le_bytes());
+        v.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn parse_received_roundtrip() {
+        let buf = wire(42, 0xC1A0_0001, b"ping", &[7]);
+        let r = parse_received(&buf).expect("валидный буфер");
+        assert_eq!(r.sender, TaskCap::new(42));
+        assert_eq!(r.label, 0xC1A0_0001);
+        assert_eq!(r.payload, b"ping");
+        assert_eq!(r.caps_len, 1);
+        assert_eq!(r.cap_slots[0], Slot::new(7));
+        assert_eq!(r.cap_slots[1], Slot::new(0));
+    }
+
+    #[test]
+    fn parse_received_empty_payload_no_caps() {
+        let buf = wire(u64::MAX, 0, &[], &[]);
+        let r = parse_received(&buf).expect("валидный буфер");
+        assert_eq!(r.sender, TaskCap::new(u64::MAX));
+        assert_eq!(r.label, 0);
+        assert!(r.payload.is_empty());
+        assert_eq!(r.caps_len, 0);
+    }
+
+    #[test]
+    fn parse_received_full_size_payload() {
+        // MAX_MSG payload — транспортный лимит.
+        let payload = [0xA5u8; MAX_MSG];
+        let buf = wire(1, 2, &payload, &[]);
+        let r = parse_received(&buf).expect("валидный буфер");
+        assert_eq!(r.payload.len(), MAX_MSG);
+        assert!(r.payload.iter().all(|&b| b == 0xA5));
+    }
+
+    #[test]
+    fn parse_received_survives_truncation_and_bad_len() {
+        // Любое усечение — None или валидный префикс, без паники.
+        let buf = wire(1, 2, b"payload-bytes", &[]);
+        for cut in 0..buf.len() {
+            let _ = parse_received(&buf[..cut]);
+        }
+        // payload_len, вылезающий за тело, — отклонён.
+        let mut bad = wire(1, 2, b"abc", &[]);
+        bad[32] = 0xFF; // младший байт payload_len (тело с 24-го байта)
+        assert!(parse_received(&bad).is_none());
+        // Мусорный заголовок доставки (caps_len > MAX_CAPS) — отклонён.
+        let mut bad2 = wire(1, 2, b"abc", &[]);
+        bad2[16] = MAX_CAPS as u8 + 1;
+        assert!(parse_received(&bad2).is_none());
+    }
 }

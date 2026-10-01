@@ -14,8 +14,8 @@ pub use crate::abi::nr;
 pub use crate::crt0::{args, argv_at, auxv_get, bootstrap, envp, exit, stack_base};
 pub use crate::handle::{CapId, Pages, Phys, Slot, TaskCap, Va};
 pub use crate::{
-    abi, arena, cap, crt0, dlog, fault, fb, flatbuf, handle, init, ipc, mem, proto, shm, stats,
-    syscall, task, timer,
+    abi, arena, cap, crt0, dlog, fault, fb, handle, init, ipc, mem, shm, stats, syscall, task,
+    timer,
 };
 // heap — только на целевом target (GlobalAlloc с сисколлами).
 #[cfg(all(not(test), target_os = "none"))]

@@ -129,15 +129,11 @@ pub fn parse_fault(received: &Received<'_>) -> Option<FaultInfo> {
 mod tests {
     use super::*;
 
-    /// Ядро кодирует фолт каноническим FlatBuffers IpcMessage —
-    /// roundtrip через НАСТОЯЩИЙ билдер/парсер cintos_user::flatbuf
-    /// (ядро не может использовать этот крейт — проверяем здесь).
+    /// Ядро кодирует фолт в проволочном формате ipc (fixed-заголовок
+    /// {label, payload_len} + payload) — фиксируем раскладку литерально:
+    /// если ядро сменит формат, тест упадёт ДО рантайма.
     #[test]
     fn kernel_layout_roundtrip() {
-        use crate::flatbuf::MessageRef;
-
-        // Раскладка ядра (FaultInfo::encode, 76 байт): фиксируем её
-        // литерально — если ядро сменит формат, тест упадёт ДО рантайма.
         let info = FaultInfo {
             kind: fault_kind::PAGE_FAULT,
             addr: 0xDEAD_BEEF,
@@ -147,26 +143,21 @@ mod tests {
         };
         let words = info_payload_bytes(&info);
 
-        let mut body = [0u8; 76];
-        // [0..4) root=12
-        body[0..4].copy_from_slice(&12u32.to_le_bytes());
-        // vtable: {8, 20, 8, 16}
-        body[4..6].copy_from_slice(&8u16.to_le_bytes());
-        body[6..8].copy_from_slice(&20u16.to_le_bytes());
-        body[8..10].copy_from_slice(&8u16.to_le_bytes());
-        body[10..12].copy_from_slice(&16u16.to_le_bytes());
-        // таблица: soffset=8, паддинг, label, payload-uoffset=4
-        body[12..16].copy_from_slice(&8i32.to_le_bytes());
-        body[20..28].copy_from_slice(&FAULT_LABEL.to_le_bytes());
-        body[28..32].copy_from_slice(&4u32.to_le_bytes());
-        // вектор payload: [len][байты]
-        body[32..36].copy_from_slice(&(FAULT_MSG_WORDS as u32 * 8).to_le_bytes());
-        body[36..76].copy_from_slice(&words);
+        // Раскладка ядра (FaultInfo::encode, 56 байт).
+        let mut body = [0u8; 56];
+        body[0..8].copy_from_slice(&FAULT_LABEL.to_le_bytes());
+        body[8..16].copy_from_slice(&(FAULT_MSG_WORDS as u64 * 8).to_le_bytes());
+        body[16..56].copy_from_slice(&words);
 
-        // Валидный IpcMessage с нужными полями?
-        let msg = MessageRef::parse(&body).expect("валидный IpcMessage");
-        assert_eq!(msg.label(), FAULT_LABEL);
-        assert_eq!(msg.payload(), &words[..]);
+        // Тело = {label, payload_len=40, payload}?
+        assert_eq!(
+            u64::from_le_bytes(body[0..8].try_into().unwrap()),
+            FAULT_LABEL
+        );
+        assert_eq!(
+            u64::from_le_bytes(body[8..16].try_into().unwrap()),
+            FAULT_MSG_WORDS as u64 * 8
+        );
 
         // parse_fault по распарсенному сообщению.
         // (Received собираем вручную: parse_fault читает label/payload.)
@@ -174,8 +165,8 @@ mod tests {
             sender: TaskCap::new(42),
             cap_slots: [Slot::new(0); crate::ipc::MAX_CAPS],
             caps_len: 0,
-            label: msg.label(),
-            payload: msg.payload(),
+            label: FAULT_LABEL,
+            payload: &body[16..56],
         };
         assert_eq!(parse_fault(&received), Some(info));
         // Чужой label — не фолт.
@@ -184,7 +175,7 @@ mod tests {
             cap_slots: [Slot::new(0); crate::ipc::MAX_CAPS],
             caps_len: 0,
             label: 0xC1A0_0001,
-            payload: msg.payload(),
+            payload: &body[16..56],
         };
         assert_eq!(parse_fault(&other), None);
     }

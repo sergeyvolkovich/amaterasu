@@ -25,7 +25,7 @@ use cintos_user::task;
 /// TRANSFER_SLOT=16 — см. ipc::TRANSFER_SLOT).
 const FAULT_EP_SLOT: Slot = Slot::new(17);
 
-/// Лейблы handshake (FlatBuffers label; не NOMAD_FAULT_LABEL).
+/// Лейблы handshake (теги тела; не NOMAD_FAULT_LABEL).
 const LABEL_ASK_BOUND: u64 = 0xFA17_0001;
 const LABEL_BOUND_ACK: u64 = 0xFA17_0002;
 

@@ -1,7 +1,7 @@
 //! capi — C-совместимый ABI юзерспейса NOMAD.
 //!
 //! Требование «коду юзерспейса нужна Си-совместимость»: вся
-//! функциональность библиотеки (IPC-транспорт, FlatBuffers-разбор,
+//! функциональность библиотеки (IPC-транспорт, разбор доставки,
 //! сисколлы, auxv) доступна из C через стабильные `extern "C"`
 //! символы с C-типами; сигнатуры зеркалятся заголовком
 //! `cintos_user/include/nomad.h`. Ни одного Rust-типа в сигнатурах;
@@ -16,8 +16,6 @@
 //! каждой функции). clippy::not_unsafe_ptr_arg_deref отключён на модуль.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-use core::ffi::c_void;
 
 use crate::abi;
 use crate::cap::Rights;
@@ -228,8 +226,8 @@ const _: () = assert!(core::mem::size_of::<NomadCapDesc>() == 24);
 
 /// Синхронная отправка (блокируется до приёма).
 ///
-/// slot — слот cspace получателя; label/payload — тело (FlatBuffers
-/// соберёт ядро-независимый формат внутри); caps — массив
+/// slot — слот cspace получателя; label/payload — тело собирается
+/// как {label, payload_len, payload} (см. nomad.h); caps — массив
 /// NomadCapDesc×caps_len (может быть NULL при caps_len=0).
 /// Возврат: 0 — доставлено; иначе код ошибки (старший бит).
 #[unsafe(no_mangle)]
@@ -241,7 +239,7 @@ pub extern "C" fn nomad_ipc_send(
     caps: *const NomadCapDesc,
     caps_len: u64,
 ) -> u64 {
-    if payload_len as usize > crate::flatbuf::MAX_MSG {
+    if payload_len as usize > crate::ipc::MAX_MSG {
         return ipc::E_MSG_TOO_BIG;
     }
     // SAFETY: payload — валидная память вызывающего на payload_len байт
@@ -323,7 +321,7 @@ pub extern "C" fn nomad_ipc_msg_sender(buf: *const u8, buf_len: u64) -> u64 {
     msg_view(buf, buf_len).map(|v| v.sender).unwrap_or(0)
 }
 
-/// FlatBuffers-тег (label) тела сообщения.
+/// Тег (label) тела сообщения.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomad_ipc_msg_label(buf: *const u8, buf_len: u64) -> u64 {
     msg_view(buf, buf_len).map(|v| v.label).unwrap_or(0)
@@ -400,65 +398,6 @@ fn msg_view(buf: *const u8, buf_len: u64) -> Option<MsgView> {
             raw
         },
     })
-}
-
-// ─── FlatBuffers-сборка (для C без Rust-типов) ───────────────────────────────
-
-/// КОНТЕКСТ: сборщик FlatBuffers-тела сообщения. Размер — NOMAD_FB_CTX_SIZE
-/// (выделяйте NomadFbCtx по значению; аллокаций нет).
-#[repr(C)]
-pub struct NomadFbCtx {
-    _private: [u8; 0],
-}
-
-/// Размер контекста сборщика (байт) — sizeof в C берётся из заголовка,
-/// здесь — для статической проверки зеркала.
-pub const NOMAD_FB_CTX_SIZE: usize = core::mem::size_of::<crate::flatbuf::Builder>();
-
-/// Инициализация сборщика в ctx (обязан вмещать NOMAD_FB_CTX_SIZE байт).
-#[unsafe(no_mangle)]
-pub extern "C" fn nomad_fb_init(ctx: *mut c_void) {
-    // SAFETY: ctx — валидная память на NOMAD_FB_CTX_SIZE байт (контракт).
-    unsafe { (ctx as *mut crate::flatbuf::Builder).write(crate::flatbuf::Builder::new()) };
-}
-
-/// Тег сообщения.
-#[unsafe(no_mangle)]
-pub extern "C" fn nomad_fb_label(ctx: *mut c_void, label: u64) {
-    // SAFETY: ctx — инициализированный Builder.
-    unsafe {
-        (*(ctx as *mut crate::flatbuf::Builder)).label(label);
-    }
-}
-
-/// Payload (байты копируются в контекст; повторный вызов перезаписывает).
-#[unsafe(no_mangle)]
-pub extern "C" fn nomad_fb_payload(ctx: *mut c_void, ptr: *const u8, len: u64) {
-    // SAFETY: ctx + ptr — контракты выше.
-    unsafe {
-        let b = &mut *(ctx as *mut crate::flatbuf::Builder);
-        let bytes = core::slice::from_raw_parts(ptr, len as usize);
-        b.payload(bytes);
-    }
-}
-
-/// Финализация: в buf_len — размер, возврат — указатель на готовое
-/// тело (живёт в ctx) или NULL (переполнение).
-#[unsafe(no_mangle)]
-pub extern "C" fn nomad_fb_finish(ctx: *mut c_void, out_len: *mut u64) -> *const u8 {
-    // SAFETY: контракты выше.
-    unsafe {
-        let b = &mut *(ctx as *mut crate::flatbuf::Builder);
-        match b.finish() {
-            Some(wire) => {
-                if !out_len.is_null() {
-                    *out_len = wire.len() as u64;
-                }
-                wire.as_ptr()
-            }
-            None => core::ptr::null(),
-        }
-    }
 }
 
 // ─── Таймер (L4-модель v2: тик — капа IrqLine на GSI из TASK_STATS) ────────

@@ -1,4 +1,4 @@
-//! ipc_receiver — приёмник IPC-демо NOMAD (L4-транспорт + FlatBuffers).
+//! ipc_receiver — приёмник IPC-демо NOMAD (L4-транспорт).
 //!
 //! Сценарий (serial-лог через DBG_LOG_WRITE): принимает ДВА сообщения
 //! (от ipc_sender на Rust и от ipc_cdemo на C — доказательство
@@ -15,11 +15,10 @@
 
 use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
-use cintos_user::flatbuf::MessageRef;
 use cintos_user::ipc::{self, Received};
 use cintos_user::task;
 
-/// Лейблы сообщений демо (FlatBuffers label).
+/// Лейблы сообщений демо (теги тела).
 pub const LABEL_PING: u64 = 0xC1A0_0001;
 pub const LABEL_PONG: u64 = 0xC1A0_0002;
 
@@ -49,14 +48,8 @@ fn main() {
             log_code("ipc_receiver: capability landed in slot ", slot.raw());
         }
 
-        // Ответ по слоту отправителя: payload либо сырой («имя:текст»),
-        // либо FlatBuffers-обёрнутый (C-демо кодирует тело через
-        // nomad_fb_*): пробуем верифицирующий FB-разбор и берём внутренний
-        // payload, затем — имя до ':'.
-        let inner = MessageRef::parse(received.payload)
-            .map(|m| m.payload())
-            .unwrap_or(received.payload);
-        let name = sender_name_of(inner).and_then(|b| core::str::from_utf8(b).ok());
+        // Ответ по слоту отправителя: payload — «имя:текст», имя до ':'.
+        let name = sender_name_of(received.payload).and_then(|b| core::str::from_utf8(b).ok());
         if let Some(slot) = name.and_then(task::peer_slot_of) {
             match ipc::send(slot, LABEL_PONG, b"pong", &[]) {
                 Ok(()) => dlog::log("ipc_receiver: pong sent\n"),

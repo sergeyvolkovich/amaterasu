@@ -8,12 +8,9 @@
 //!     (argc/argv/envp/auxv), bootstrap-capability системного сервера
 //!     (слот 0 = self-TCB, слот 1 = неймспейс, 2+i = peer-TCB), `main`,
 //!     self-exit, паник-хендлер;
-//!   - [`flatbuf`] — мини-FlatBuffers-рантайм (сериализация IPC-сообщений:
-//!     ЯДРО не разбирает payload — сериализация целиком в юзерспейсе;
-//!     generic-слой таблиц + конверт IpcMessage);
-//!   - [`proto`] — типизированные прототипы IPC-сообщений поверх
-//!     flatbuf (правила эволюции схем, пример fb-сервиса);
 //!   - [`ipc`] — Rust-обвязка L4-транспорта (send/wait + map items);
+//!     тело сообщения — фиксированный заголовок {label, payload_len}
+//!     + payload (сериализация — задача протокола поверх, seL4-стиль);
 //!   - [`cap`]/[`mem`] — capability-операции (create_*/mint/clone/
 //!     revoke/destroy, монтаж регионов) и сырая память задачи;
 //!   - [`handle`] — типизированные хендлы поверх u64 (Slot/CapId/
@@ -51,7 +48,6 @@ pub mod crt0;
 pub mod dlog;
 pub mod fault;
 pub mod fb;
-pub mod flatbuf;
 pub mod handle;
 // heap: GlobalAlloc с сисколлами — ТОЛЬКО для целевого target (в
 // хост-тестах он подменял бы аллокатор std-харнесса).
@@ -61,7 +57,6 @@ pub mod init;
 pub mod ipc;
 pub mod mem;
 pub mod prelude;
-pub mod proto;
 pub mod shm;
 pub mod stats;
 pub mod syscall;

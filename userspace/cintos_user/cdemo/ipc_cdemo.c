@@ -3,7 +3,7 @@
  *
  * Полный цикл IPC ЧИСТО НА C (заголовок nomad.h, libcintos_user.a):
  *   1. Поиск ipc_receiver в ростере argv (слот peer = 2 + позиция).
- *   2. Сборка FlatBuffers-тела (nomad_fb_*), отправка PING с capability
+ *   2. Отправка PING (payload — сырые байты) с capability
  *      map item (свой слот 1 → слот 5 получателя, право SEND).
  *      send блокируется до rendezvous — как у Rust-отправителя.
  *   3. Closed wait PONG от получателя, разбор через nomad_ipc_msg_*.
@@ -81,24 +81,15 @@ int main(long argc, char **argv)
         return 1;
     }
 
-    /* FlatBuffers-тело: label + payload. */
-    static uint8_t fb_ctx[NOMAD_FB_CTX_SIZE] __attribute__((aligned(8)));
-    nomad_fb_init(fb_ctx);
-    nomad_fb_label(fb_ctx, LABEL_PING);
-    nomad_fb_payload(fb_ctx, (const uint8_t *)"ipc_cdemo:hello-from-c", 22);
-    uint64_t body_len = 0;
-    const uint8_t *body = nomad_fb_finish(fb_ctx, &body_len);
-    if (body == NULL) {
-        say("ipc_cdemo: fb overflow\n");
-        return 1;
-    }
-
-    /* Отправка с map item: слот 1 (неймспейс) → свободный слот получателя.
+    /* Отправка: payload — сырые байты, тело собирает обвязка
+     * ({label, payload_len, payload}). */
+    /* Map item: слот 1 (неймспейс) → свободный слот получателя.
      * 17, а не NOMAD_SLOT_TRANSFER(16): ipc_sender уже положил туда свою
      * capability (приёмник жив и держит слот) — второй map в тот же слот
      * даёт E_SLOT_OCCUPIED. */
     NomadCapDesc caps[1] = {{1, NOMAD_SLOT_TRANSFER + 1, NOMAD_CAP_SEND}};
-    uint64_t r = nomad_ipc_send(recv_slot, LABEL_PING, body, body_len,
+    uint64_t r = nomad_ipc_send(recv_slot, LABEL_PING,
+                               (const uint8_t *)"ipc_cdemo:hello-from-c", 22,
                                caps, 1);
     if (r != 0) {
         say("ipc_cdemo: send error ");

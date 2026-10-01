@@ -1,4 +1,4 @@
-//! ipc_sender — отправитель IPC-демо NOMAD (L4-транспорт + FlatBuffers).
+//! ipc_sender — отправитель IPC-демо NOMAD (L4-транспорт).
 //!
 //! Сценарий (serial-лог через DBG_LOG_WRITE):
 //!   1. Находит ipc_receiver в ростере (argv → слот peer).
