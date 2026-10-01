@@ -468,7 +468,7 @@ fn harvest_bootinfo(hhdm: usize) -> &'static BootInfo<'static> {
     }
 
     // Framebuffer: ядро не пишет — параметры уходят init-серверу через
-    // auxv (AT_CINTOS_FB_*), образ мапится ядром в пространство задачи
+    // auxv (AT_NOMAD_FB_*), образ мапится ядром в пространство задачи
     // (запись в FB ведёт userspace-инит, см. cintos-user::fb).
     if let Some(fb) = FB.get_response().and_then(|r| r.framebuffers().next()) {
         let addr = fb.addr() as usize;

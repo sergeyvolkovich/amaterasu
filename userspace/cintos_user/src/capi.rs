@@ -4,7 +4,7 @@
 //! функциональность библиотеки (IPC-транспорт, FlatBuffers-разбор,
 //! сисколлы, auxv) доступна из C через стабильные `extern "C"`
 //! символы с C-типами; сигнатуры зеркалятся заголовком
-//! `cintos_user/include/cintos.h`. Ни одного Rust-типа в сигнатурах;
+//! `cintos_user/include/nomad.h`. Ни одного Rust-типа в сигнатурах;
 //! коды ошибок — те же биты SYSCALL_ERROR_FLAG, что и в ядре.
 //!
 //! C-демо (ipc_cdemo) компонуется с staticlib-сборкой этого крейта и
@@ -25,40 +25,40 @@ use crate::ipc::{self, HEADER_WORDS, MAX_CAPS};
 // ─── Общие ──────────────────────────────────────────────────────────────────
 
 /// Размер буфера приёма IPC, рекомендованный C-коду (байт).
-pub const CINT_IPC_BUF_LEN: usize = 1024;
+pub const NOMAD_IPC_BUF_LEN: usize = 1024;
 
 /// Локальная ошибка «сообщение не влезает в транспорт».
-pub const CINT_E_MSG_TOO_BIG: u64 = ipc::E_MSG_TOO_BIG;
+pub const NOMAD_E_MSG_TOO_BIG: u64 = ipc::E_MSG_TOO_BIG;
 
 /// Уступить квант планировщику.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_sched_yield() -> u64 {
+pub extern "C" fn nomad_sched_yield() -> u64 {
     unsafe { crate::syscall::syscall0(abi::nr::SCHED_YIELD) }
 }
 
 /// Строка в лог ядра (serial + кольцо). Возврат — код сисколла.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_log_write(ptr: *const u8, len: u64) -> u64 {
+pub extern "C" fn nomad_log_write(ptr: *const u8, len: u64) -> u64 {
     unsafe { crate::syscall::syscall2(abi::nr::DBG_LOG_WRITE, ptr as u64, len) }
 }
 
 /// Значение auxv по тегу (0 — тег отсутствует).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_auxv_get(tag: u64) -> u64 {
+pub extern "C" fn nomad_auxv_get(tag: u64) -> u64 {
     crate::crt0::auxv_get(tag).unwrap_or(0)
 }
 
-/// task_cap_id текущей задачи (AT_CINTOS_SELF_CAP; 0 — отсутствует).
+/// task_cap_id текущей задачи (AT_NOMAD_SELF_CAP; 0 — отсутствует).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_self_cap() -> u64 {
-    cint_auxv_get(abi::auxv_values::AT_CINTOS_SELF_CAP)
+pub extern "C" fn nomad_self_cap() -> u64 {
+    nomad_auxv_get(abi::auxv_values::AT_NOMAD_SELF_CAP)
 }
 
 /// Self-exit: уничтожить текущую задачу (выходит из main по возврату;
 /// C-код может позвать явно).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_exit() -> u64 {
-    let self_cap = cint_self_cap();
+pub extern "C" fn nomad_exit() -> u64 {
+    let self_cap = nomad_self_cap();
     unsafe { crate::syscall::syscall1(abi::nr::SCHED_DESTROY_TASK, self_cap) }
 }
 
@@ -66,13 +66,13 @@ pub extern "C" fn cint_exit() -> u64 {
 
 /// Выделить `pages` страниц; возврат — VA (старший бит = ошибка).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_alloc_pages(pages: u64) -> u64 {
+pub extern "C" fn nomad_alloc_pages(pages: u64) -> u64 {
     unsafe { crate::syscall::syscall1(abi::nr::ALLOC_PAGES, pages) }
 }
 
 /// Снять аллокацию по базовому VA.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_free_pages(vaddr: u64) -> u64 {
+pub extern "C" fn nomad_free_pages(vaddr: u64) -> u64 {
     unsafe { crate::syscall::syscall1(abi::nr::FREE_PAGES, vaddr) }
 }
 
@@ -82,27 +82,27 @@ pub extern "C" fn cint_free_pages(vaddr: u64) -> u64 {
 /// раскладка синхронизирована с Rust `ipc::CapDesc` и ядром.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct CintCapDesc {
+pub struct NomadCapDesc {
     pub src_slot: u64,
     pub dst_slot: u64,
     pub rights: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<CintCapDesc>() == 24);
+const _: () = assert!(core::mem::size_of::<NomadCapDesc>() == 24);
 
 /// Синхронная отправка (блокируется до приёма).
 ///
 /// slot — слот cspace получателя; label/payload — тело (FlatBuffers
 /// соберёт ядро-независимый формат внутри); caps — массив
-/// CintCapDesc×caps_len (может быть NULL при caps_len=0).
+/// NomadCapDesc×caps_len (может быть NULL при caps_len=0).
 /// Возврат: 0 — доставлено; иначе код ошибки (старший бит).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_send(
+pub extern "C" fn nomad_ipc_send(
     slot: u64,
     label: u64,
     payload: *const u8,
     payload_len: u64,
-    caps: *const CintCapDesc,
+    caps: *const NomadCapDesc,
     caps_len: u64,
 ) -> u64 {
     if payload_len as usize > crate::flatbuf::MAX_MSG {
@@ -115,11 +115,11 @@ pub extern "C" fn cint_ipc_send(
     };
     let mut rust_caps = [ipc::CapDesc::new(0, 0, 0); MAX_CAPS];
     let n = (caps_len as usize).min(MAX_CAPS);
-    // SAFETY: caps — валидный массив CintCapDesc×caps_len (контракт).
+    // SAFETY: caps — валидный массив NomadCapDesc×caps_len (контракт).
     let src = if caps.is_null() || n == 0 {
         &[]
     } else {
-        unsafe { core::slice::from_raw_parts(caps.cast::<CintCapDesc>(), n) }
+        unsafe { core::slice::from_raw_parts(caps.cast::<NomadCapDesc>(), n) }
     };
     for (dst, s) in rust_caps.iter_mut().zip(src.iter()) {
         *dst = ipc::CapDesc::new(s.src_slot, s.dst_slot, s.rights);
@@ -131,14 +131,14 @@ pub extern "C" fn cint_ipc_send(
 }
 
 /// Ожидание сообщения (блокируется до доставки). from — слот
-/// отправителя или CINT_IPC_WAIT_ANY. recv_base/recv_count — приёмное
+/// отправителя или NOMAD_IPC_WAIT_ANY. recv_base/recv_count — приёмное
 /// окно capability получателя (ядро кладёт i-ю capability в первый
 /// свободный слот окна; 0/0 — не принимать: сообщение с map items
 /// отклонит отправителю). buf — буфер приёма (>= 24 байт;
-/// см. CINT_IPC_BUF_LEN). Возврат: 0 — сообщение в buf (разбор через
-/// cint_ipc_msg_*); иначе код ошибки.
+/// см. NOMAD_IPC_BUF_LEN). Возврат: 0 — сообщение в buf (разбор через
+/// nomad_ipc_msg_*); иначе код ошибки.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_wait(
+pub extern "C" fn nomad_ipc_wait(
     from: u64,
     recv_base: u64,
     recv_count: u64,
@@ -157,25 +157,25 @@ pub extern "C" fn cint_ipc_wait(
 }
 
 /// Слот «ждать от кого угодно» (open wait).
-pub const CINT_IPC_WAIT_ANY: u64 = ipc::WAIT_ANY;
+pub const NOMAD_IPC_WAIT_ANY: u64 = ipc::WAIT_ANY;
 
 // ─── Разбор принятого сообщения (нулевые копии: указатели в buf) ───────────
 
 /// task_cap_id отправителя (0 — буфер не валиден).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_msg_sender(buf: *const u8, buf_len: u64) -> u64 {
+pub extern "C" fn nomad_ipc_msg_sender(buf: *const u8, buf_len: u64) -> u64 {
     msg_view(buf, buf_len).map(|v| v.sender).unwrap_or(0)
 }
 
 /// FlatBuffers-тег (label) тела сообщения.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_msg_label(buf: *const u8, buf_len: u64) -> u64 {
+pub extern "C" fn nomad_ipc_msg_label(buf: *const u8, buf_len: u64) -> u64 {
     msg_view(buf, buf_len).map(|v| v.label).unwrap_or(0)
 }
 
 /// Указатель на payload (NULL — буфер не валиден). Живёт в buf.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_msg_payload(
+pub extern "C" fn nomad_ipc_msg_payload(
     buf: *const u8,
     buf_len: u64,
     out_len: *mut u64,
@@ -194,13 +194,13 @@ pub extern "C" fn cint_ipc_msg_payload(
 
 /// Число доставленных capability.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_msg_caps_count(buf: *const u8, buf_len: u64) -> u64 {
+pub extern "C" fn nomad_ipc_msg_caps_count(buf: *const u8, buf_len: u64) -> u64 {
     msg_view(buf, buf_len).map(|v| v.caps_len as u64).unwrap_or(0)
 }
 
 /// Слот ПОЛУЧАТЕЛЯ i-й capability (u64::MAX — вне диапазона).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_ipc_msg_cap_slot(buf: *const u8, buf_len: u64, i: u64) -> u64 {
+pub extern "C" fn nomad_ipc_msg_cap_slot(buf: *const u8, buf_len: u64, i: u64) -> u64 {
     match msg_view(buf, buf_len) {
         Some(v) => v
             .cap_slots
@@ -242,27 +242,27 @@ fn msg_view(buf: *const u8, buf_len: u64) -> Option<MsgView> {
 
 // ─── FlatBuffers-сборка (для C без Rust-типов) ───────────────────────────────
 
-/// КОНТЕКСТ: сборщик FlatBuffers-тела сообщения. Размер — CINT_FB_CTX_SIZE
-/// (выделяйте CintFbCtx по значению; аллокаций нет).
+/// КОНТЕКСТ: сборщик FlatBuffers-тела сообщения. Размер — NOMAD_FB_CTX_SIZE
+/// (выделяйте NomadFbCtx по значению; аллокаций нет).
 #[repr(C)]
-pub struct CintFbCtx {
+pub struct NomadFbCtx {
     _private: [u8; 0],
 }
 
 /// Размер контекста сборщика (байт) — sizeof в C берётся из заголовка,
 /// здесь — для статической проверки зеркала.
-pub const CINT_FB_CTX_SIZE: usize = core::mem::size_of::<crate::flatbuf::Builder>();
+pub const NOMAD_FB_CTX_SIZE: usize = core::mem::size_of::<crate::flatbuf::Builder>();
 
-/// Инициализация сборщика в ctx (обязан вмещать CINT_FB_CTX_SIZE байт).
+/// Инициализация сборщика в ctx (обязан вмещать NOMAD_FB_CTX_SIZE байт).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fb_init(ctx: *mut c_void) {
-    // SAFETY: ctx — валидная память на CINT_FB_CTX_SIZE байт (контракт).
+pub extern "C" fn nomad_fb_init(ctx: *mut c_void) {
+    // SAFETY: ctx — валидная память на NOMAD_FB_CTX_SIZE байт (контракт).
     unsafe { (ctx as *mut crate::flatbuf::Builder).write(crate::flatbuf::Builder::new()) };
 }
 
 /// Тег сообщения.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fb_label(ctx: *mut c_void, label: u64) {
+pub extern "C" fn nomad_fb_label(ctx: *mut c_void, label: u64) {
     // SAFETY: ctx — инициализированный Builder.
     unsafe {
         (*(ctx as *mut crate::flatbuf::Builder)).label(label);
@@ -271,7 +271,7 @@ pub extern "C" fn cint_fb_label(ctx: *mut c_void, label: u64) {
 
 /// Payload (байты копируются в контекст; повторный вызов перезаписывает).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fb_payload(ctx: *mut c_void, ptr: *const u8, len: u64) {
+pub extern "C" fn nomad_fb_payload(ctx: *mut c_void, ptr: *const u8, len: u64) {
     // SAFETY: ctx + ptr — контракты выше.
     unsafe {
         let b = &mut *(ctx as *mut crate::flatbuf::Builder);
@@ -283,7 +283,7 @@ pub extern "C" fn cint_fb_payload(ctx: *mut c_void, ptr: *const u8, len: u64) {
 /// Финализация: в buf_len — размер, возврат — указатель на готовое
 /// тело (живёт в ctx) или NULL (переполнение).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fb_finish(ctx: *mut c_void, out_len: *mut u64) -> *const u8 {
+pub extern "C" fn nomad_fb_finish(ctx: *mut c_void, out_len: *mut u64) -> *const u8 {
     // SAFETY: контракты выше.
     unsafe {
         let b = &mut *(ctx as *mut crate::flatbuf::Builder);
@@ -304,13 +304,13 @@ pub extern "C" fn cint_fb_finish(ctx: *mut c_void, out_len: *mut u64) -> *const 
 /// Частота тика (зеркало kernel_limine/kernel_x86::timer). Линия тика —
 /// динамика платформы (GSI из MADT): берите из TASK_STATS (слово [10]);
 /// на legacy-платформе — timer::FALLBACK_TIMER_LINE (0).
-pub const CINT_TICK_HZ: u64 = crate::timer::TICK_HZ;
+pub const NOMAD_TICK_HZ: u64 = crate::timer::TICK_HZ;
 
 /// Уснуть до ближайшего тика таймера. buf — массив 2×u64
-/// [count][line] (см. cint_timer_wait_buf). Возврат — код сисколла
+/// [count][line] (см. nomad_timer_wait_buf). Возврат — код сисколла
 /// (0 — буфер заполнен: [0]=1, [1]=номер линии).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_wait_tick(buf: *mut u64) -> u64 {
+pub extern "C" fn nomad_wait_tick(buf: *mut u64) -> u64 {
     if buf.is_null() {
         return abi::result::E_INVALID_ARG;
     }
@@ -337,7 +337,7 @@ fn lazy_claim_tick() -> Result<(), crate::syscall::SyscallError> {
     if CLAIMED.load(Ordering::Acquire) {
         return Ok(());
     }
-    let self_cap = crate::crt0::auxv_get(crate::abi::auxv::AT_CINTOS_SELF_CAP)
+    let self_cap = crate::crt0::auxv_get(crate::abi::auxv::AT_NOMAD_SELF_CAP)
         .unwrap_or(u64::MAX);
     let mut sbuf = crate::stats::stats_buf();
     let line = crate::stats::task_stats(self_cap, &mut sbuf)
@@ -354,7 +354,7 @@ fn lazy_claim_tick() -> Result<(), crate::syscall::SyscallError> {
 /// wire-блок 16×u64 — совместим побайтово с TASK_STATS).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct CintTaskStats {
+pub struct NomadTaskStats {
     pub magic: u64,
     pub version: u64,
     pub task_cap_id: u64,
@@ -369,13 +369,13 @@ pub struct CintTaskStats {
     pub reserved: [u64; 5],
 }
 
-const _: () = assert!(core::mem::size_of::<CintTaskStats>() == crate::stats::STATS_WORDS * 8);
+const _: () = assert!(core::mem::size_of::<NomadTaskStats>() == crate::stats::STATS_WORDS * 8);
 
 /// Снапшот статистики задачи (своей — без прав, чужой — STATS_READ).
-/// out — валидная память под sizeof(CintTaskStats). Возврат — код
+/// out — валидная память под sizeof(NomadTaskStats). Возврат — код
 /// сисколла (0 — out заполнен).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_task_stats(task_cap_id: u64, out: *mut CintTaskStats) -> u64 {
+pub extern "C" fn nomad_task_stats(task_cap_id: u64, out: *mut NomadTaskStats) -> u64 {
     if out.is_null() {
         return abi::result::E_INVALID_ARG;
     }
@@ -401,28 +401,28 @@ pub extern "C" fn cint_task_stats(task_cap_id: u64, out: *mut CintTaskStats) -> 
 
 /// Создать capability на разделяемый регион СОБСТВЕННОЙ памяти
 /// (ALLOC_PAGES → сюда → пересылка IPC map-item'ом; монтаж получателем
-/// — cint_mount_cap_region). Монтирование получателем — ПО СЛОТУ
+/// — nomad_mount_cap_region). Монтирование получателем — ПО СЛОТУ
 /// (старший бит — ошибка).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_cap_create_shared(src_vaddr: u64, pages: u64, dst_slot: u64) -> u64 {
+pub extern "C" fn nomad_cap_create_shared(src_vaddr: u64, pages: u64, dst_slot: u64) -> u64 {
     unsafe { crate::syscall::syscall3(abi::nr::CAP_CREATE_SHARED, src_vaddr, pages, dst_slot) }
 }
 
 /// Смонтировать capability-регион в своё пространство (возврат — VA,
 /// старший бит — ошибка).
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_mount_cap_region(cap_slot: u64) -> u64 {
+pub extern "C" fn nomad_mount_cap_region(cap_slot: u64) -> u64 {
     unsafe { crate::syscall::syscall1(abi::nr::MOUNT_CAP_REGION, cap_slot) }
 }
 
 /// Волшебное слово SPSC-кольца (проверка смонтированных страниц).
-pub const CINT_SHM_RING_MAGIC: u64 = crate::shm::SHM_RING_MAGIC;
+pub const NOMAD_SHM_RING_MAGIC: u64 = crate::shm::SHM_RING_MAGIC;
 
 /// Инициализировать кольцо в СОБСТВЕННЫХ страницах (производитель).
 /// va — возврат ALLOC_PAGES, pages — его же размер. Возврат: 0 — ок,
 /// 1 — неверные аргументы.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_shm_producer_init(va: u64, pages: u64) -> u64 {
+pub extern "C" fn nomad_shm_producer_init(va: u64, pages: u64) -> u64 {
     // SAFETY: va — живая собственная аллокация pages страниц (контракт).
     match unsafe { crate::shm::Producer::init(va as usize, pages as usize) } {
         Some(_) => 0,
@@ -431,11 +431,11 @@ pub extern "C" fn cint_shm_producer_init(va: u64, pages: u64) -> u64 {
 }
 
 /// Кладёт кадр в кольцо (производитель). va/pages — ТЕ ЖЕ, что в
-/// cint_shm_producer_init: кольцо ПЕРЕОТКРЫВАЕТСЯ по заголовку (индексы
+/// nomad_shm_producer_init: кольцо ПЕРЕОТКРЫВАЕТСЯ по заголовку (индексы
 /// в самих страницах — переоткрытие их не трогает). Возврат: 0 — ок,
 /// 1 — переполнено/ошибка.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_shm_push(va: u64, pages: u64, data: *const u8, len: u64) -> u64 {
+pub extern "C" fn nomad_shm_push(va: u64, pages: u64, data: *const u8, len: u64) -> u64 {
     // SAFETY: va — инициализированное кольцо (контракт).
     let Some(mut prod) = (unsafe { crate::shm::Producer::open(va as usize, pages as usize) })
     else {
@@ -446,10 +446,10 @@ pub extern "C" fn cint_shm_push(va: u64, pages: u64, data: *const u8, len: u64) 
     u64::from(!prod.push(bytes))
 }
 
-/// Достаёт кадр из кольца (потребитель). va — возврат cint_mount_cap_region,
+/// Достаёт кадр из кольца (потребитель). va — возврат nomad_mount_cap_region,
 /// pages — размер региона. Возврат — длина кадра; u64::MAX — пусто/ошибка.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_shm_pop(va: u64, pages: u64, out: *mut u8, out_len: u64) -> u64 {
+pub extern "C" fn nomad_shm_pop(va: u64, pages: u64, out: *mut u8, out_len: u64) -> u64 {
     // SAFETY: va — живой внешний маппинг pages страниц (контракт).
     let Some(mut cons) = (unsafe { crate::shm::Consumer::open(va as usize, pages as usize) })
     else {
@@ -475,8 +475,8 @@ fn code_of(e: crate::syscall::SyscallError) -> u64 {
 /// Данные фолта (payload сообщения; 5×u64 = 40 байт).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct CintFaultInfo {
-    /// Вектор исключения (CINT_FAULT_DE..CINT_FAULT_XF).
+pub struct NomadFaultInfo {
+    /// Вектор исключения (NOMAD_FAULT_DE..NOMAD_FAULT_XF).
     pub kind: u64,
     /// Адрес фолта (CR2 для #PF, 0 иначе).
     pub addr: u64,
@@ -488,13 +488,13 @@ pub struct CintFaultInfo {
     pub err: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<CintFaultInfo>() == 5 * 8);
+const _: () = assert!(core::mem::size_of::<NomadFaultInfo>() == 5 * 8);
 
 /// Создать фолт-эндпоинт: ТЕКУЩАЯ задача становится обработчиком,
 /// capability — в dst_slot её cspace. Требует CAP_MANAGE|FAULT_HANDLE.
-/// 0 — ок; иначе CINT_E_*.
+/// 0 — ок; иначе NOMAD_E_*.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fault_create_endpoint(dst_slot: u64) -> u64 {
+pub extern "C" fn nomad_fault_create_endpoint(dst_slot: u64) -> u64 {
     match crate::fault::create_endpoint(dst_slot) {
         Ok(()) => 0,
         Err(e) => code_of(e),
@@ -502,10 +502,10 @@ pub extern "C" fn cint_fault_create_endpoint(dst_slot: u64) -> u64 {
 }
 
 /// Привязать эндпоинт (ep_slot текущей задачи) к ЦЕЛИ (её TaskTCB-слот):
-/// фолты цели пойдут обработчику через cint_ipc_wait. Требует
+/// фолты цели пойдут обработчику через nomad_ipc_wait. Требует
 /// TASK_CREATE|FAULT_HANDLE; повторная привязка заменяет прежнюю.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fault_set_endpoint(ep_slot: u64, target_slot: u64) -> u64 {
+pub extern "C" fn nomad_fault_set_endpoint(ep_slot: u64, target_slot: u64) -> u64 {
     match crate::fault::set_endpoint(ep_slot, target_slot) {
         Ok(()) => 0,
         Err(e) => code_of(e),
@@ -515,11 +515,11 @@ pub extern "C" fn cint_fault_set_endpoint(ep_slot: u64, target_slot: u64) -> u64
 /// Ответить на фолт (resume упавшей): new_rip/new_rsp = 0 — повторить
 /// упавшую инструкцию; иначе — продолжить с нового адреса/стека.
 /// Валиден только зарегистрированному обработчику ПОСЛЕ приёма
-/// сообщения. 0 — ок; CINT_E_NOT_FOUND — задача не в фолте;
-/// CINT_E_RIGHTS — зовёт не обработчик; CINT_E_INVALID_ARG —
+/// сообщения. 0 — ок; NOMAD_E_NOT_FOUND — задача не в фолте;
+/// NOMAD_E_RIGHTS — зовёт не обработчик; NOMAD_E_INVALID_ARG —
 /// сообщение ещё не принято.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fault_reply(
+pub extern "C" fn nomad_fault_reply(
     target_task_cap: u64,
     new_rip: u64,
     new_rsp: u64,
@@ -530,21 +530,21 @@ pub extern "C" fn cint_fault_reply(
     }
 }
 
-/// Это фолт-сообщение? (label == CINT_FAULT_LABEL). 1/0.
+/// Это фолт-сообщение? (label == NOMAD_FAULT_LABEL). 1/0.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fault_is(buf: *const u8, buf_len: u64) -> u64 {
+pub extern "C" fn nomad_fault_is(buf: *const u8, buf_len: u64) -> u64 {
     u64::from(msg_view(buf, buf_len).is_some_and(|v| v.label == crate::fault::FAULT_LABEL))
 }
 
 /// Разбор фолт-сообщения из буфера приёма. out_info — валидный
-/// CintFaultInfo вызывающего. 0 — заполнено; CINT_E_INVALID_ARG — не
+/// NomadFaultInfo вызывающего. 0 — заполнено; NOMAD_E_INVALID_ARG — не
 /// фолт/плохой буфер. sender (task_cap_id упавшей) — как обычно,
-/// cint_ipc_msg_sender.
+/// nomad_ipc_msg_sender.
 #[unsafe(no_mangle)]
-pub extern "C" fn cint_fault_parse(
+pub extern "C" fn nomad_fault_parse(
     buf: *const u8,
     buf_len: u64,
-    out_info: *mut CintFaultInfo,
+    out_info: *mut NomadFaultInfo,
 ) -> u64 {
     let Some(view) = msg_view(buf, buf_len) else {
         return abi::result::E_INVALID_ARG;
@@ -560,7 +560,7 @@ pub extern "C" fn cint_fault_parse(
     };
     // SAFETY: out_info — валидная структура вызывающего (контракт).
     unsafe {
-        *out_info = CintFaultInfo {
+        *out_info = NomadFaultInfo {
             kind: word(0),
             addr: word(1),
             ip: word(2),

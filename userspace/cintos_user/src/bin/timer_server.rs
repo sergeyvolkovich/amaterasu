@@ -26,7 +26,7 @@ use cintos_user::timer;
 const REPORT_EVERY: u64 = 50;
 
 fn main() {
-    let self_cap = crt0::auxv_get(cintos_user::abi::auxv::AT_CINTOS_SELF_CAP).unwrap_or(u64::MAX);
+    let self_cap = crt0::auxv_get(cintos_user::abi::auxv::AT_NOMAD_SELF_CAP).unwrap_or(u64::MAX);
 
     // Линия тика — от ядра (TASK_STATS: слово [10]); на IO-APIC-платформе
     // это GSI из MADT override (обычно 2), не «IRQ0».
@@ -37,17 +37,17 @@ fn main() {
     match timer::claim_tick_line(self_cap, timer_line) {
         Ok(()) => {
             let mut l = Line::new();
-            l.str("timer_server: линия тика занята капой (GSI ".as_bytes());
+            l.str("timer_server: линия тика занята капой (GSI ");
             l.u64(timer_line);
-            l.str("), 100 Гц\n".as_bytes());
-            dlog::log(l.as_bytes());
+            l.str("), 100 Гц\n");
+            dlog::log(l.as_str());
         }
         Err(e) => {
             let mut l = Line::new();
-            l.str("timer_server: claim линии тика err ".as_bytes());
+            l.str("timer_server: claim линии тика err ");
             l.u64(code_of(e));
             l.nl();
-            dlog::log(l.as_bytes());
+            dlog::log(l.as_str());
             // Без капы WAIT вернёт отказ — но сервер продолжит цикл
             // (yield), чтобы не зависнуть наглухо в диагностике.
         }
@@ -64,16 +64,16 @@ fn main() {
                 if ticks.is_multiple_of(REPORT_EVERY) {
                     match stats::task_stats(self_cap, &mut sbuf) {
                         Ok(s) => log_report(ticks, &s),
-                        Err(_) => dlog::log(b"timer_server: TASK_STATS err\n"),
+                        Err(_) => dlog::log("timer_server: TASK_STATS err\n"),
                     }
                 }
             }
             Err(e) => {
                 let mut l = Line::new();
-                l.str(b"timer_server: WaitIrq err ");
+                l.str("timer_server: WaitIrq err ");
                 l.u64(code_of(e));
                 l.nl();
-                dlog::log(l.as_bytes());
+                dlog::log(l.as_str());
                 // Ошибка сняла ожидание — отдаём квант и ждём снова
                 // (иначе рискуем busy-loop на повторяющемся отказе).
                 unsafe {
@@ -87,28 +87,28 @@ fn main() {
 /// Сводка: локальные тики, uptime (с ядра), пропущенные тики, счётчики.
 fn log_report(local: u64, s: &stats::TaskStats) {
     let mut l = Line::new();
-    l.str("timer_server: тик ".as_bytes());
+    l.str("timer_server: тик ");
     l.u64(local);
-    l.str(b", uptime ");
+    l.str(", uptime ");
     l.u64(timer::ticks_to_ms(s.global_ticks) / 1000);
     l.ch(b'.');
     l.u64((timer::ticks_to_ms(s.global_ticks) % 1000) / 100);
-    l.str(" с (глоб. ".as_bytes());
+    l.str(" с (глоб. ");
     l.u64(s.global_ticks);
-    l.str(" тиков, пропущено ".as_bytes());
+    l.str(" тиков, пропущено ");
     l.u64(s.global_ticks.saturating_sub(local));
-    l.str(b"); cpu=");
+    l.str("); cpu=");
     l.u64(s.cpu_ticks);
-    l.str(b" yields=");
+    l.str(" yields=");
     l.u64(s.yields);
-    l.str(b" preempt=");
+    l.str(" preempt=");
     l.u64(s.preempts);
-    l.str(b" ipc=");
+    l.str(" ipc=");
     l.u64(s.ipc_sent + s.ipc_recv);
-    l.str(b" blocks=");
+    l.str(" blocks=");
     l.u64(s.blocks);
     l.nl();
-    dlog::log(l.as_bytes());
+    dlog::log(l.as_str());
 }
 
 fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {

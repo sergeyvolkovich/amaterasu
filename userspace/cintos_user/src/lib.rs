@@ -14,14 +14,14 @@
 //!   - [`task`] — динамический спавн задач (TASK_CREATE по TaskImage-
 //!     капе / TASK_CREATE_FROM_MEM — exec ELF из читаемой памяти);
 //!   - [`capi`] — C-совместимый ABI (extern "C" + #[repr(C)]; заголовок
-//!     include/cintos.h) — юзерспейс-код NOMAD пригоден для C.
+//!     include/nomad.h) — юзерспейс-код NOMAD пригоден для C.
 //!
 //! Бинарник NOMAD — `#![no_std]`-крейт с обычным `fn main()`:
 //! `#![no_main]` НЕ нужен — crt0 определяет `start` lang item
 //! (rustc сам генерирует C-шиму main → lang_start → fn main()),
 //! `_start`, паник-хендлер и self-exit. Удобные импорты — glob из
 //! [`prelude`]. C-серверы (staticlib) определяют 2-арговый
-//! `main(long argc, char** argv)` — см. include/cintos.h.
+//! `main(long argc, char** argv)` — см. include/nomad.h.
 //!
 //! Хостовые юнит-тесты (SPSC-кольцо shm и др.) запускаются со std:
 //! `#![cfg_attr(not(test), no_std)]` — тот же паттерн, что у kernel_base.

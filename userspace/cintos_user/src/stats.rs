@@ -52,7 +52,7 @@ pub const fn stats_buf() -> StatsBuf {
 }
 
 /// Забрать снапшот статистики задачи `task_cap_id` (свой id — из
-/// auxv AT_CINTOS_SELF_CAP, см. crt0). Буфер перезаписывается.
+/// auxv AT_NOMAD_SELF_CAP, см. crt0). Буфер перезаписывается.
 pub fn task_stats(task_cap_id: u64, buf: &mut StatsBuf) -> SyscallResult<TaskStats> {
     let code = unsafe {
         syscall::syscall3(

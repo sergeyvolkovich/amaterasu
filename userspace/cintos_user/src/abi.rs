@@ -233,23 +233,23 @@ pub mod auxv {
     pub const AT_PAGESZ: u64 = 7;
     pub const AT_ENTRY: u64 = 9;
     /// id TaskTCB-капабилити этой задачи (self-exit через SCHED_DESTROY_TASK).
-    pub const AT_CINTOS_SELF_CAP: u64 = 0xC170_0001;
+    pub const AT_NOMAD_SELF_CAP: u64 = 0xC170_0001;
     /// id корневой capability неймспейса задачи.
-    pub const AT_CINTOS_NS_CAP: u64 = 0xC170_0002;
+    pub const AT_NOMAD_NS_CAP: u64 = 0xC170_0002;
     /// VA фреймбуфера в пространстве задачи (0 — FB не замаплен).
-    pub const AT_CINTOS_FB_ADDR: u64 = 0xC170_0003;
+    pub const AT_NOMAD_FB_ADDR: u64 = 0xC170_0003;
     /// Байт на строку развёртки.
-    pub const AT_CINTOS_FB_PITCH: u64 = 0xC170_0004;
+    pub const AT_NOMAD_FB_PITCH: u64 = 0xC170_0004;
     /// Пикселей в ширину.
-    pub const AT_CINTOS_FB_WIDTH: u64 = 0xC170_0005;
+    pub const AT_NOMAD_FB_WIDTH: u64 = 0xC170_0005;
     /// Пикселей в высоту.
-    pub const AT_CINTOS_FB_HEIGHT: u64 = 0xC170_0006;
+    pub const AT_NOMAD_FB_HEIGHT: u64 = 0xC170_0006;
     /// Бит на пиксель.
-    pub const AT_CINTOS_FB_BPP: u64 = 0xC170_0007;
+    pub const AT_NOMAD_FB_BPP: u64 = 0xC170_0007;
     /// Физический адрес RSDP (ACPI): init монтирует таблицы через
     /// CAP_CREATE_MMIO — диапазоны зарегистрированы ядром в phys_guard
     /// (acpi-allow-list). Отсутствие тега — ACPI не найден загрузчиком.
-    pub const AT_CINTOS_ACPI_RSDP: u64 = 0xC170_0008;
+    pub const AT_NOMAD_ACPI_RSDP: u64 = 0xC170_0008;
 
     /// Bootstrap-слоты cspace системного сервера.
     pub const BOOT_SLOT_SELF: u64 = 0;
@@ -269,12 +269,12 @@ pub mod auxv_values {
     pub const AT_NULL: u64 = 0;
     pub const AT_PAGESZ: u64 = 7;
     pub const AT_ENTRY: u64 = 9;
-    pub const AT_CINTOS_SELF_CAP: u64 = 0xC170_0001;
-    pub const AT_CINTOS_NS_CAP: u64 = 0xC170_0002;
-    pub const AT_CINTOS_FB_ADDR: u64 = 0xC170_0003;
-    pub const AT_CINTOS_FB_PITCH: u64 = 0xC170_0004;
-    pub const AT_CINTOS_FB_WIDTH: u64 = 0xC170_0005;
-    pub const AT_CINTOS_FB_HEIGHT: u64 = 0xC170_0006;
-    pub const AT_CINTOS_FB_BPP: u64 = 0xC170_0007;
-    pub const AT_CINTOS_ACPI_RSDP: u64 = 0xC170_0008;
+    pub const AT_NOMAD_SELF_CAP: u64 = 0xC170_0001;
+    pub const AT_NOMAD_NS_CAP: u64 = 0xC170_0002;
+    pub const AT_NOMAD_FB_ADDR: u64 = 0xC170_0003;
+    pub const AT_NOMAD_FB_PITCH: u64 = 0xC170_0004;
+    pub const AT_NOMAD_FB_WIDTH: u64 = 0xC170_0005;
+    pub const AT_NOMAD_FB_HEIGHT: u64 = 0xC170_0006;
+    pub const AT_NOMAD_FB_BPP: u64 = 0xC170_0007;
+    pub const AT_NOMAD_ACPI_RSDP: u64 = 0xC170_0008;
 }

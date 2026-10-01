@@ -11,9 +11,9 @@
 //! main = self-exit через SCHED_DESTROY_TASK со своим cap id.
 //!
 //! C-путь (staticlib): C-сервер определяет main(long argc, char** argv)
-//! — та же 2-арговая сигнатура (include/cintos.h); envp не передаётся.
+//! — та же 2-арговая сигнатура (include/nomad.h); envp не передаётся.
 //!
-//! Bootstrap-capability системного сервера (см. AT_CINTOS_* в abi::auxv):
+//! Bootstrap-capability системного сервера (см. AT_NOMAD_* в abi::auxv):
 //!   слот 0 cspace — TaskTCB самой задачи;
 //!   слот 1 cspace — корневой неймспейс.
 //! Значения (id) передаются в auxv и доступны через [`bootstrap()`].
@@ -126,7 +126,7 @@ unsafe extern "C" fn crt_entry(stack: *mut u64) -> ! {
     // зовёт `start` lang item ([lang_start]) с пользовательским main
     // (Termination применён rustc). envp доступен через envp(),
     // auxv — через auxv_get(). C-серверы определяют main с той же
-    // 2-арговой сигнатурой (include/cintos.h).
+    // 2-арговой сигнатурой (include/nomad.h).
     unsafe extern "C" {
         fn main(argc: i32, argv: *const *const u8) -> i32;
     }
@@ -201,16 +201,16 @@ pub fn scan_auxv_slice(auxv: &[u64]) -> AuxValues {
         let (tag, val) = (auxv[i], auxv[i + 1]);
         match tag {
             abi::auxv::AT_NULL => break,
-            abi::auxv::AT_CINTOS_SELF_CAP => out.self_cap = val,
-            abi::auxv::AT_CINTOS_NS_CAP => out.namespace_cap = val,
+            abi::auxv::AT_NOMAD_SELF_CAP => out.self_cap = val,
+            abi::auxv::AT_NOMAD_NS_CAP => out.namespace_cap = val,
             abi::auxv::AT_PAGESZ => out.page_size = val,
             abi::auxv::AT_ENTRY => out.entry = val,
-            abi::auxv::AT_CINTOS_FB_ADDR => out.fb_addr = val,
-            abi::auxv::AT_CINTOS_FB_PITCH => out.fb_pitch = val,
-            abi::auxv::AT_CINTOS_FB_WIDTH => out.fb_width = val,
-            abi::auxv::AT_CINTOS_FB_HEIGHT => out.fb_height = val,
-            abi::auxv::AT_CINTOS_FB_BPP => out.fb_bpp = val,
-            abi::auxv::AT_CINTOS_ACPI_RSDP => out.acpi_rsdp = val,
+            abi::auxv::AT_NOMAD_FB_ADDR => out.fb_addr = val,
+            abi::auxv::AT_NOMAD_FB_PITCH => out.fb_pitch = val,
+            abi::auxv::AT_NOMAD_FB_WIDTH => out.fb_width = val,
+            abi::auxv::AT_NOMAD_FB_HEIGHT => out.fb_height = val,
+            abi::auxv::AT_NOMAD_FB_BPP => out.fb_bpp = val,
+            abi::auxv::AT_NOMAD_ACPI_RSDP => out.acpi_rsdp = val,
             _ => {}
         }
         i += 2;
@@ -247,16 +247,16 @@ unsafe fn scan_auxv(auxv: *const u64) -> AuxValues {
             let (tag, val) = (*p, *p.add(1));
             match tag {
                 abi::auxv::AT_NULL => break,
-                abi::auxv::AT_CINTOS_SELF_CAP => out.self_cap = val,
-                abi::auxv::AT_CINTOS_NS_CAP => out.namespace_cap = val,
+                abi::auxv::AT_NOMAD_SELF_CAP => out.self_cap = val,
+                abi::auxv::AT_NOMAD_NS_CAP => out.namespace_cap = val,
                 abi::auxv::AT_PAGESZ => out.page_size = val,
                 abi::auxv::AT_ENTRY => out.entry = val,
-                abi::auxv::AT_CINTOS_FB_ADDR => out.fb_addr = val,
-                abi::auxv::AT_CINTOS_FB_PITCH => out.fb_pitch = val,
-                abi::auxv::AT_CINTOS_FB_WIDTH => out.fb_width = val,
-                abi::auxv::AT_CINTOS_FB_HEIGHT => out.fb_height = val,
-                abi::auxv::AT_CINTOS_FB_BPP => out.fb_bpp = val,
-                abi::auxv::AT_CINTOS_ACPI_RSDP => out.acpi_rsdp = val,
+                abi::auxv::AT_NOMAD_FB_ADDR => out.fb_addr = val,
+                abi::auxv::AT_NOMAD_FB_PITCH => out.fb_pitch = val,
+                abi::auxv::AT_NOMAD_FB_WIDTH => out.fb_width = val,
+                abi::auxv::AT_NOMAD_FB_HEIGHT => out.fb_height = val,
+                abi::auxv::AT_NOMAD_FB_BPP => out.fb_bpp = val,
+                abi::auxv::AT_NOMAD_ACPI_RSDP => out.acpi_rsdp = val,
                 _ => {}
             }
             p = p.add(2);
@@ -394,7 +394,7 @@ pub fn acpi_rsdp_phys() -> Option<u64> {
 
 /// Параметры фреймбуфера из auxv (None — FB не замаплен: fb_addr = 0).
 /// Публикуется crt0::_start; ядро мапит образ MMIO по фиксированному VA
-/// и передаёт параметры тегами AT_CINTOS_FB_* (см. kernel_exec::spawn).
+/// и передаёт параметры тегами AT_NOMAD_FB_* (см. kernel_exec::spawn).
 pub fn fb_aux() -> Option<crate::fb::FbInfo> {
     let addr = FB_STATE.addr.load(Ordering::Acquire);
     if addr == 0 {
@@ -449,9 +449,9 @@ mod tests {
             4096,
             auxv::AT_ENTRY,
             0x401_000,
-            auxv::AT_CINTOS_SELF_CAP,
+            auxv::AT_NOMAD_SELF_CAP,
             0x2A,
-            auxv::AT_CINTOS_NS_CAP,
+            auxv::AT_NOMAD_NS_CAP,
             0x2B,
             0xDEAD_BEEF, // неизвестный тег — пропускается
             1,
@@ -516,7 +516,7 @@ mod tests {
             0x1000, // argv[0]
             0,      // argv NULL
             0,      // envp NULL (пустое окружение)
-            auxv::AT_CINTOS_SELF_CAP,
+            auxv::AT_NOMAD_SELF_CAP,
             0x2A,
             auxv::AT_NULL,
             0,

@@ -78,7 +78,7 @@ pub const fn image_slot(j: u64) -> u64 {
 /// Слот peer'а по имени из бут-ростера: argv задачи содержит имена всех
 /// boot-серверов (argv[0] — своё имя), i-е имя ростера — слот
 /// [`ipc::PEER_SLOT_BASE`] + (i-1). Общая точка вместо копий в демо.
-pub fn peer_slot_of(name: &[u8]) -> Option<u64> {
+pub fn peer_slot_of(name: &str) -> Option<u64> {
     let argc = crt0::args()?;
     for i in 1..argc {
         let p = crt0::argv_at(i)?;
@@ -94,7 +94,7 @@ pub fn peer_slot_of(name: &[u8]) -> Option<u64> {
             Some(pos) => &bytes[pos + 1..],
             None => bytes,
         };
-        if base == name {
+        if base == name.as_bytes() {
             return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
         }
     }

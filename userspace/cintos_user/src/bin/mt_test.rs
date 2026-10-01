@@ -28,6 +28,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use cintos_user::abi;
+use cintos_user::dlog::{self, Line};
 use cintos_user::heap::KernelHeap;
 use cintos_user::syscall;
 
@@ -37,19 +38,19 @@ const WAKE_OBJECT: u64 = 0xAA;
 fn main() {
     // Фаза 1: карусель — тик и уступка кванта.
     for i in 1..=3u64 {
-        log_line(b"mt_test: tick ", i);
+        log_line("mt_test: tick ", i);
         let _ = unsafe { syscall::syscall0(abi::nr::SCHED_YIELD) };
     }
 
     // Фаза 2: усыпление на объекте — управление уходит другим задачам.
-    log_line(b"mt_test: sleep on 0xAA", 0);
+    log_line("mt_test: sleep on 0xAA", 0);
     let _ = unsafe { syscall::syscall1(abi::nr::SCHED_BLOCK_ON_OBJECT, WAKE_OBJECT) };
 
     // Фаза 3: здесь мы оказываемся только после пробуждения от mt_waker.
     // Счётчик 4..=6 доказывает возобновление контекста (не рестарт):
     // локальные переменные и позиция исполнения сохранены.
     for i in 4..=6u64 {
-        log_line(b"mt_test: woke up, tick ", i);
+        log_line("mt_test: woke up, tick ", i);
         let _ = unsafe { syscall::syscall0(abi::nr::SCHED_YIELD) };
     }
 
@@ -74,40 +75,27 @@ fn main() {
     for i in (0..v.len()).rev() {
         rsum = rsum.wrapping_add(v[i]);
     }
-    log_line(b"mt_test: heap vec len ", v.len() as u64);
-    log_line(b"mt_test: heap vec sum ", sum);
-    log_line(b"mt_test: heap checksum ok ", (sum == rsum) as u64);
-    log_line(b"mt_test: heap sorted ", sorted as u64);
+    log_line("mt_test: heap vec len ", v.len() as u64);
+    log_line("mt_test: heap vec sum ", sum);
+    log_line("mt_test: heap checksum ok ", (sum == rsum) as u64);
+    log_line("mt_test: heap sorted ", sorted as u64);
     let hs = KernelHeap::current_stats();
-    log_line(b"mt_test: heap chunks ", hs.chunks as u64);
-    log_line(b"mt_test: heap used ", hs.used_bytes as u64);
-    log_line(b"mt_test: heap free ", hs.free_bytes as u64);
+    log_line("mt_test: heap chunks ", hs.chunks as u64);
+    log_line("mt_test: heap used ", hs.used_bytes as u64);
+    log_line("mt_test: heap free ", hs.free_bytes as u64);
     drop(v);
 
     // Фаза 5: self-exit — задача умирает, система живёт.
-    log_line(b"mt_test: done, self-exit", 0);
+    log_line("mt_test: done, self-exit", 0);
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
-/// Строка-префикс + десятичное число + перевод строки -> DBG_LOG_WRITE.
-fn log_line(prefix: &[u8], n: u64) {
-    let mut buf = [0u8; 64];
-    // Длина префикса с запасом под число (максимум 20 цифр u64) и '\n'.
-    let plen = prefix.len().min(buf.len() - 24);
-    buf[..plen].copy_from_slice(&prefix[..plen]);
-    let mut len = plen;
-    // Десятичная запись задом наперёд, затем разворот.
-    if n > 0 {
-        let start = len;
-        let mut v = n;
-        while v > 0 {
-            buf[len] = b'0' + (v % 10) as u8;
-            v /= 10;
-            len += 1;
-        }
-        buf[start..len].reverse();
-    }
-    buf[len] = b'\n';
-    len += 1;
-    let _ = unsafe { syscall::syscall2(abi::nr::DBG_LOG_WRITE, buf.as_ptr() as u64, len as u64) };
+/// Строка-префикс + десятичное число + перевод строки -> DBG_LOG_WRITE
+/// (поверх dlog::Line — без fmt/аллокаций, в духе целочисленного испытателя).
+fn log_line(prefix: &str, n: u64) {
+    let mut l = Line::new();
+    l.str(prefix);
+    l.u64(n);
+    l.nl();
+    dlog::log(l.as_str());
 }

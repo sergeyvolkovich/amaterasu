@@ -3,7 +3,10 @@
 //!
 //! Десятичные u64 без fmt-механизмов Rust (профиль panic=abort, размер
 //! образа важнее удобства). [`Line`] — растущая в фиксированном буфере
-//! строка: str/ch/u64/nl + as_bytes.
+//! строка: str/ch/u64/nl + as_bytes/as_str.
+//!
+//! Строковый путь — [`log`] (&str); сырые байты (дампы, ручные буферы) —
+//! [`log_bytes].
 //!
 //! Для серверов без дефицита размера — макросы `log!`/`logln!`
 //! (core::fmt поверх Line: форматные строки, {:x} и пр.); Line при
@@ -14,8 +17,14 @@ use core::fmt;
 use crate::abi;
 use crate::syscall;
 
-/// Пишет байты в журнал ядра (serial + кольцо лога).
-pub fn log(msg: &[u8]) {
+/// Пишет строку в журнал ядра (serial + кольцо лога).
+pub fn log(s: &str) {
+    log_bytes(s.as_bytes());
+}
+
+/// Пишет сырые байты в журнал ядра (низкий уровень: дампы payload'ов,
+/// ручные буферы [`Line::as_bytes`]). Строковый путь — [`log`].
+pub fn log_bytes(msg: &[u8]) {
     unsafe {
         syscall::syscall2(abi::nr::DBG_LOG_WRITE, msg.as_ptr() as u64, msg.len() as u64)
     };
@@ -33,7 +42,8 @@ impl Line {
     }
 
     /// Литеральный фрагмент (обрезается по остатку буфера).
-    pub fn str(&mut self, s: &[u8]) {
+    pub fn str(&mut self, s: &str) {
+        let s = s.as_bytes();
         let n = s.len().min(self.buf.len() - self.len);
         self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
         self.len += n;
@@ -73,7 +83,7 @@ impl Line {
 
     /// Шестнадцатеричная запись u64 (0x-префикс).
     pub fn hex(&mut self, v: u64) {
-        self.str(b"0x");
+        self.str("0x");
         let mut digits = [0u8; 16];
         let mut n = 0;
         let mut v = v;
@@ -97,6 +107,13 @@ impl Line {
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
+
+    /// Содержимое как &str. Корректно для наполнения str/u64/hex/ch-ASCII
+    /// (именно так заполняют log!/logln! и ручной путь); после записи
+    /// произвольных байтов через ch() используйте as_bytes + log_bytes.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
 }
 
 impl Default for Line {
@@ -109,7 +126,7 @@ impl Default for Line {
 // 192 байта (лишнее молча обрезается в str()).
 impl fmt::Write for Line {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.str(s.as_bytes());
+        self.str(s);
         Ok(())
     }
 }
@@ -123,7 +140,7 @@ macro_rules! log {
     ($($arg:tt)*) => {{
         let mut line = $crate::dlog::Line::new();
         let _ = core::fmt::Write::write_fmt(&mut line, format_args!($($arg)*));
-        $crate::dlog::log(line.as_bytes());
+        $crate::dlog::log(line.as_str());
     }};
 }
 
@@ -134,6 +151,6 @@ macro_rules! logln {
         let mut line = $crate::dlog::Line::new();
         let _ = core::fmt::Write::write_fmt(&mut line, format_args!($($arg)*));
         line.nl();
-        $crate::dlog::log(line.as_bytes());
+        $crate::dlog::log(line.as_str());
     }};
 }

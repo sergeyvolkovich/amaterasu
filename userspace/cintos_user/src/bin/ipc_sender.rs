@@ -12,13 +12,15 @@
 #![no_std]
 
 use cintos_user::crt0;
+use cintos_user::dlog::{self, Line};
 use cintos_user::ipc::{self, CapDesc};
+use cintos_user::task;
 
 fn main() {
-    log(b"ipc_sender: start\n");
+    dlog::log("ipc_sender: start\n");
 
-    let Some(receiver_slot) = peer_slot_of(b"ipc_receiver") else {
-        log(b"ipc_sender: ipc_receiver not found in roster\n");
+    let Some(receiver_slot) = task::peer_slot_of("ipc_receiver") else {
+        dlog::log("ipc_sender: ipc_receiver not found in roster\n");
         crt0::exit(1);
     };
 
@@ -28,9 +30,9 @@ fn main() {
     //    Payload: "имя:текст" — приёмник отвечает по имени.
     let caps = [CapDesc::new(1, ipc::TRANSFER_SLOT, ipc::rights::SEND)];
     match ipc::send(receiver_slot, LABEL_PING, b"ipc_sender:ping-1", &caps) {
-        Ok(()) => log(b"ipc_sender: ping delivered (rendezvous)\n"),
+        Ok(()) => dlog::log("ipc_sender: ping delivered (rendezvous)\n"),
         Err(e) => {
-            log_code(b"ipc_sender: send err ", code_of(e));
+            log_code("ipc_sender: send err ", code_of(e));
             crt0::exit(1);
         }
     }
@@ -39,44 +41,20 @@ fn main() {
     let mut buf = ipc::recv_buffer();
     match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
         Ok(r) => {
-            log_code(b"ipc_sender: label=", r.label);
-            log_bytes(b"ipc_sender: payload=", r.payload);
+            log_code("ipc_sender: label=", r.label);
+            log_bytes("ipc_sender: payload=", r.payload);
         }
-        Err(e) => log_code(b"ipc_sender: wait err ", code_of(e)),
+        Err(e) => log_code("ipc_sender: wait err ", code_of(e)),
     }
 
-    log(b"ipc_sender: done, self-exit\n");
+    dlog::log("ipc_sender: done, self-exit\n");
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
 pub const LABEL_PING: u64 = 0xC1A0_0001;
 pub const LABEL_PONG: u64 = 0xC1A0_0002;
 
-/// Слот peer-TaskTCB по имени (ростер в argv: [0]=своё имя, [1+i]=i-й).
-/// Имена модулей — ПУТИ (/boot/modules/X): сравниваем базовое имя.
-pub fn peer_slot_of(name: &[u8]) -> Option<u64> {
-    let argc = crt0::args()?;
-    for i in 1..argc {
-        let p = crt0::argv_at(i)?;
-        let mut len = 0usize;
-        unsafe {
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
-        let base = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &bytes[pos + 1..],
-            None => bytes,
-        };
-        if base == name {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
-        }
-    }
-    None
-}
-
-// ─── Логирование ────────────────────────────────────────────────────────────
+// ─── Логирование (поверх dlog::Line — без fmt/аллокаций) ────────────────────
 
 fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     match e {
@@ -84,51 +62,25 @@ fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     }
 }
 
-fn log(msg: &[u8]) {
-    unsafe {
-        cintos_user::syscall::syscall2(
-            cintos_user::abi::nr::DBG_LOG_WRITE,
-            msg.as_ptr() as u64,
-            msg.len() as u64,
-        )
-    };
+/// «prefix + десятичное + \n».
+fn log_code(prefix: &str, v: u64) {
+    let mut l = Line::new();
+    l.str(prefix);
+    l.u64(v);
+    l.nl();
+    dlog::log(l.as_str());
 }
 
-fn log_code(prefix: &[u8], v: u64) {
-    let mut buf = [0u8; 72];
-    let plen = prefix.len().min(buf.len() - 20);
-    buf[..plen].copy_from_slice(&prefix[..plen]);
-    let mut len = plen;
-    let start = len;
-    let mut v = v;
-    if v == 0 {
-        buf[len] = b'0';
-        len += 1;
-    } else {
-        while v > 0 {
-            buf[len] = b'0' + (v % 10) as u8;
-            v /= 10;
-            len += 1;
-        }
-        buf[start..len].reverse();
-    }
-    buf[len] = b'\n';
-    len += 1;
-    log(&buf[..len]);
-}
-
-fn log_bytes(prefix: &[u8], bytes: &[u8]) {
-    let mut buf = [0u8; 96];
-    let plen = prefix.len().min(buf.len() - 34);
-    buf[..plen].copy_from_slice(&prefix[..plen]);
-    let mut len = plen;
+/// «prefix + печатные байты payload'а (до 24) + \n». Байты могут быть
+/// не-UTF8 — выпуск через dlog::log_bytes (as_str тут не корректен).
+fn log_bytes(prefix: &str, bytes: &[u8]) {
+    let mut l = Line::new();
+    l.str(prefix);
     for &b in bytes.iter().take(24) {
         if b.is_ascii_graphic() || b == b' ' {
-            buf[len] = b;
-            len += 1;
+            l.ch(b);
         }
     }
-    buf[len] = b'\n';
-    len += 1;
-    log(&buf[..len]);
+    l.nl();
+    dlog::log_bytes(l.as_bytes());
 }

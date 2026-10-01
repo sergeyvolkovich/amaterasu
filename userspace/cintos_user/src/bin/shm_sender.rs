@@ -20,6 +20,7 @@ use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc::{self, CapDesc};
 use cintos_user::shm::{self, Producer};
+use cintos_user::task;
 
 /// Страниц под разделяемый регион.
 const SHM_PAGES: u64 = 4;
@@ -32,10 +33,10 @@ const MSG_LEN: usize = 1024;
 const SLOT_SHM_CAP: u64 = 16;
 
 fn main() {
-    dlog::log("shm_sender: старт\n".as_bytes());
+    dlog::log("shm_sender: старт\n");
 
-    let Some(receiver_slot) = peer_slot_of(b"shm_receiver") else {
-        dlog::log("shm_sender: shm_receiver не найден в ростере\n".as_bytes());
+    let Some(receiver_slot) = task::peer_slot_of("shm_receiver") else {
+        dlog::log("shm_sender: shm_receiver не найден в ростере\n");
         crt0::exit(1);
     };
 
@@ -70,14 +71,14 @@ fn main() {
     let mut buf = ipc::recv_buffer();
     match ipc::wait(receiver_slot, ipc::RECV_NONE, &mut buf) {
         Ok(r) if r.label == shm::labels::SHM_READY => {
-            dlog::log("shm_sender: получатель смонтировал регион\n".as_bytes());
+            dlog::log("shm_sender: получатель смонтировал регион\n");
         }
         Ok(r) => {
             let mut l = Line::new();
-            l.str("shm_sender: неожиданная метка ".as_bytes());
+            l.str("shm_sender: неожиданная метка ");
             l.u64(r.label);
             l.nl();
-            dlog::log(l.as_bytes());
+            dlog::log(l.as_str());
             crt0::exit(1);
         }
         Err(e) => fail("shm_sender: wait READY err ", code_of(e)),
@@ -110,10 +111,10 @@ fn main() {
             Ok(r) if r.label == shm::labels::SHM_ACK => {}
             Ok(r) => {
                 let mut l = Line::new();
-                l.str("shm_sender: ждал ACK, пришла метка ".as_bytes());
+                l.str("shm_sender: ждал ACK, пришла метка ");
                 l.u64(r.label);
                 l.nl();
-                dlog::log(l.as_bytes());
+                dlog::log(l.as_str());
                 crt0::exit(1);
             }
             Err(e) => fail("shm_sender: wait ACK err ", code_of(e)),
@@ -127,10 +128,10 @@ fn main() {
         }
         Ok(r) => {
             let mut l = Line::new();
-            l.str("shm_sender: ждал DONE, пришла метка ".as_bytes());
+            l.str("shm_sender: ждал DONE, пришла метка ");
             l.u64(r.label);
             l.nl();
-            dlog::log(l.as_bytes());
+            dlog::log(l.as_str());
             crt0::exit(1);
         }
         Err(e) => fail("shm_sender: wait DONE err ", code_of(e)),
@@ -139,24 +140,24 @@ fn main() {
     let data_bytes = (MSG_COUNT * MSG_LEN) as u64;
     let mut l = Line::new();
     if remote_sum == checksum {
-        l.str("shm_sender: ОК — через общие страницы ".as_bytes());
+        l.str("shm_sender: ОК — через общие страницы ");
         l.u64(data_bytes);
-        l.str(" Б, ядро перенесло только ".as_bytes());
+        l.str(" Б, ядро перенесло только ");
         l.u64(kernel_bytes);
-        l.str(" Б дверных IPC (".as_bytes());
+        l.str(" Б дверных IPC (");
         l.u64(data_bytes * 100 / kernel_bytes.max(1));
-        l.str("x меньше); контрольные суммы совпали: ".as_bytes());
+        l.str("x меньше); контрольные суммы совпали: ");
         l.u64(checksum);
         l.nl();
-        dlog::log(l.as_bytes());
-        dlog::log("shm_sender: готово, self-exit\n".as_bytes());
+        dlog::log(l.as_str());
+        dlog::log("shm_sender: готово, self-exit\n");
     } else {
-        l.str("shm_sender: КОНТРОЛЬНЫЕ СУММЫ РАЗОШЛИСЬ: лок ".as_bytes());
+        l.str("shm_sender: КОНТРОЛЬНЫЕ СУММЫ РАЗОШЛИСЬ: лок ");
         l.u64(checksum);
-        l.str(" vs удал ".as_bytes());
+        l.str(" vs удал ");
         l.u64(remote_sum);
         l.nl();
-        dlog::log(l.as_bytes());
+        dlog::log(l.as_str());
         // Расхождение сумм (старый «код возврата 1») — аварийный
         // self-exit сразу.
         crt0::exit(1)
@@ -187,29 +188,6 @@ fn sum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0u64, |acc, b| acc.wrapping_add(*b as u64))
 }
 
-/// Слот peer-TaskTCB по имени (ростер в argv: [0]=своё имя, [1+i]=i-й).
-pub fn peer_slot_of(name: &[u8]) -> Option<u64> {
-    let argc = crt0::args()?;
-    for i in 1..argc {
-        let p = crt0::argv_at(i)?;
-        let mut len = 0usize;
-        unsafe {
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
-        let base = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &bytes[pos + 1..],
-            None => bytes,
-        };
-        if base == name {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
-        }
-    }
-    None
-}
-
 fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     match e {
         cintos_user::syscall::SyscallError::Kernel(code) => code,
@@ -219,9 +197,9 @@ fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
 /// Диагностика + аварийный self-exit (код ядром игнорируется).
 fn fail(prefix: &str, code: u64) -> ! {
     let mut l = Line::new();
-    l.str(prefix.as_bytes());
+    l.str(prefix);
     l.u64(code);
     l.nl();
-    dlog::log(l.as_bytes());
+    dlog::log(l.as_str());
     crt0::exit(1)
 }

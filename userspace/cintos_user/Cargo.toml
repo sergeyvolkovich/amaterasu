@@ -2,11 +2,11 @@
 name = "cintos-user"
 version = "0.1.0"
 edition = "2024"
-description = "NOMAD userspace library: syscall ABI wrappers, crt0, mini-FlatBuffers, L4-IPC bindings, C ABI (capi + cintos.h)"
+description = "NOMAD userspace library: syscall ABI wrappers, crt0, mini-FlatBuffers, L4-IPC bindings, C ABI (capi + nomad.h)"
 build = "build.rs"
 
 # lib собирается И как rlib (Rust-бинарники), И как staticlib
-# (libcintos_user.a — C-совместимость юзерспейса, см. capi.rs/cintos.h).
+# (libcintos_user.a — C-совместимость юзерспейса, см. capi.rs/nomad.h).
 [lib]
 crate-type = ["lib", "staticlib"]
 

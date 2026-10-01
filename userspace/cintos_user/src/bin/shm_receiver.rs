@@ -17,6 +17,7 @@ use cintos_user::crt0;
 use cintos_user::dlog::{self, Line};
 use cintos_user::ipc;
 use cintos_user::shm::{self, Consumer};
+use cintos_user::task;
 
 /// Ожидаемая геометрия демо (согласована с shm_sender).
 const MSG_COUNT: usize = 16;
@@ -27,10 +28,10 @@ const SHM_PAGES: usize = 4;
 const RECV_SLOT: u64 = 16;
 
 fn main() {
-    dlog::log("shm_receiver: старт\n".as_bytes());
+    dlog::log("shm_receiver: старт\n");
 
-    let Some(sender_slot) = peer_slot_of(b"shm_sender") else {
-        dlog::log("shm_receiver: shm_sender не найден в ростере\n".as_bytes());
+    let Some(sender_slot) = task::peer_slot_of("shm_sender") else {
+        dlog::log("shm_receiver: shm_sender не найден в ростере\n");
         crt0::exit(1);
     };
 
@@ -43,10 +44,10 @@ fn main() {
         }
         Ok(r) => {
             let mut l = Line::new();
-            l.str("shm_receiver: ждал OFFER, пришла метка ".as_bytes());
+            l.str("shm_receiver: ждал OFFER, пришла метка ");
             l.u64(r.label);
             l.nl();
-            dlog::log(l.as_bytes());
+            dlog::log(l.as_str());
             crt0::exit(1);
         }
         Err(e) => fail("shm_receiver: wait OFFER err ", code_of(e)),
@@ -82,21 +83,21 @@ fn main() {
                 };
                 if seq != expected as u64 {
                     let mut l = Line::new();
-                    l.str("shm_receiver: сбой порядка кадров: ждал ".as_bytes());
+                    l.str("shm_receiver: сбой порядка кадров: ждал ");
                     l.u64(expected as u64);
-                    l.str(", пришёл ".as_bytes());
+                    l.str(", пришёл ");
                     l.u64(seq);
                     l.nl();
-                    dlog::log(l.as_bytes());
+                    dlog::log(l.as_str());
                     crt0::exit(1);
                 }
             }
             Ok(r) => {
                 let mut l = Line::new();
-                l.str("shm_receiver: ждал DATA, пришла метка ".as_bytes());
+                l.str("shm_receiver: ждал DATA, пришла метка ");
                 l.u64(r.label);
                 l.nl();
-                dlog::log(l.as_bytes());
+                dlog::log(l.as_str());
                 crt0::exit(1);
             }
             Err(e) => fail("shm_receiver: wait DATA err ", code_of(e)),
@@ -131,12 +132,12 @@ fn main() {
     }
 
     let mut l = Line::new();
-    l.str("shm_receiver: принял ".as_bytes());
+    l.str("shm_receiver: принял ");
     l.u64((MSG_COUNT * MSG_LEN) as u64);
-    l.str(" Б из общих страниц, сумма ".as_bytes());
+    l.str(" Б из общих страниц, сумма ");
     l.u64(checksum);
-    l.str(b", self-exit\n");
-    dlog::log(l.as_bytes());
+    l.str(", self-exit\n");
+    dlog::log(l.as_str());
     // Возврат из main → lang_start → crt0::exit (SCHED_DESTROY_TASK).
 }
 
@@ -151,29 +152,6 @@ fn mount_cap_region(cap_slot: u64) -> Result<u64, u64> {
     cintos_user::syscall::check(code).map_err(code_of)
 }
 
-/// Слот peer-TaskTCB по имени (ростер в argv: [0]=своё имя, [1+i]=i-й).
-pub fn peer_slot_of(name: &[u8]) -> Option<u64> {
-    let argc = crt0::args()?;
-    for i in 1..argc {
-        let p = crt0::argv_at(i)?;
-        let mut len = 0usize;
-        unsafe {
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
-        let base = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &bytes[pos + 1..],
-            None => bytes,
-        };
-        if base == name {
-            return Some(ipc::PEER_SLOT_BASE + (i - 1) as u64);
-        }
-    }
-    None
-}
-
 fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
     match e {
         cintos_user::syscall::SyscallError::Kernel(code) => code,
@@ -183,9 +161,9 @@ fn code_of(e: cintos_user::syscall::SyscallError) -> u64 {
 /// Диагностика + аварийный self-exit (код ядром игнорируется).
 fn fail(prefix: &str, code: u64) -> ! {
     let mut l = Line::new();
-    l.str(prefix.as_bytes());
+    l.str(prefix);
     l.u64(code);
     l.nl();
-    dlog::log(l.as_bytes());
+    dlog::log(l.as_str());
     crt0::exit(1)
 }

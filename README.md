@@ -22,7 +22,8 @@
   доставляются обработчику через IPC; resume — FaultReply.
 - **Userspace-куча**: `GlobalAlloc` поверх `ALLOC_PAGES` (без mmap) —
   `Vec/String/Box` доступны из `prelude`.
-- **C-совместимость**: staticlib `libcintos_user.a` + `cintos.h`.
+- **C-совместимость**: staticlib `libcintos_user.a` + `include/nomad.h`
+  (символы `nomad_*`).
 
 ## Структура workspace
 

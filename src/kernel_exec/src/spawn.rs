@@ -25,9 +25,9 @@
 //! ```
 //!
 //! AUXV-теги NOMAD (кастомный диапазон 0xC170_0000+):
-//!   - `AT_CINTOS_SELF_CAP`  — id TaskTCB-капабилити задачи (для
+//!   - `AT_NOMAD_SELF_CAP`  — id TaskTCB-капабилити задачи (для
 //!     DestroyTask(self) в crt0::exit);
-//!   - `AT_CINTOS_NS_CAP`    — id корневой capability неймспейса задачи;
+//!   - `AT_NOMAD_NS_CAP`    — id корневой capability неймспейса задачи;
 //!   - стандартные: `AT_PAGESZ` (7), `AT_ENTRY` (9).
 //!
 //! Bootstrap-слоты cspace: слот 0 = self-TCB, слот 1 = корневой
@@ -53,17 +53,17 @@ use kernel_base::kernel_log;
 pub const AT_NULL: u64 = 0;
 pub const AT_PAGESZ: u64 = 7;
 pub const AT_ENTRY: u64 = 9;
-pub const AT_CINTOS_SELF_CAP: u64 = 0xC170_0001;
-pub const AT_CINTOS_NS_CAP: u64 = 0xC170_0002;
-pub const AT_CINTOS_FB_ADDR: u64 = 0xC170_0003;
-pub const AT_CINTOS_FB_PITCH: u64 = 0xC170_0004;
-pub const AT_CINTOS_FB_WIDTH: u64 = 0xC170_0005;
-pub const AT_CINTOS_FB_HEIGHT: u64 = 0xC170_0006;
-pub const AT_CINTOS_FB_BPP: u64 = 0xC170_0007;
+pub const AT_NOMAD_SELF_CAP: u64 = 0xC170_0001;
+pub const AT_NOMAD_NS_CAP: u64 = 0xC170_0002;
+pub const AT_NOMAD_FB_ADDR: u64 = 0xC170_0003;
+pub const AT_NOMAD_FB_PITCH: u64 = 0xC170_0004;
+pub const AT_NOMAD_FB_WIDTH: u64 = 0xC170_0005;
+pub const AT_NOMAD_FB_HEIGHT: u64 = 0xC170_0006;
+pub const AT_NOMAD_FB_BPP: u64 = 0xC170_0007;
 /// Физический адрес RSDP (ACPI): init монтирует таблицы через
 /// CAP_CREATE_MMIO — их диапазоны зарегистрированы в phys_guard на буте
 /// (см. phys_guard::register_acpi). 0/отсутствие тега — ACPI не найден.
-pub const AT_CINTOS_ACPI_RSDP: u64 = 0xC170_0008;
+pub const AT_NOMAD_ACPI_RSDP: u64 = 0xC170_0008;
 
 /// Фиксированный VA фреймбуфера в пространстве сервера: выше окна
 /// VmapRegion задач (DEFAULT_TASK_VMAP_BASE = 4 ГиБ + 64 ГиБ окна),
@@ -409,8 +409,8 @@ pub fn build_initial_stack<U: MemoryInterfaceUserspace>(
         let mut v = heapless::Vec::new();
         let _ = v.push(AuxEntry { tag: AT_PAGESZ, val: PAGE_SIZE as u64 });
         let _ = v.push(AuxEntry { tag: AT_ENTRY, val: entry as u64 });
-        let _ = v.push(AuxEntry { tag: AT_CINTOS_SELF_CAP, val: self_cap });
-        let _ = v.push(AuxEntry { tag: AT_CINTOS_NS_CAP, val: ns_cap });
+        let _ = v.push(AuxEntry { tag: AT_NOMAD_SELF_CAP, val: self_cap });
+        let _ = v.push(AuxEntry { tag: AT_NOMAD_NS_CAP, val: ns_cap });
         for a in aux {
             let _ = v.push(*a);
         }
@@ -589,7 +589,7 @@ pub fn spawn_boot_servers<A: ArchImplementation>(
 
     // ФАЗА 1: спавн (без стартового стека — ростер ещё не известен).
     let fb = boot.framebuffer();
-    // Физический адрес RSDP — всем серверам в auxv (AT_CINTOS_ACPI_RSDP):
+    // Физический адрес RSDP — всем серверам в auxv (AT_NOMAD_ACPI_RSDP):
     // монтирование таблиц — CAP_CREATE_MMIO по acpi-allow-list phys_guard.
     let rsdp_phys: Option<u64> = match boot.hw_model() {
         kernel_base::bootinfo::BootHWModel::AcpiRsdp { begin, .. } => Some(*begin as u64),
@@ -792,7 +792,7 @@ fn spawn_one_server<'a, A: ArchImplementation>(
 
     // Фреймбуфер: образ MMIO мапится в пространство задачи по
     // фиксированному VA (FB_VA_BASE), параметры — через auxv
-    // (AT_CINTOS_FB_*). Запись в FB ведёт userspace; ядро только
+    // (AT_NOMAD_FB_*). Запись в FB ведёт userspace; ядро только
     // пробрасывает. Отказ маппинга НЕ срывает сервер: init получит
     // fb_addr=0 и перейдёт в headless-режим. Стек строится в фазе 2
     // (ростер argv) — aux сохраняется в PendingServer.
@@ -811,11 +811,11 @@ fn spawn_one_server<'a, A: ArchImplementation>(
                     MemoryFlags::empty(), // RW, user
                 ) {
                     Ok(_) => {
-                        let _ = aux.push(AuxEntry { tag: AT_CINTOS_FB_ADDR, val: (FB_VA_BASE + off) as u64 });
-                        let _ = aux.push(AuxEntry { tag: AT_CINTOS_FB_PITCH, val: fb.pitch as u64 });
-                        let _ = aux.push(AuxEntry { tag: AT_CINTOS_FB_WIDTH, val: fb.width as u64 });
-                        let _ = aux.push(AuxEntry { tag: AT_CINTOS_FB_HEIGHT, val: fb.height as u64 });
-                        let _ = aux.push(AuxEntry { tag: AT_CINTOS_FB_BPP, val: fb.bpp as u64 });
+                        let _ = aux.push(AuxEntry { tag: AT_NOMAD_FB_ADDR, val: (FB_VA_BASE + off) as u64 });
+                        let _ = aux.push(AuxEntry { tag: AT_NOMAD_FB_PITCH, val: fb.pitch as u64 });
+                        let _ = aux.push(AuxEntry { tag: AT_NOMAD_FB_WIDTH, val: fb.width as u64 });
+                        let _ = aux.push(AuxEntry { tag: AT_NOMAD_FB_HEIGHT, val: fb.height as u64 });
+                        let _ = aux.push(AuxEntry { tag: AT_NOMAD_FB_BPP, val: fb.bpp as u64 });
                     }
                     Err(e) => kernel_log!(
                         "exec: fb map не удался ({}x{}): {:?} — headless\n",
@@ -830,7 +830,7 @@ fn spawn_one_server<'a, A: ArchImplementation>(
     // Само монтирование — CAP_CREATE_MMIO по acpi-allow-list phys_guard
     // (диапазоны регистрируются портом на буте до этого места).
     if let Some(p) = rsdp_phys {
-        let _ = aux.push(AuxEntry { tag: AT_CINTOS_ACPI_RSDP, val: p });
+        let _ = aux.push(AuxEntry { tag: AT_NOMAD_ACPI_RSDP, val: p });
     }
 
     // Runtime-метаданные фазы 2 (entry + размеры).
@@ -1144,9 +1144,9 @@ mod tests {
         assert_eq!(read(rsp + 56), 4096, "AT_PAGESZ value");
         assert_eq!(read(rsp + 64), AT_ENTRY, "второй тег");
         assert_eq!(read(rsp + 72), 0x401_000, "AT_ENTRY value");
-        assert_eq!(read(rsp + 80), AT_CINTOS_SELF_CAP);
+        assert_eq!(read(rsp + 80), AT_NOMAD_SELF_CAP);
         assert_eq!(read(rsp + 88), 0x2A, "self cap");
-        assert_eq!(read(rsp + 96), AT_CINTOS_NS_CAP);
+        assert_eq!(read(rsp + 96), AT_NOMAD_NS_CAP);
         assert_eq!(read(rsp + 104), 0x2B, "ns cap");
         assert_eq!(read(rsp + 112), AT_NULL, "auxv завершён");
         let _ = a1;
