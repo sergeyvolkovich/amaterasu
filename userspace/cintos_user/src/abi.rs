@@ -70,9 +70,24 @@ pub mod nr {
     /// IPC: синхронная отправка (rendezvous) — (слот получателя, msg,
     /// размер, caps-массив, число caps).
     pub const IPC_SEND: u64 = 10;
-    /// IPC: ожидание (open/closed wait) — (слот отправителя | ANY, буфер,
-    /// ёмкость, база приёмного окна, размер окна).
+    /// IPC: ожидание (open/closed wait ИЛИ wait на гейте) — (цель,
+    /// буфер, ёмкость, база приёмного окна, размер окна, дедлайн).
+    /// Цель: ANY | слот TaskTCB (closed) | слот IpcGate (право Recv).
     pub const IPC_WAIT: u64 = 11;
+    /// IPC: ответ клиенту, от которого принят последний запрос
+    /// (неявный reply-адресат, TaskTCB-капа клиента не нужна) —
+    /// (msg, размер, caps-массив, число caps).
+    pub const IPC_REPLY: u64 = 12;
+    /// IPC: атомарные send+wait (L4 call) — (слот сервера, msg, размер,
+    /// caps, число caps, VA дескриптора приёма {capacity, recv_base,
+    /// recv_count, deadline}); ответ приходит В БУФЕР ЗАПРОСА.
+    pub const IPC_CALL: u64 = 13;
+    /// Capability: создать IPC-гейт (seL4-эндпоинт) — (dst_slot);
+    /// возврат — id капы.
+    pub const IPC_CREATE_GATE: u64 = 14;
+    /// IPC: reply + следующий wait (цикл RPC-сервера) — (msg, размер,
+    /// caps, число caps, цель wait, дедлайн).
+    pub const IPC_REPLY_WAIT: u64 = 15;
 
     /// Capability: создать неймспейс.
     pub const CAP_CREATE_NAMESPACE: u64 = 16;

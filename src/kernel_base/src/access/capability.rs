@@ -12,6 +12,11 @@ bitflags! {
         const Clone = 1;
         const Mint  = 1 << 1;
         const Send  = 1 << 2;
+        /// Право ЖДАТЬ (приём через IPC-гейт; прямые TaskTCB-wait
+        /// продолжают требовать Send — право резолва пира). Гейт-капа,
+        /// заминченная клиенту, обычно Send без Recv: клиент может
+        /// слать в сервис, но не может перехватывать чужие запросы.
+        const Recv  = 1 << 3;
     }
 }
 
@@ -104,6 +109,16 @@ pub enum CapabilityObject<UMAP: MemoryInterfaceUserspace> {
         unit: u64,
         pasid_token: u64,
     },
+    /// IPC-гейт (seL4-эндпоинт): точка мультиплексирования IPC.
+    /// Сервер публикует гейт, клиенты шлют В ГЕЙТ (капа с правом Send —
+    /// и ничего больше: ни TaskTCB сервера, ни его id), сервер ждёт на
+    /// гейте (капа с правом Recv). Состояние очередей — ipc::gate,
+    /// инвокации — IPC_SEND/IPC_WAIT с гейт-капой в слоте цели.
+    /// `gate_id` — слот таблицы ipc::gate (живёт до конца работы ядра —
+    /// как прочие descriptor-объекты).
+    IpcGate {
+        gate_id: u64,
+    },
     /// Фолт-эндпоинт (стиль seL4 fault endpoint / KeyKOS keeper-ключ):
     /// фиксирует задачу-обработчика фолтов. Создаётся САМИМ обработчиком
     /// (CAP_CREATE_FAULT_ENDPOINT — handler = текущая задача), после
@@ -141,6 +156,9 @@ impl<UMAP: MemoryInterfaceUserspace> CapabilityObject<UMAP> {
         match self {
             // Пул памяти под IPC-буферы — оперирование обычной памятью.
             CapabilityObject::MemoryIPCPool { .. } => NamespaceRights::MEMORY_ALLOC,
+            // IPC-гейт — компетенция IPC-каналов группы (создание и
+            // инвокации — рядовые операции транспорта).
+            CapabilityObject::IpcGate { .. } => NamespaceRights::IPC_SEND,
             CapabilityObject::MemoryMMIORegion { .. } => NamespaceRights::MMIO_MAP,
             CapabilityObject::IrqLine { .. } => NamespaceRights::IRQ_BIND,
             // TaskTCB — право управлять задачами группы (создавать и т.п.).
@@ -188,6 +206,16 @@ impl<UMAP: MemoryInterfaceUserspace> CapabilityObject<UMAP> {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// Живой IPC-гейт: Some(gate_id) — слот таблицы ipc::gate. Гейт-слот
+    /// валиден всегда (таблица статична), но резолв требуется под
+    /// permission_backend-локом — как у TaskTCB.
+    pub fn resolve_ipc_gate(&self) -> Option<u64> {
+        match self {
+            CapabilityObject::IpcGate { gate_id } => Some(*gate_id),
             _ => None,
         }
     }

@@ -635,6 +635,33 @@ impl MemoryInterfaceUserspace for X86Umap {
 /// Обход таблиц: трансляция VA -> физика (база кадра | смещение внутри).
 /// Huge-листы (2 МиБ/1 ГиБ) поддержаны. Публично: планировщику и ядру
 /// для доступа к памяти задачи (translate трейта обёртка над этим).
+/// Гарантирует доступность MMIO-окна устройства (физ. база, выровнена
+/// на страницу) через HHDM. Limine HHDM покрывает memory map: у ряда
+/// конфигураций (QEMU/SeaBIOS + Limine 12.x) окна LAPIC/IO-APIC
+/// (0xFEE00000/0xFEC00000) попадают в дыры карты — до этих пор ядро
+/// падало #PF на буте. Маппинг идемпотентен (существующие листы не
+/// трогает). false — кадровый аллокатор ещё не поднят.
+pub fn device_window_ensure(phys: usize) -> bool {
+    struct AnyFrames;
+    let Some(frames) = kernel_base::traits::memory::init_hooks::memory_allocator() else {
+        return false;
+    };
+    // SAFETY: доступ к таблицам ядра (CR3) — как в hhdm_ensure_mapped;
+    // вызывается на буте/ап-ините до многопоточного размонтирования.
+    match unsafe { hhdm_ensure_mapped_pub(frames, phys, 0x1000) } {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
+fn hhdm_ensure_mapped_pub(
+    frames: &'static dyn kernel_base::traits::memory::FrameAllocator,
+    phys: usize,
+    len: usize,
+) -> Result<(), kernel_base::traits::memory::ErrorCode> {
+    hhdm_ensure_mapped(frames, phys, len)
+}
+
 pub fn translate_page(root_phys: usize, virt: usize) -> Option<usize> {
     let mut table_phys = root_phys;
     // Уровни сверху вниз: 39 (PML4), 30 (PDPT), 21 (PD), 12 (PT).

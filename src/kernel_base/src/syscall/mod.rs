@@ -28,6 +28,13 @@ pub fn init_syscalls<A: ArchImplementation + crate::traits::iommu::IommuTokenLay
 
     A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCSend>::new(kctl));
     A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCWait>::new(kctl));
+    // Домен RPC (классический L4 call/return): неявный reply-адресат
+    // в TCB сервера (заверен ядром — TaskTCB-капа клиента не нужна),
+    // атомарные call (SEND+WAIT с ответом в буфер запроса) и
+    // reply-and-wait (основной цикл RPC-сервера).
+    A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCReply>::new(kctl));
+    A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCCall>::new(kctl));
+    A::register_syscalls(IPCSyscallDomain::<_, SyscallIPCReplyWait>::new(kctl));
 
     // Домен IRQ (v2): сон до срабатывания линий (по КАПАМ линий — per-line
     // authority), MSI-аллокация, возврат линии владельцем. ABI в
@@ -51,6 +58,8 @@ pub fn init_syscalls<A: ArchImplementation + crate::traits::iommu::IommuTokenLay
     // (CAP_TRANSFER, голые task_cap-id) удалён как ambient authority —
     // пересылка capability живёт только в IPC-транспорте (map items).
     // Номер 24 зарезервирован.
+    // IPC_CREATE_GATE(14): capability-объект «IPC-гейт» (seL4-эндпоинт).
+    A::register_syscalls(DomainCapability::<_, SyscallIpcCreateGate>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateNamespace>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateIpcPool>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateMmio>::new(kctl));

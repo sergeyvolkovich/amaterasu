@@ -578,8 +578,12 @@ fn acpi_guard_register(boot_info: &BootInfo) {
         return;
     };
     // Длина корневой: u32 по смещению 4 её заголовка (уже дочерчено).
+    // read_unaligned: ACPI spec требует выравнивания полей ВНУТРИ
+    // таблицы, но физический базис самой таблицы в ряде конфигураций
+    // (QEMU/SeaBIOS + Limine, RSDP в EBDA) НЕ выровнен на u32 —
+    // read_volatile здесь ловит UB-панику на буте (debug_assertions).
     let root_len =
-        unsafe { ((phys_to_virt(root_phys) + 4) as *const u32).read_volatile() } as usize;
+        unsafe { ((phys_to_virt(root_phys) + 4) as *const u32).read_unaligned() } as usize;
     page_span_acpi(root_phys, root_len);
 
     // Дочерние таблицы (только чек-суммно-валидные — фильтр tables()).
@@ -976,9 +980,56 @@ fn install_scheduler(core_id: usize) {
     // Хук кика (Resched-IPI) — достаточно одного на систему; установка
     // идемпотентна (fn-указатель перезаписывается тем же значением).
     kernel_base::task::wake::set_kick_hook(resched_kick);
+    // Резолвер таймаутов IPC (E_TIMEOUT после настоящего сна ставится
+    // патчем кадра будильщиком — тик дедлайна; см. deadline::on_tick).
+    kernel_base::task::deadline::set_timeout_resolver(ipc_timeout_resolver);
     let lctl = X86Backend::get_local_base();
     lctl.install_cpu_scheduler(core_id, &SCHEDULERS[core_id]);
     kernel_log!("sched: RR поставлен на ядро {} (wake-реестр)\n", core_id);
+}
+
+/// Резолвер таймаута IPC-ожиданий (deadline::set_timeout_resolver):
+/// решает исход сработавшего дедлайна по диапазону wait-объекта.
+///   - объект отправителя: если сообщение ещё не доставлено —
+///     самоочистка (SendSpec + запись в очереди получателя/гейта) и
+///     патч RAX = E_TIMEOUT;
+///   - объект получателя: если ещё ждёт (не доставлено/не клеймлено) —
+///     снятие регистрации и патч RAX = E_TIMEOUT;
+///   - доставка, случившаяся в тот же тик, старше таймаута — патча нет,
+///     задача проснётся с OK и заполненным буфером.
+fn ipc_timeout_resolver(task_cap_id: u64, object_id: usize) -> bool {
+    use kernel_base::ipc::endpoint;
+    use kernel_base::traits::syscall::syscall_result as res;
+
+    let kctl = kernel_ctl();
+    let tasks = kctl.task_manager().lock();
+    let patched = if endpoint::is_sender_wait_object(object_id) {
+        transport_sender_timeout(&tasks, task_cap_id)
+    } else if endpoint::is_endpoint_wait_object(object_id) {
+        transport_receiver_timeout(&tasks, task_cap_id)
+    } else {
+        false
+    };
+    if patched
+        && let Some(tcb) = tasks.get_tcb(task_cap_id)
+    {
+        tcb.patch_resume_result(X86Backend::RESUME_RESULT_WORD, res::E_TIMEOUT);
+    }
+    patched
+}
+
+fn transport_sender_timeout(
+    tasks: &kernel_base::task::TaskManager<kernel_x86::paging::X86Umap>,
+    sender: u64,
+) -> bool {
+    kernel_base::ipc::transport::sender_timeout_pending(tasks, sender).is_some()
+}
+
+fn transport_receiver_timeout(
+    tasks: &kernel_base::task::TaskManager<kernel_x86::paging::X86Umap>,
+    receiver: u64,
+) -> bool {
+    kernel_base::ipc::transport::receiver_timeout_pending(tasks, receiver)
 }
 
 /// Кик проснувшегося ядра из task::wake: Resched-IPI через переносимый

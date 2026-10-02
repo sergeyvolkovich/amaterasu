@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     access::capability::{CapabilityMembrane, LinkedRecord},
     collection::RBSlabIO,
+    task::ipc_state::IpcCell,
     task::stats::TaskStatsCell,
     traits::memory::MemoryInterfaceUserspace,
     umap::{DEFAULT_TASK_VMAP_BASE, DEFAULT_TASK_VMAP_PAGES, VmapRegion},
@@ -234,6 +235,10 @@ pub struct TCB<Umap: MemoryInterfaceUserspace> {
     /// возникновения (единственное место, где они видны); отчётность
     /// и интерпретация перенесены в юзерспейс (сисколл TASK_STATS).
     stats: TaskStatsCell,
+    /// IPC-состояние (rendezvous в стиле L4, см. task::ipc_state):
+    /// параметры блокированного отправителя/получателя, очередь
+    /// отправителей, неявный адресат ответа. Листовой SpinMutex.
+    ipc: IpcCell,
 }
 
 impl<Umap: MemoryInterfaceUserspace> TCB<Umap> {
@@ -249,7 +254,14 @@ impl<Umap: MemoryInterfaceUserspace> TCB<Umap> {
             resume: ResumeSlot::new(),
             fpu: FpuArea::new(),
             stats: TaskStatsCell::new(),
+            ipc: IpcCell::new(),
         }
+    }
+
+    /// IPC-состояние задачи (rendezvous-транспорт, task::ipc_state).
+    /// ЛИСТОВОЙ лок: внутри его секции чужие локи не берутся.
+    pub fn ipc(&self) -> &IpcCell {
+        &self.ipc
     }
 
     /// Счётчики событий задачи (атомарные; снапшот — TASK_STATS).

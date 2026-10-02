@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod deadline;
+pub mod ipc_state;
 pub mod irq_wait;
 pub mod stats;
 pub mod tcb;
@@ -158,6 +159,13 @@ impl<UMAP: MemoryInterfaceUserspace> TaskManager<UMAP> {
 
     pub fn get_tcb(&self, task_cap_id: u64) -> Option<&TCB<UMAP>> {
         self.ltcb_list.get(&task_cap_id)
+    }
+
+    /// Итерация по всем локальным TCB (id + ссылка). Нужен IPC-транспорту
+    /// (transport::on_task_destroyed — скан очередей/состояний при
+    /// уничтожении задачи). Вызывать под task_manager-локом.
+    pub fn for_each_tcb<F: FnMut(u64, &TCB<UMAP>)>(&self, mut f: F) {
+        self.ltcb_list.for_each_kv(|id, tcb| f(*id, tcb));
     }
 
     /// Обратный поиск: task_cap_id задачи, владеющей данным GTcb.

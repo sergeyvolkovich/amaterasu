@@ -34,6 +34,36 @@ use crate::traits::memory::MemoryInterfaceUserspace;
 /// Максимальное число одновременных ожидающих с дедлайном.
 pub const MAX_DEADLINE_WAITERS: usize = 32;
 
+/// Резолвер таймаута (фронтовый хук, паттерн task::wake::set_kick_hook):
+/// kernel_base не имеет доступа к kctl, но исход таймаута решает именно
+/// семантика ожидания (IPC-транспорт: доставка уже случилась?
+/// самочистка отправителя из очереди? патч RAX=E_TIMEOUT в сохранённый
+/// кадр — после настоящего сна хендлер НЕ перезапускается, возвратный
+/// код обязан поставить будильщик). Регистрируется фронтом
+/// (kernel_limine) на буте. Аргументы: (task_cap_id, wait_object);
+/// возврат true — таймаут обработан (кадр пропатчен/самочистка
+/// выполнена), false — ожидание вне IPC (или уже доставлено) — будим
+/// без патча.
+pub type TimeoutResolver = fn(task_cap_id: u64, object_id: usize) -> bool;
+
+static TIMEOUT_RESOLVER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Регистрирует резолвер (повторная установка — замена; идемпотентно).
+pub fn set_timeout_resolver(hook: TimeoutResolver) {
+    TIMEOUT_RESOLVER.store(hook as usize as u64, core::sync::atomic::Ordering::Release);
+}
+
+fn resolve_timeout(task_cap_id: u64, object_id: usize) -> bool {
+    let raw = TIMEOUT_RESOLVER.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: raw — fn-указатель, записанный set_timeout_resolver.
+    let f: TimeoutResolver = unsafe { core::mem::transmute(raw) };
+    f(task_cap_id, object_id)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DeadlineWaiter {
     /// Capability id задачи-ожидателя.
@@ -86,13 +116,19 @@ pub fn register(task_cap_id: u64, object_id: usize, deadline: u64) -> Result<(),
 }
 
 /// Тик таймера (IRQ-контекст): будим всех, чей срок вышел. Слот
-/// ОСТАЁТСЯ (пометка fired) — его снимет хендлер WAIT через cancel,
-/// когда задача проснётся; иначе гонка "тик будит, хендлер не успел"
-/// потеряла бы факт таймаута. Задачи, умершие до cancel, чистит
-/// remove_task.
+/// ОСТАЁТСЯ (пометка fired) — его снимет хендлер через cancel, когда
+/// задача проснётся (или в гонке «ещё не уснул»); задачи, умершие до
+/// cancel, чистит remove_task.
+///
+/// Исход таймаута у ЗАСНУВШЕЙ задачи решает резолвер (см. шапку):
+/// хендлер после настоящего сна НЕ перезапускается — его кадр уже
+/// сохранён с RAX = возврату хендлера; E_TIMEOUT в userspace попадает
+/// только патчем кадра будильщиком. Доставленное в тот же тик сообщение
+/// старше таймаута: резолвер видит доставку по IPC-состоянию и НЕ
+/// патчит (доставка побеждает, задача проснётся с OK).
 pub fn on_tick<Umap: MemoryInterfaceUserspace>(lctl: &mut LocalKernelCTL<Umap>, now: u64) {
-    // 1. Под локом: пометить сработавшие (будить БУДЕМ вне лока).
-    let mut to_wake: [Option<usize>; MAX_DEADLINE_WAITERS] = [None; MAX_DEADLINE_WAITERS];
+    // 1. Под локом: пометить сработавшие (обрабатывать ВНЕ лока).
+    let mut to_wake: [(u64, usize); MAX_DEADLINE_WAITERS] = [(0, 0); MAX_DEADLINE_WAITERS];
     let mut wake_count = 0usize;
     {
         let mut slots = SLOTS.lock();
@@ -100,16 +136,16 @@ pub fn on_tick<Umap: MemoryInterfaceUserspace>(lctl: &mut LocalKernelCTL<Umap>, 
             let Some(w) = slot else { continue };
             if !w.fired && now >= w.deadline {
                 w.fired = true;
-                to_wake[wake_count % MAX_DEADLINE_WAITERS] = Some(w.object_id);
+                to_wake[wake_count % MAX_DEADLINE_WAITERS] = (w.task_cap_id, w.object_id);
                 wake_count += 1;
             }
         }
     }
-    // 2. Вне лока: пробуждение (может брать чужие локи — шедулер).
-    for object_id in to_wake.iter().take(wake_count) {
-        if let Some(obj) = object_id {
-            lctl.scheduler_release_object(*obj);
-        }
+    // 2. Вне лока: резолвер (патч/самочистка — берёт task_manager/ipc
+    //    локи) и пробуждение (берёт планировщик) — по очереди.
+    for &(task_cap_id, object_id) in to_wake.iter().take(wake_count) {
+        let _ = resolve_timeout(task_cap_id, object_id);
+        lctl.scheduler_release_object(object_id);
     }
 }
 

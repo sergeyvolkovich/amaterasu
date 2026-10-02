@@ -208,20 +208,22 @@ pub fn destroy_task_full<A: ArchImplementation>(
             let _ = lctl.scheduler_unregister_task(task_cap_id);
             lctl.clear_current_task_if(task_cap_id);
 
-            // IPC: умерший получатель будит спящих отправителей их
-            // сообщений (RAX их кадров перезаписывается ДО
-            // пробуждения — E_NOT_FOUND).
-            for (sender, wait_object) in
-                crate::ipc::endpoint::on_task_destroyed(task_cap_id).iter()
+            // IPC (TCB-центричный транспорт): скан живых TCB — отправители,
+            // нацеленные на умершего (их SendSpec.to == dead, в т.ч.
+            // стоявшие в его очереди), получают E_NOT_FOUND в кадр ДО
+            // пробуждения; записи об умершем в чужих очередях/reply_to
+            // чистятся; гейт-очереди пurge'ятся.
             {
+                let tasks = kctl.task_manager().lock();
+                for (sender, wait_object) in crate::ipc::transport::on_task_destroyed(&tasks, task_cap_id).iter()
                 {
-                    let tasks = kctl.task_manager().lock();
                     if let Some(tcb) = tasks.get_tcb(*sender) {
                         tcb.patch_resume_result(A::RESUME_RESULT_WORD, res::E_NOT_FOUND);
                     }
+                    lctl.scheduler_release_object(*wait_object);
                 }
-                lctl.scheduler_release_object(*wait_object);
             }
+            crate::ipc::gate::gate_purge_task(task_cap_id);
 
             // IRQ: реестр ожиданий не должен течь (мёртвая задача
             // никогда не перевызовет WaitIrq), линии владельца
@@ -372,9 +374,10 @@ impl<A: ArchImplementation> SyscallDomain for DomainScheduler<A, SyscallBlockOnO
 /// запрещена — это механизмы доставки, а не публичные примитивы.
 fn is_kernel_wait_object(id: usize) -> bool {
     const IPC_BASE: usize = crate::ipc::endpoint::IPC_OBJECT_BASE;
-    // Ящики отправителей: [BASE, BASE+MAILBOX_SLOTS); эндпоинты:
-    // [BASE+64, BASE+64+MAX_ENDPOINTS) — см. endpoint::sender/endpoint_wait_object.
-    const IPC_SPAN: usize = 64 + crate::ipc::endpoint::MAX_ENDPOINTS;
+    // Отправители: [BASE, BASE+0x1000); получатели: [BASE+0x1000,
+    // BASE+0x2000); гейты: [BASE+0x2000, BASE+0x3000) — см. endpoint::
+    // sender/endpoint_wait_object, gate::gate_wait_object.
+    const IPC_SPAN: usize = 0x3000;
     const FAULT_BASE: usize = crate::ipc::fault::FAULT_OBJECT_BASE;
     id < 64
         || (IPC_BASE..IPC_BASE + IPC_SPAN).contains(&id)

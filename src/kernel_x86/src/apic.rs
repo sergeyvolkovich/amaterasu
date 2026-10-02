@@ -248,6 +248,14 @@ fn init_common() -> bool {
     LAPIC_MMIO_BASE.store(mmio, Ordering::Relaxed);
     X2APIC.store(x2, Ordering::Relaxed);
 
+    // MMIO-окно LAPIC обязано быть доступно через HHDM: у ряда
+    // конфигураций (QEMU/SeaBIOS + Limine 12.x) 0xFEE00000 — дыра в
+    // memory map, HHDM её не покрывает → #PF на первом mmio_write.
+    // Маппинг идемпотентен; на AP — no-op (окно уже замаплено BSP).
+    if !crate::paging::device_window_ensure(mmio) {
+        return false;
+    }
+
     if !x2 {
         // Глушим LVT ДО включения: ни один локальный источник не должен
         // прийти на непредназначенный для него вектор.

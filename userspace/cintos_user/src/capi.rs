@@ -230,6 +230,26 @@ const _: () = assert!(core::mem::size_of::<NomadCapDesc>() == 24);
 /// как {label, payload_len, payload} (см. nomad.h); caps — массив
 /// NomadCapDesc×caps_len (может быть NULL при caps_len=0).
 /// Возврат: 0 — доставлено; иначе код ошибки (старший бит).
+/// Разбор C-массива NomadCapDesc в Rust-дескрипторы (контракт C-ABI:
+/// caps — валидный массив caps_len элементов или NULL при caps_len=0).
+fn decode_caps(caps: *const NomadCapDesc, caps_len: u64) -> ([ipc::CapDesc; MAX_CAPS], usize) {
+    let mut rust_caps = [ipc::CapDesc::new(Slot::new(0), Slot::new(0), Rights::from_bits(0)); MAX_CAPS];
+    let n = (caps_len as usize).min(MAX_CAPS);
+    if caps.is_null() || n == 0 {
+        return (rust_caps, 0);
+    }
+    // SAFETY: caps — валидный массив (контракт C-ABI).
+    let src = unsafe { core::slice::from_raw_parts(caps.cast::<NomadCapDesc>(), n) };
+    for (dst, s) in rust_caps.iter_mut().zip(src.iter()) {
+        *dst = ipc::CapDesc::new(
+            Slot::new(s.src_slot),
+            Slot::new(s.dst_slot),
+            Rights::from_bits(s.rights),
+        );
+    }
+    (rust_caps, n)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nomad_ipc_send(
     slot: u64,
@@ -268,6 +288,118 @@ pub extern "C" fn nomad_ipc_send(
     }
     match ipc::send(Slot::new(slot), label, payload, &rust_caps[..n]) {
         Ok(()) => 0,
+        Err(crate::syscall::SyscallError::Kernel(code)) => code,
+    }
+}
+
+/// Ответ клиенту последнего запроса (IPC_REPLY; см. nomad.h).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_ipc_reply(
+    label: u64,
+    payload: *const u8,
+    payload_len: u64,
+    caps: *const NomadCapDesc,
+    caps_len: u64,
+) -> u64 {
+    let ok = unsafe { payload.as_ref() }.is_some() || payload_len == 0;
+    if !ok || payload_len as usize > crate::ipc::MAX_MSG {
+        return abi::result::E_INVALID_ARG;
+    }
+    // SAFETY: payload — валидная память вызывающего (контракт C-ABI).
+    let payload = unsafe { core::slice::from_raw_parts(payload, payload_len as usize) };
+    let (rust_caps, n) = decode_caps(caps, caps_len);
+    match ipc::reply(label, payload, &rust_caps[..n]) {
+        Ok(()) => 0,
+        Err(crate::syscall::SyscallError::Kernel(code)) => code,
+    }
+}
+
+/// Создать IPC-гейт (IPC_CREATE_GATE; см. nomad.h).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_ipc_create_gate(dst_slot: u64) -> u64 {
+    match ipc::create_gate(Slot::new(dst_slot)) {
+        Ok(id) => id,
+        Err(crate::syscall::SyscallError::Kernel(code)) => code,
+    }
+}
+
+/// Атомарный call (IPC_CALL; см. nomad.h) — буфер двунаправленный.
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_ipc_call(
+    slot: u64,
+    buf: *mut u8,
+    buf_len: u64,
+    label: u64,
+    request: *const u8,
+    request_len: u64,
+    caps: *const NomadCapDesc,
+    caps_len: u64,
+    recv_base: u64,
+    recv_count: u64,
+    deadline: u64,
+) -> u64 {
+    if buf.is_null()
+        || buf_len < (crate::ipc::BODY_HDR + request_len as usize) as u64
+        || request_len as usize > crate::ipc::MAX_MSG
+    {
+        return abi::result::E_INVALID_ARG;
+    }
+    // SAFETY: buf/request — валидная память вызывающего (контракт C-ABI).
+    let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf, buf_len as usize) };
+    let request_slice = unsafe { core::slice::from_raw_parts(request, request_len as usize) };
+    let (rust_caps, n) = decode_caps(caps, caps_len);
+    match ipc::call(
+        Slot::new(slot),
+        label,
+        request_slice,
+        &rust_caps[..n],
+        ipc::recv_window(Slot::new(recv_base), recv_count),
+        deadline,
+        buf_slice,
+    ) {
+        Ok(_) => 0,
+        Err(crate::syscall::SyscallError::Kernel(code)) => code,
+    }
+}
+
+/// Reply + следующий wait (IPC_REPLY_WAIT; см. nomad.h).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_ipc_reply_wait(
+    label: u64,
+    payload: *const u8,
+    payload_len: u64,
+    caps: *const NomadCapDesc,
+    caps_len: u64,
+    from: u64,
+    deadline: u64,
+    buf: *mut u8,
+    buf_len: u64,
+) -> u64 {
+    if buf.is_null() || buf_len < (crate::ipc::HEADER_WORDS * 8) as u64 {
+        return abi::result::E_INVALID_ARG;
+    }
+    // SAFETY: payload — валидная память вызывающего (контракт C-ABI).
+    let payload_slice = if payload_len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(payload, payload_len as usize) }
+    };
+    let (rust_caps, n) = decode_caps(caps, caps_len);
+    // SAFETY: buf — валидная память вызывающего (контракт C-ABI).
+    let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf, buf_len as usize) };
+    match ipc::reply_wait(
+        label,
+        payload_slice,
+        &rust_caps[..n],
+        if from == u64::MAX {
+            ipc::WaitFrom::Any
+        } else {
+            ipc::WaitFrom::Slot(Slot::new(from))
+        },
+        deadline,
+        buf_slice,
+    ) {
+        Ok(_) => 0,
         Err(crate::syscall::SyscallError::Kernel(code)) => code,
     }
 }

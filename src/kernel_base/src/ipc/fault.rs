@@ -22,18 +22,24 @@
 //!     именно зарегистрированный обработчик, и будит упавшую задачу
 //!     (опционально с новым RIP/RSP).
 //!
-//! ПОТОК ФОЛТА (исключение в ring3,deliverable-вектор):
+//! ПОТОК ФОЛТА (исключение в ring3, deliverable-вектор):
 //!   1. Порт (idt-путь) проверяет: вектор доставляем, фолт из ring3,
 //!      у текущей задачи есть биндинг → [`deliver_fault`].
-//!   2. Выделяется слот активного фолта; собирается сообщение
-//!      (тело проволочного формата ipc: label = FAULT_LABEL,
-//!      payload = 5×u64 — см. [`FaultInfo::encode`]).
-//!   3. Доставка: быстрый путь — обработчик уже спит в IPC_WAIT
-//!      (claim эндпоинта, запись в его буфер, пробуждение); медленный
-//!      путь — почтовый ящик (обработчик заберёт при следующем
-//!      IPC_WAIT: [`endpoint::enqueue_pending_fault`]).
+//!   2. Выделяется слот активного фолта (тело сообщения хранится В
+//!      СЛОТЕ — упавшая не является обычным отправителем, её буфер
+//!      недоступен); собирается сообщение (тело проволочного формата
+//!      ipc: label = FAULT_LABEL, payload = 5×u64 — см.
+//!      [`FaultInfo::encode`]).
+//!   3. Доставка через общий rendezvous-транспорт (ipc::transport):
+//!      быстрый путь — обработчик спит в IPC_WAIT (клейм, запись в его
+//!      буфер, пробуждение); медленный путь — очередь обработчика
+//!      (transport::enqueue_sender с is_fault=true; обработчик заберёт
+//!      при следующем IPC_WAIT — take_pending_fault).
 //!   4. Упавшая задача блокируется на `fault_wait_object(слот)` с
 //!      СОХРАНЁННЫМ кадром (порт кладёт его в слот возобновления TCB).
+//!      Сон под предикатом «слот фолта ещё жив»: FAULT_REPLY, успевший
+//!      до фактического сна, снимает слот — предикат отменяет сон,
+//!      задача сразу возобновляется (lost-wakeup закрыт).
 //!   5. Обработчик читает фолт, зовёт FAULT_REPLY: ядро проверяет
 //!      «обработчик + доставка состоялась», опционально патчит
 //!      RIP/RSP сохранённого кадра и будит задачу. new_rip=0 —
@@ -41,11 +47,11 @@
 //!      new_rip≠0 — продолжить с нового адреса (эмуляция/сигнал).
 //!
 //! ОТЛИЧИЕ от обычного IPC-отправителя: упавшая задача спит на СВОЁМ
-//! fault-объекте (а не sender_wait_object ящика) и НЕ будится при
-//! приёме сообщения обработчиком — только FAULT_REPLY'ем. Поэтому
-//! фолт-ящики никогда не «отбрасываются с ошибкой» (take_pending их
-//! пропускает вместо drop), а уничтожение обработчика будит упавших
-//! (см. [`on_task_destroyed`]) — иначе они зависли бы навсегда.
+//! fault-объекте (а не на объекте отправителя) и НЕ будится при приёме
+//! сообщения обработчиком — только FAULT_REPLY'ем. Поэтому фолт-записи
+//! никогда не «отбрасываются с ошибкой» (take_next их пропускает вместо
+//! drop), а уничтожение обработчика будит упавших (см.
+//! [`on_task_destroyed`]) — иначе они зависли бы навсегда.
 //!
 //! СМЕРТЬ УЧАСТНИКОВ:
 //!   - умерла упавшая (невозможно для self-exit — она спит, но ядро
@@ -56,9 +62,9 @@
 //!     тихого зависания). Сообщение из ящика отбрасывается молча
 //!     (endpoint::on_task_destroyed).
 //!
-//! ОГРАНИЧЕНИЕ v1 (как у всего IPC): wake идёт через per-core
-//! планировщик ТЕКУЩЕГО ядра — корректно, пока участники на одном ядре
-//! (boot-серверы на BSP). Аналогично irq_wait.
+//! ОГРАНИЧЕНИЕ SMP СНЯТО: пробуждение (обработчик/упавшая) идёт через
+//! task::wake::release_object_global — участники могут жить на разных
+//! ядрах.
 //!
 //! СИНХРОНИЗАЦИЯ: оба реестра — листовые локи IrqSafeSpinMutex (в
 //! реестр нельзя войти, удерживая другой лок; путь исключения и так
@@ -70,11 +76,12 @@ use heapless::Vec as HVec;
 
 use crate::{
     KernelCTL,
-    ipc::endpoint::{self, ClaimResult},
+    ipc::{endpoint, transport},
     irqsafe::IrqSafeSpinMutex,
     kernel_log,
     lctl::LocalKernelCTL,
-    traits::{ArchImplementation, scheduller::WaitModel},
+    task::TaskManager,
+    traits::{ArchImplementation, memory::MemoryInterfaceUserspace, scheduller::WaitModel},
 };
 
 /// База wait-объектов фолтов (не пересекается с IPC: 0x1_0000, IRQ:
@@ -199,14 +206,21 @@ struct FaultBinding {
 }
 
 /// Слот активного фолта: упавшая задача спит на `fault_wait_object(i)`.
+/// Тело сообщения хранится здесь: упавшая — НЕ обычный отправитель (её
+/// userspace-буфер не участвует), ядро само формирует и держит фолт-
+/// сообщение до изъятия обработчиком (fast-path доставки или IPC_WAIT).
 #[derive(Debug, Clone, Copy)]
 struct FaultSlot {
     faulting: u64,
     handler: u64,
     /// Сообщение ПРИНЯТО обработчиком (быстрый путь доставки или
-    /// take_pending в его IPC_WAIT). Только после этого FAULT_REPLY
+    /// take_pending_fault в его IPC_WAIT). Только после этого FAULT_REPLY
     /// валиден — до приёма ответ означал бы дубликаты фолтов.
     delivered: bool,
+    /// Изъято из очереди обработчика, но ещё НЕ записано в его буфер
+    /// (откат незавершённой доставки — untake_pending_fault).
+    taken: bool,
+    msg: [u8; FAULT_MSG_LEN],
 }
 
 static BINDINGS: IrqSafeSpinMutex<[Option<FaultBinding>; MAX_FAULT_BINDINGS]> =
@@ -254,7 +268,7 @@ pub fn fault_handler_of(task_cap_id: u64) -> Option<u64> {
 /// Выделяет слот активного фолта (запись для упавшей задачи).
 /// Повторный фолт той же задачи невозможен (она спит), но защитно
 /// ПЕРЕЗАПИСЫВАЕТ прежнюю запись.
-fn begin_fault(faulting: u64, handler: u64) -> Option<usize> {
+fn begin_fault(faulting: u64, handler: u64, msg: &[u8; FAULT_MSG_LEN]) -> Option<usize> {
     let mut slots = SLOTS.lock();
     let mut free: Option<usize> = None;
     for (idx, slot) in slots.iter_mut().enumerate() {
@@ -264,6 +278,8 @@ fn begin_fault(faulting: u64, handler: u64) -> Option<usize> {
                     faulting,
                     handler,
                     delivered: false,
+                    taken: false,
+                    msg: *msg,
                 });
                 return Some(idx);
             }
@@ -276,8 +292,65 @@ fn begin_fault(faulting: u64, handler: u64) -> Option<usize> {
         faulting,
         handler,
         delivered: false,
+        taken: false,
+        msg: *msg,
     });
     Some(idx)
+}
+
+/// Слот фолта ещё жив (предикат сна упавшей: FAULT_REPLY успел до
+/// фактического сна — слот снят — спать не нужно, задача сразу
+/// возобновляется повтором упавшей инструкции).
+fn fault_slot_alive(faulting: u64) -> bool {
+    let slots = SLOTS.lock();
+    slots.iter().any(|s| matches!(s, Some(x) if x.faulting == faulting))
+}
+
+/// Изъятие фолт-сообщения обработчиком из ОЧЕРЕДИ (медленный путь):
+/// возвращает тело и помечает запись изъятой (taken). Доставку завершает
+/// mark_fault_delivered (после записи в буфер); откат — untake.
+/// Опубликована для syscall::ipc (take_next — ветка is_fault).
+pub fn take_pending_fault<Umap: MemoryInterfaceUserspace>(
+    tasks: &TaskManager<Umap>,
+    faulting: u64,
+    handler: u64,
+) -> Option<[u8; FAULT_MSG_LEN]> {
+    let _ = tasks;
+    let mut slots = SLOTS.lock();
+    for slot in slots.iter_mut() {
+        if let Some(s) = slot
+            && s.faulting == faulting
+            && s.handler == handler
+            && !s.delivered
+            && !s.taken
+        {
+            s.taken = true;
+            return Some(s.msg);
+        }
+    }
+    None
+}
+
+/// Откат изъятия (буфер обработчика мал/неотображаем): фолт НЕ теряется
+/// — запись возвращается в очередь обработчика (requeue), доставка
+/// повторится следующим wait с достаточным буфером.
+pub fn untake_pending_fault<Umap: MemoryInterfaceUserspace>(
+    tasks: &TaskManager<Umap>,
+    faulting: u64,
+    handler: u64,
+) {
+    let _ = tasks;
+    let mut slots = SLOTS.lock();
+    for slot in slots.iter_mut() {
+        if let Some(s) = slot
+            && s.faulting == faulting
+            && s.handler == handler
+            && s.taken
+        {
+            s.taken = false;
+            return;
+        }
+    }
 }
 
 /// Освобождает слот активного фолта без побочных эффектов (откат
@@ -399,49 +472,64 @@ pub fn deliver_fault<A: ArchImplementation + 'static>(
     // SAFETY: под permission_backend-локом уничтожение невозможно.
     let handler_umap = unsafe { handler_gtcb.as_ref().userspace_map() };
 
-    let Some(slot) = begin_fault(faulting_task_cap, handler) else {
+    let Some(slot) = begin_fault(faulting_task_cap, handler, &msg) else {
+        kernel_log!(
+            "fault: слоты фолтов исчерпаны — фолт задачи {} потерян\n",
+            faulting_task_cap
+        );
         return false;
     };
 
     // Фолт-сообщение capability не несёт: caps_count = 0 — любое
     // приёмное окно обработчика (даже recv_count = 0) его принимает.
-    match endpoint::claim_ready(handler, faulting_task_cap, need, 0) {
+    let claim = {
+        let tasks = kctl.task_manager().lock();
+        transport::claim_receiver(&tasks, handler, faulting_task_cap, None, need, 0)
+    };
+    match claim {
         // Быстрый путь: обработчик спит в IPC_WAIT — захват, запись в
         // его буфер, пробуждение. Фолт сразу «доставлен».
-        ClaimResult::Claimed(ep_idx, ep) => {
-            if endpoint::check_user_region(handler_umap, ep.tgt_va, need)
-                && endpoint::deliver_to_claimed(
+        transport::ClaimResult::Claimed(rspec) => {
+            if endpoint::check_user_region(handler_umap, rspec.tgt_va, need)
+                && endpoint::write_delivery_header_and_body(
                     handler_umap,
-                    &ep,
+                    rspec.tgt_va,
                     faulting_task_cap,
                     &msg,
                     &[],
                 )
             {
-                endpoint::consume_ready(ep_idx);
+                {
+                    let tasks = kctl.task_manager().lock();
+                    // recv → Idle; reply_to НЕ ставится (фолт-ответ —
+                    // FAULT_REPLY, не IPC_REPLY).
+                    transport::finish_delivery(&tasks, handler, faulting_task_cap, true);
+                }
                 mark_fault_delivered(faulting_task_cap);
                 // Разбудить обработчика (его кадр: RAX уже OK с момента
                 // блокировки в IPC_WAIT — буфер заполнен).
-                lctl.scheduler_release_object(endpoint::endpoint_wait_object(ep_idx));
+                lctl.scheduler_release_object(endpoint::endpoint_wait_object(handler));
             } else {
                 // Буфер обработчика мал/не отображён — ошибка КОНФИГУРАЦИИ
                 // обработчика. Разбудить его нельзя (кадр без сообщения),
                 // оставить спать — зависание пары. Фатально с диагностикой.
-                endpoint::restore_ready(ep_idx, ep);
+                {
+                    let tasks = kctl.task_manager().lock();
+                    transport::restore_receiver(&tasks, handler, rspec);
+                }
                 kernel_log!(
                     "fault: буфер обработчика {} непригоден ({:#x}, need {})\n",
                     handler,
-                    ep.tgt_va,
+                    rspec.tgt_va,
                     need
                 );
                 abort_fault(slot);
                 return false;
             }
         }
-        ClaimResult::TooSmall => {
+        transport::ClaimResult::TooSmall => {
             // Аналогично: ждущий обработчик с буфером меньше фолт-сообщения
-            // (100 байт) — ошибка конфигурации; фолт-ящик не выйдет из
-            // taker'а, пара зависнет. Фатально с диагностикой.
+            // (56 байт) — ошибка конфигурации; пара зависнет. Фатально.
             kernel_log!(
                 "fault: буфер ожидания обработчика {} меньше {} байт\n",
                 handler,
@@ -450,34 +538,47 @@ pub fn deliver_fault<A: ArchImplementation + 'static>(
             abort_fault(slot);
             return false;
         }
-        ClaimResult::CapsRejected => {
-            // CAPS-квота обработчика исчерпана — конфигурация обработчика
-            // непригодна для доставки фолта (fail-closed, как TooSmall).
+        transport::ClaimResult::CapsRejected => {
+            // Фолты capability не несут — сюда попасть нельзя (claim
+            // зовётся с caps_count = 0). Защитная диагностика.
             kernel_log!("fault: caps-квота обработчика {} исчерпана\n", handler);
             abort_fault(slot);
             return false;
         }
-        ClaimResult::NotWaiting => {
-            // Медленный путь: ящик; обработчик заберёт фолт следующим
-            // IPC_WAIT (take_pending, ветка is_fault — пометит доставку
-            // и НЕ будет будить отправителя: упавшая спит до REPLY).
-            match endpoint::enqueue_pending_fault(handler, faulting_task_cap, &msg) {
-                Ok(_) => {}
-                Err(_) => {
-                    kernel_log!(
-                        "fault: пул ящиков переполнен — фолт задачи {} потерян\n",
-                        faulting_task_cap
-                    );
-                    abort_fault(slot);
-                    return false;
-                }
+        transport::ClaimResult::NotWaiting => {
+            // Медленный путь: очередь обработчика (is_fault=true);
+            // обработчик заберёт фолт следующим IPC_WAIT
+            // (take_next → take_pending_fault — пометит доставку и НЕ
+            // будет будить отправителя: упавшая спит до REPLY).
+            let queued = {
+                let tasks = kctl.task_manager().lock();
+                transport::enqueue_sender(&tasks, handler, faulting_task_cap, true)
+            };
+            if queued.is_err() {
+                kernel_log!(
+                    "fault: очередь обработчика {} переполнена — фолт задачи {} потерян\n",
+                    handler,
+                    faulting_task_cap
+                );
+                abort_fault(slot);
+                return false;
             }
         }
     }
 
-    // Упавшая задача уходит в ожидание своего фолт-объекта. Порт после
-    // возврата true сохранит её кадр в TCB и уйдёт в планировщик.
-    let _ = lctl.scheduler_block_on_object(fault_wait_object(slot), WaitModel::OneShot);
+    // Упавшая задача уходит в ожидание своего фолт-объекта. Сон под
+    // предикатом «слот фолта жив»: FAULT_REPLY, случившийся до
+    // фактического сна, снимает слот — предикат отменяет сон, задача
+    // сразу возобновляется повтором упавшей инструкции (lost-wakeup
+    // закрыт; в прежнем варианте ответ в окне [wake обработчика .. сон
+    // упавшей] терялся навсегда). Порт после возврата true сохранит её
+    // кадр в TCB и уйдёт в планировщик (если предикат не отменил сон —
+    // тогда кадр вернётся в ring3 напрямую).
+    let _ = lctl.scheduler_block_on_object_if(
+        fault_wait_object(slot),
+        WaitModel::OneShot,
+        || !fault_slot_alive(faulting_task_cap),
+    );
     true
 }
 
@@ -497,6 +598,8 @@ mod tests {
         let payload = buf.get(16..16 + plen)?;
         Some((label, payload))
     }
+
+    const MSG: [u8; FAULT_MSG_LEN] = [0u8; FAULT_MSG_LEN];
 
     #[test]
     fn fault_msg_is_fixed_layout() {
@@ -536,7 +639,7 @@ mod tests {
         set_fault_handler(11, 30).expect("биндинг 11→30");
 
         // Слоты: begin → delivered → finish.
-        let slot = begin_fault(10, 30).expect("слот фолта");
+        let slot = begin_fault(10, 30, &MSG).expect("слот фолта");
         assert_eq!(fault_wait_object(slot), FAULT_OBJECT_BASE + slot);
         // Ответ до доставки — отказ; чужой обработчик — отказ.
         assert_eq!(finish_fault(10, 30), Err(FaultReplyError::NotDelivered));
@@ -549,8 +652,8 @@ mod tests {
         assert!(!mark_fault_delivered(10));
 
         // Смерть обработчика: упавшие будятся, биндинги снимаются.
-        let s1 = begin_fault(10, 30).expect("повторный фолт задачи 10");
-        let s2 = begin_fault(11, 30).expect("фолт задачи 11 (обработчик 30)");
+        let s1 = begin_fault(10, 30, &MSG).expect("повторный фолт задачи 10");
+        let s2 = begin_fault(11, 30, &MSG).expect("фолт задачи 11 (обработчик 30)");
         let wake = on_task_destroyed(30);
         assert_eq!(wake.len(), 2);
         assert!(wake.contains(&fault_wait_object(s1)));
@@ -559,7 +662,7 @@ mod tests {
         assert_eq!(fault_handler_of(11), None);
 
         // Смерть упавшей: слот молча освобождается, будить некого.
-        begin_fault(10, 99).expect("фолт задачи 10");
+        begin_fault(10, 99, &MSG).expect("фолт задачи 10");
         assert!(on_task_destroyed(10).is_empty());
         assert_eq!(finish_fault(10, 99), Err(FaultReplyError::NoFault));
 

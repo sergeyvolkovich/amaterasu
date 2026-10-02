@@ -45,8 +45,10 @@ pub const BODY_HDR: usize = BODY_HDR_WORDS * 8;
 /// (зеркало kernel_base::ipc::endpoint::MAX_MSG).
 pub const MAX_MSG: usize = 512;
 
-/// От кого ждать ([`wait`]): конкретный peer (closed wait) или кто
-/// угодно (open wait, L4 from-any). Замена сырого `WAIT_ANY = u64::MAX`.
+/// Цель ожидания ([`wait`]): кто угодно (open wait, L4 from-any) или
+/// слот cspace — TaskTCB (closed wait на пира) ИЛИ IpcGate (wait НА
+/// ГЕЙТЕ, право Recv; ядро различает по типу capability в слоте).
+/// Замена сырого `WAIT_ANY = u64::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFrom {
     /// Открытое ожидание: любое сообщение endpoint'а задачи.
@@ -125,10 +127,11 @@ pub const E_MSG_TOO_BIG: u64 = abi::SYSCALL_ERROR_FLAG | 100;
 
 /// Отправка сообщения (блокируется до приёма получателем — rendezvous).
 ///
-/// `slot` — слот cspace с TaskTCB-капабилити получателя; тело —
-/// {label, payload_len, payload} ([`BODY_HDR`]); caps — дескрипторы
-/// пересылки. `Err(SyscallError::Kernel(code))` — отказ транспорта
-/// (права, негабарит буфера получателя, смерть получателя).
+/// `slot` — слот cspace с TaskTCB-капабилити получателя (или IPC-гейта,
+/// см. [`crate::gate`]); тело — {label, payload_len, payload}
+/// ([`BODY_HDR`]); caps — дескрипторы пересылки.
+/// `Err(SyscallError::Kernel(code))` — отказ транспорта (права,
+/// негабарит буфера получателя, смерть получателя, таймаут).
 pub fn send(
     slot: Slot,
     label: u64,
@@ -136,6 +139,18 @@ pub fn send(
     caps: &[CapDesc],
 ) -> Result<(), SyscallError> {
     send_cost(slot, label, payload, caps).map(|_| ())
+}
+
+/// Отправка с дедлайном: rendezvous не состоялся к абсолютному тику
+/// ядра — E_TIMEOUT; 0 — ждать вечно.
+pub fn send_deadline(
+    slot: Slot,
+    label: u64,
+    payload: &[u8],
+    caps: &[CapDesc],
+    deadline: u64,
+) -> Result<(), SyscallError> {
+    send_cost_deadline(slot, label, payload, caps, deadline).map(|_| ())
 }
 
 /// Как [`send`], но успех возвращает ЧИСЛО БАЙТ, перенесённых ядром при
@@ -149,12 +164,24 @@ pub fn send_cost(
     payload: &[u8],
     caps: &[CapDesc],
 ) -> Result<u64, SyscallError> {
+    send_cost_deadline(slot, label, payload, caps, 0)
+}
+
+/// [`send_cost`] с дедлайном (ABI v3: IPC_SEND — 6 аргументов).
+pub fn send_cost_deadline(
+    slot: Slot,
+    label: u64,
+    payload: &[u8],
+    caps: &[CapDesc],
+    deadline: u64,
+) -> Result<u64, SyscallError> {
     if payload.len() > MAX_MSG {
         return Err(SyscallError::Kernel(E_MSG_TOO_BIG));
     }
-    // Тело собирается в стековый буфер и живёт до возврата из syscall —
-    // ядро копирует его в момент вызова (быстрый путь) или в свой
-    // почтовый ящик (медленный).
+    // Тело остаётся в ЭТОМ стековом буфере до rendezvous: медленный
+    // путь ядра копирует его из буфера ОТПРАВИТЕЛЯ (классический L4 —
+    // без почтовых ящиков), поэтому буфер обязан жить до пробуждения —
+    // он живёт до возврата из сисколла, что и есть rendezvous.
     let mut wire = [0u8; BODY_HDR + MAX_MSG];
     wire[0..8].copy_from_slice(&label.to_le_bytes());
     wire[8..BODY_HDR].copy_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -170,13 +197,14 @@ pub fn send_cost(
     }
 
     let code = unsafe {
-        syscall::syscall5(
+        syscall::syscall6(
             abi::nr::IPC_SEND,
             slot.raw(),
             wire.as_ptr() as u64,
             wire_len as u64,
             if n > 0 { caps_wire.as_ptr() as u64 } else { 0 },
             n as u64,
+            deadline,
         )
     };
     syscall::check(code)?;
@@ -243,6 +271,148 @@ pub fn wait_deadline<'a>(
             deadline,
         )
     };
+    syscall::check(code)?;
+    parse_received(buf).ok_or(SyscallError::Kernel(abi::result::E_INTERNAL))
+}
+
+/// Ответ клиенту, от которого принят последний запрос (IPC_REPLY).
+/// Адресат — неявный reply-адресат ядра: TaskTCB-капа клиента НЕ нужна.
+/// `caps` — дескрипторы пересылки (например, передача результата).
+pub fn reply(label: u64, payload: &[u8], caps: &[CapDesc]) -> Result<(), SyscallError> {
+    if payload.len() > MAX_MSG {
+        return Err(SyscallError::Kernel(E_MSG_TOO_BIG));
+    }
+    let mut wire = [0u8; BODY_HDR + MAX_MSG];
+    wire[0..8].copy_from_slice(&label.to_le_bytes());
+    wire[8..BODY_HDR].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    wire[BODY_HDR..BODY_HDR + payload.len()].copy_from_slice(payload);
+
+    let mut caps_wire = [0u64; MAX_CAPS * 3];
+    let n = caps.len().min(MAX_CAPS);
+    for (i, c) in caps.iter().take(n).enumerate() {
+        caps_wire[i * 3] = c.src_slot.raw();
+        caps_wire[i * 3 + 1] = c.dst_slot.raw();
+        caps_wire[i * 3 + 2] = c.rights.bits();
+    }
+    let code = unsafe {
+        syscall::syscall4(
+            abi::nr::IPC_REPLY,
+            wire.as_ptr() as u64,
+            (BODY_HDR + payload.len()) as u64,
+            if n > 0 { caps_wire.as_ptr() as u64 } else { 0 },
+            n as u64,
+        )
+    };
+    syscall::check(code).map(|_| ())
+}
+
+/// Создать IPC-гейт (seL4-эндпоинт): корневая капа (Clone|Mint|Send|
+/// Recv) в `slot`. Сервер минтит клиентам Send-копии (без Recv!), себе
+/// оставляет Recv. Возврат — id созданной капы.
+pub fn create_gate(slot: Slot) -> Result<u64, SyscallError> {
+    let code = unsafe { syscall::syscall1(abi::nr::IPC_CREATE_GATE, slot.raw()) };
+    syscall::check(code)
+}
+
+/// Атомарный L4-call: отправить запрос серверу и ждать ответ ОДНИМ
+/// сисколлом (IPC_CALL). Ответ доставляется В БУФЕР ЗАПРОСА (двунаправ-
+/// ленный буфер, seL4-стиль); сервер отвечает ipc::reply/reply_wait без
+/// TaskTCB-капы клиента. `slot` — TaskTCB-капа сервера (или гейт).
+/// `recv` — приёмное окно capability для ответа; `deadline` — 0 = вечно.
+pub fn call<'a>(
+    slot: Slot,
+    label: u64,
+    request: &[u8],
+    caps: &[CapDesc],
+    recv: RecvWindow,
+    deadline: u64,
+    buf: &'a mut [u8],
+) -> Result<Received<'a>, SyscallError> {
+    if request.len() > MAX_MSG || buf.len() < BODY_HDR + request.len() {
+        return Err(SyscallError::Kernel(abi::result::E_INVALID_ARG));
+    }
+    // ЗАПИСЬ запроса в buf: буфер ДВУНАПРАВЛЕННЫЙ — ядро доставит ответ
+    // в тот же буфер (msg_ptr == приёмный tgt; seL4-стиль регистров
+    // сообщения). Тело обязано жить до конца сисколла (rendezvous).
+    buf[0..8].copy_from_slice(&label.to_le_bytes());
+    buf[8..BODY_HDR].copy_from_slice(&(request.len() as u64).to_le_bytes());
+    buf[BODY_HDR..BODY_HDR + request.len()].copy_from_slice(request);
+
+    let mut caps_wire = [0u64; MAX_CAPS * 3];
+    let n = caps.len().min(MAX_CAPS);
+    for (i, c) in caps.iter().take(n).enumerate() {
+        caps_wire[i * 3] = c.src_slot.raw();
+        caps_wire[i * 3 + 1] = c.dst_slot.raw();
+        caps_wire[i * 3 + 2] = c.rights.bits();
+    }
+
+    // Дескриптор приёма ответа (4×u64): capacity буфера, окно caps,
+    // дедлайн.
+    let mut desc_wire = [
+        buf.len() as u64,
+        recv.base.raw(),
+        recv.count,
+        deadline,
+    ];
+
+    let code = unsafe {
+        syscall::syscall6(
+            abi::nr::IPC_CALL,
+            slot.raw(),
+            buf.as_ptr() as u64,
+            (BODY_HDR + request.len()) as u64,
+            if n > 0 { caps_wire.as_ptr() as u64 } else { 0 },
+            n as u64,
+            desc_wire.as_mut_ptr() as u64,
+        )
+    };
+    syscall::check(code)?;
+    // Ответ уже в buf: разбор тем же parse_received.
+    parse_received(buf).ok_or(SyscallError::Kernel(abi::result::E_INTERNAL))
+}
+
+/// reply + следующий wait одним сисколлом (IPC_REPLY_WAIT, классический
+/// L4 'reply and wait' — основной цикл RPC-сервера). Ошибка reply
+/// прерывает операцию. Успех — принятое сообщение (следующий запрос).
+/// ОГРАНИЧЕНИЕ ABI: у REPLY_WAIT нет окна приёма capability (6
+/// арг-регистров исчерпаны) — сообщения с map items отклоняются
+/// отправителям; серверам, принимающим caps в запросах, — reply + wait
+/// по отдельности.
+pub fn reply_wait<'a>(
+    label: u64,
+    payload: &[u8],
+    caps: &[CapDesc],
+    from: WaitFrom,
+    deadline: u64,
+    buf: &'a mut [u8],
+) -> Result<Received<'a>, SyscallError> {
+    if payload.len() > MAX_MSG || buf.len() < HEADER_WORDS * 8 {
+        return Err(SyscallError::Kernel(abi::result::E_INVALID_ARG));
+    }
+    let mut wire = [0u8; BODY_HDR + MAX_MSG];
+    wire[0..8].copy_from_slice(&label.to_le_bytes());
+    wire[8..BODY_HDR].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    wire[BODY_HDR..BODY_HDR + payload.len()].copy_from_slice(payload);
+
+    let mut caps_wire = [0u64; MAX_CAPS * 3];
+    let n = caps.len().min(MAX_CAPS);
+    for (i, c) in caps.iter().take(n).enumerate() {
+        caps_wire[i * 3] = c.src_slot.raw();
+        caps_wire[i * 3 + 1] = c.dst_slot.raw();
+        caps_wire[i * 3 + 2] = c.rights.bits();
+    }
+    let code = unsafe {
+        syscall::syscall6(
+            abi::nr::IPC_REPLY_WAIT,
+            wire.as_ptr() as u64,
+            (BODY_HDR + payload.len()) as u64,
+            if n > 0 { caps_wire.as_ptr() as u64 } else { 0 },
+            n as u64,
+            from.raw(),
+            deadline,
+        )
+    };
+    // (окно приёма не передаётся — см. комментарий к сигнатуре)
     syscall::check(code)?;
     parse_received(buf).ok_or(SyscallError::Kernel(abi::result::E_INTERNAL))
 }

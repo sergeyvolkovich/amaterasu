@@ -14,8 +14,17 @@
   (Reschedule / Halt / синхронный TLB-shootdown с поколениями и acked).
 - **FPU eager FXSAVE/FXRSTOR**: x87/MMX/XMM переживают сисколлы, IRQ, фолты
   и переключения задач; новые задачи стартуют с FCW=0x037F, MXCSR=0x1F80.
-- **IPC**: синхронный rendezvous (open/closed wait, дедлайны), пересылка
-  capability, shm-регионы, пул IPC-памяти.
+- **IPC (L4-транспорт, ABI v3)**: TCB-центричный rendezvous в стиле
+  Лидтке — почтовых ящиков в ядре нет, сообщение остаётся в буфере
+  заблокированного отправителя, получатель копирует напрямую через его
+  умап; lost-wakeup-free сон (предикаты под WAKE_LOCK); open/closed
+  wait, дедлайны на SEND и WAIT (E_TIMEOUT ставится будильщиком);
+  **RPC**: IPC_REPLY / IPC_CALL (send+wait атомарно, ответ в буфер
+  запроса) / IPC_REPLY_WAIT с неявным reply-адресатом (сервер отвечает
+  клиенту БЕЗ TaskTCB-капы); **IPC-гейты** (seL4-эндпоинты): клиенты
+  шлют в канал (Send), сервер ждёт из канала (Recv), FIFO-очереди;
+  пересылка capability (map items + приёмное окно получателя), shm-
+  регионы, пул IPC-памяти.
 - **IOMMU**: DMA-домены, PASID-пространства (SVA — собственные указатели
   устройства в DMA), DMA-buf из памяти вызывающего с пином региона.
 - **Фолт-эндпоинты**: фолты ring3 (#DE/#BP/#OF/#UD/#GP/#PF/#MF/#AC/#XF)
@@ -29,7 +38,7 @@
 
 | Крейт | Роль |
 |---|---|
-| `src/kernel_base` | архитектурно-независимое ядро: capability, TCB, трейты памяти/IOMMU/IRQ/IPI |
+| `src/kernel_base` | архитектурно-независимое ядро: capability (вкл. IpcGate), TCB+IPC-состояние, трейты памяти/IOMMU/IRQ/IPI |
 | `src/kernel_x86` | x86_64: страничные таблицы, LAPIC/IPI, IRQ-диспетчер, entry-стабы cswitch |
 | `src/kernel_sched` | планировщик |
 | `src/kernel_exec` | exec-домен: ELF, spawn, auxv |
@@ -54,6 +63,29 @@ qemu-system-x86_64 -cdrom cintos.iso
 (debug/release), `LIMINE_BIN`, `QEMU_BIN_DIR`. Порядок boot-модулей — ростер
 серверов: слоты peer-TCB выдаются как `2+i` (init, IPC-пара, таймер, shm-пара,
 C-демо, mt-испытатели, fault-пара).
+
+## IPC: сисколлы и модель
+
+| NR | Сисколл | Суть |
+|---|---|---|
+| 10 | `IPC_SEND` | (slot, msg, caps, **deadline**) — rendezvous; слот → TaskTCB (прямая) или IpcGate (в канал) |
+| 11 | `IPC_WAIT` | (target, buf, окно caps, deadline) — ANY / TaskTCB (closed) / IpcGate (право Recv) |
+| 12 | `IPC_REPLY` | ответ клиенту последнего запроса (неявный reply_to; без TaskTCB-капы клиента) |
+| 13 | `IPC_CALL` | атомарные send+wait; ответ — в буфер запроса; параметры приёма — desc {capacity, recv_base, recv_count, deadline} |
+| 14 | `IPC_CREATE_GATE` | создать гейт: корневая капа Clone\|Mint\|Send\|Recv |
+| 15 | `IPC_REPLY_WAIT` | reply + следующий wait (цикл RPC-сервера) |
+
+Ключевые инварианты:
+- **Без буферизации в ядре**: SendSpec живёт в TCB отправителя, тело —
+  в его userspace (стабильно, пока он спит); медленный путь — прямая
+  копия отправитель→получатель через два умапа.
+- **Lost-wakeup закрыт**: сон через `scheduler_block_on_object_if` —
+  предикат (claim/очередь/seq) проверяется под `WAKE_LOCK`.
+- **Таймауты**: после настоящего сна код ставит будильщик — тик дедлайна
+  зовёт резолвер (патч RAX=E_TIMEOUT + самоочистка из очередей/гейтов);
+  доставка в тот же тик старше таймаута.
+- **Права гейта**: `Recv` (1<<3) — ждать из канала; клиентам минтится
+  Send без Recv (не перехватывают чужие запросы).
 
 ## Тесты
 

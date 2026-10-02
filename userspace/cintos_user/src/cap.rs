@@ -31,8 +31,8 @@ use crate::syscall::{self, SyscallError};
 // ─── Права ──────────────────────────────────────────────────────────────────
 
 /// Прямые права DirectCapability-капы (wire-биты ядра: Clone=1,
-/// Mint=2, Send=4). Mint не расширяет: копия ⊆ источника, иначе
-/// E_RIGHTS_EXCEEDED.
+/// Mint=2, Send=4, Recv=8). Mint не расширяет: копия ⊆ источника,
+/// иначе E_RIGHTS_EXCEEDED.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rights(u64);
 
@@ -41,14 +41,16 @@ impl Rights {
     pub const CLONE: Self = Self(1 << 0);
     /// Mint: производная копия с сужением (CAP_MINT).
     pub const MINT: Self = Self(1 << 1);
-    /// Send: пересылка map item'ом по IPC.
+    /// Send: пересылка map item'ом по IPC; отправка в TaskTCB/гейт.
     pub const SEND: Self = Self(1 << 2);
-    /// Полный набор (как у bootstrap-кап).
-    pub const ALL: Self = Self(0b111);
+    /// Recv: ожидание из IPC-гейта (wait на гейт-капе).
+    pub const RECV: Self = Self(1 << 3);
+    /// Полный набор (как у bootstrap-кап и корневых гейт-кап).
+    pub const ALL: Self = Self(0b1111);
 
     /// Из wire-битов (граница C-ABI/auxv; неизвестные биты маскируются).
     pub const fn from_bits(bits: u64) -> Self {
-        Self(bits & 0b111)
+        Self(bits & 0b1111)
     }
     pub const fn bits(self) -> u64 {
         self.0

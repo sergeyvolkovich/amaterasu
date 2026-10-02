@@ -43,6 +43,8 @@ extern "C" {
 #define NOMAD_CAP_CLONE  0x1
 #define NOMAD_CAP_MINT   0x2
 #define NOMAD_CAP_SEND   0x4
+/* Recv: ожидание из IPC-гейта (wait на гейт-капе). */
+#define NOMAD_CAP_RECV   0x8
 
 /* Буфер приёма IPC (байт). */
 #define NOMAD_IPC_BUF_LEN 1024
@@ -109,6 +111,40 @@ uint64_t nomad_ipc_wait(uint64_t from, uint64_t recv_base, uint64_t recv_count,
                        uint8_t *buf, uint64_t buf_len);
 
 /* Разбор буфера после успешного wait (указатели живут в buf). */
+/* IPC_REPLY: ответ клиенту, от которого принят последний запрос
+ * (неявный reply-адресат ядра; TaskTCB-капа клиента не нужна).
+ * Возврат: 0 — доставлено; иначе код ошибки. */
+uint64_t nomad_ipc_reply(uint64_t label,
+                         const uint8_t *payload, uint64_t payload_len,
+                         const NomadCapDesc *caps, uint64_t caps_len);
+
+/* IPC_CREATE_GATE: создать IPC-гейт (seL4-эндпоинт) в слоте dst_slot
+ * вызывающего (корневая капа Clone|Mint|Send|Recv). Возврат: id капы
+ * (0 валиден — успех/ошибка по старшему биту, см. abi). */
+uint64_t nomad_ipc_create_gate(uint64_t dst_slot);
+
+/* IPC_CALL: атомарные send+wait (L4 call). Запрос собирается в buf
+ * ({label, payload_len, payload} — buf ДВУНАПРАВЛЕННЫЙ: туда же ядро
+ * кладёт ответ), recv_base/recv_count — окно caps ответа, deadline —
+ * 0 = вечно. Возврат: 0 — ответ в buf (разбор nomad_ipc_msg_*). */
+uint64_t nomad_ipc_call(uint64_t slot,
+                        uint8_t *buf, uint64_t buf_len,
+                        uint64_t label,
+                        const uint8_t *request, uint64_t request_len,
+                        const NomadCapDesc *caps, uint64_t caps_len,
+                        uint64_t recv_base, uint64_t recv_count,
+                        uint64_t deadline);
+
+/* IPC_REPLY_WAIT: reply + следующий wait (цикл RPC-сервера). Ответ —
+ * как в nomad_ipc_reply; затем wait (from — NOMAD_IPC_WAIT_ANY / слот
+ * TaskTCB / слот IpcGate). Окно приёма caps в ABI не входит — сообщения
+ * с map items отклоняются отправителям. Возврат: 0 — запрос в buf. */
+uint64_t nomad_ipc_reply_wait(uint64_t label,
+                              const uint8_t *payload, uint64_t payload_len,
+                              const NomadCapDesc *caps, uint64_t caps_len,
+                              uint64_t from, uint64_t deadline,
+                              uint8_t *buf, uint64_t buf_len);
+
 uint64_t nomad_ipc_msg_sender(const uint8_t *buf, uint64_t buf_len);
 uint64_t nomad_ipc_msg_label(const uint8_t *buf, uint64_t buf_len);
 const uint8_t *nomad_ipc_msg_payload(const uint8_t *buf, uint64_t buf_len,

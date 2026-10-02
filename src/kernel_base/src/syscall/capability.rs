@@ -133,6 +133,16 @@ pub struct SyscallCapCreateFaultEndpoint {
     dst_slot: u64,
 }
 
+/// IPC_CREATE_GATE(14):capability-объект «IPC-гейт» (seL4-эндпоинт) в
+/// слоте cspace ВЫЗЫВАЮЩЕГО. Корневые права — все (Clone|Mint|Send|Recv):
+/// сервер минтит клиентам Send-копии (Recv не выдаёт — клиенты не
+/// перехватывают чужие запросы), себе оставляет Recv для ожидания.
+#[derive(syscall_macros::SyscallArguments)]
+pub struct SyscallIpcCreateGate {
+    /// Слот cspace текущей задачи под корневую капу гейта.
+    dst_slot: u64,
+}
+
 /// Mint: производная копия с правами ⊆ источника, под мембрану слота
 /// получателя (новая граница авторитета).
 #[derive(SyscallArguments)]
@@ -665,6 +675,55 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
             args.dst_slot,
             CapabilityObject::new_fault_endpoint(handler_zygote, current),
         )
+    }
+}
+
+/// IPC_CREATE_GATE(14): создаёт гейт (слот таблицы ipc::gate) и корневую
+/// капу в cspace вызывающего. Права: CAP_MANAGE (создание объектов) +
+/// IPC_SEND (компетенция IPC-каналов).
+impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallIpcCreateGate> {
+    const SYSCALL_ID: usize = 14;
+    type Args = SyscallIpcCreateGate;
+    type Umap = A::Umap;
+
+    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+
+        let mut access = self.0.permission_backend.lock();
+
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::IPC_SEND)
+            .is_err()
+        {
+            return res::E_RIGHTS_DENIED;
+        }
+
+        let Some(creator_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом GTcb не уничтожается.
+        let creator = unsafe { creator_ptr.as_ref() };
+
+        // 1. Слот таблицы гейтов (до капы — при отказе ничего не создано).
+        let Some(gate_id) = crate::ipc::gate::gate_alloc() else {
+            return res::E_IDS_EXHAUSTED;
+        };
+
+        // 2. Объект + корневая капа (все права: Clone|Mint|Send|Recv).
+        let cap_id = create_descriptor_capability::<A>(
+            &mut access,
+            creator,
+            current,
+            args.dst_slot,
+            CapabilityObject::IpcGate { gate_id },
+        );
+        if crate::traits::syscall::syscall_result::is_error(cap_id) {
+            crate::ipc::gate::gate_free(gate_id);
+            return cap_id;
+        }
+        cap_id
     }
 }
 

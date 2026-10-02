@@ -2,27 +2,40 @@
 //!
 //! Ядро — ТОЛЬКО транспорт: payload непрозрачен (сериализация —
 //! юзерспейс: тело {label, payload_len, payload}, см. cintos_user::ipc),
-//! capability пересылаются явными дескрипторами ([`CapItem`], аналог L4 map
-//! items). Rendezvous-логика — ipc::endpoint.
+//! capability пересылаются явными дескрипторами ([`CapItem`], аналог L4
+//! map items). Rendezvous-состояние — в TCB участников (task::
+//! ipc_state), оркестрация — ipc::transport. ПОЧТОВЫХ ЯЩИКОВ НЕТ:
+//! заблокированный отправитель держит сообщение в СВОЁМ буфере,
+//! получатель копирует напрямую через его умап (классический L4).
 //!
-//! ABI:
-//!   IPC_SEND(10): (slot, msg_ptr, msg_size, caps_ptr, caps_count)
+//! ABI (v3):
+//!   IPC_SEND(10): (slot, msg_ptr, msg_size, caps_ptr, caps_count,
+//!                  deadline)
 //!     slot — слот cspace ОТПРАВИТЕЛЯ с TaskTCB-капабилити получателя
 //!     (право Send); msg — непрозрачное тело; caps — #[repr(C)] массив
-//!     {src_slot, dst_slot, rights} × caps_count (src — слот отправителя;
-//!     dst_slot ИГНОРИРУЕТСЯ ядром — см. IPC_WAIT).
-//!   IPC_WAIT(11): (from_slot, tgt_ptr, tgt_capacity, recv_base, recv_count)
-//!     from_slot — слот с TaskTCB отправителя (closed wait) или
-//!     IPC_WAIT_ANY (open wait); tgt — буфер приёма [заголовок|caps|msg];
-//!     recv_base/recv_count — ПРИЁМНОЕ ОКНО capability получателя: ядро
-//!     кладёт i-ю capability сообщения в слот recv_base + i (seL4-стиль:
-//!     слот выбирает получатель, а не отправитель). recv_count = 0 —
-//!     сообщения с map items отклоняются отправителю.
+//!     {src_slot, dst_slot, rights} × caps_count (dst_slot ИГНОРИРУЕТСЯ
+//!     ядром — см. IPC_WAIT); deadline — абсолютный тик (0 — вечно),
+//!     по истечении E_TIMEOUT с самоочисткой из очереди получателя.
+//!   IPC_WAIT(11): (target, tgt_ptr, tgt_capacity, recv_base,
+//!                  recv_count, deadline)
+//!     target — IPC_WAIT_ANY (open wait) или слот cspace с TaskTCB
+//!     отправителя (closed wait); tgt — буфер приёма
+//!     [заголовок|слоты caps|тело]; recv_base/recv_count — ПРИЁМНОЕ
+//!     ОКНО capability (seL4-стиль: слот выбирает получатель).
 //!
-//! Блокировка: send без ждущего получателя спит до доставки; wait без
-//! ждущего отправителя спит до доставки. Ошибка доставки спящему
-//! отправителю пишется перезаписью RAX его сохранённого кадра
-//! (TCB::patch_resume_rax) ДО пробуждения.
+//! Блокировка (lost-wakeup-free): сон — через lctl::
+//! scheduler_block_on_object_if, предикат проверяется ПОД WAKE_LOCK —
+//! доставка, случившаяся между проверкой и сном, не теряется (предикат
+//! её видит и отменяет сон). Ошибка доставки спящему отправителю
+//! пишется перезаписью RAX его сохранённого кадра (TCB::
+//! patch_resume_result) ДО пробуждения; для гонки «не успел уснуть»
+//! исход дублируется в ipc.send_rax (см. task::ipc_state).
+//!
+//! Таймауты: после НАСТОЯЩЕГО сна хендлер НЕ перезапускается — код
+//! E_TIMEOUT ставит будильщик: тик дедлайна зовёт зарегистрированный
+//! резолвер (deadline::set_timeout_resolver — см. kernel_limine),
+//! который патчит кадр и делает самоочистку; доставка в тот же тик
+//! старше таймаута (резолвер видит её по IPC-состоянию).
 
 use core::marker::PhantomData;
 
@@ -35,13 +48,15 @@ use crate::{
     ipc::{
         cap_transfer::{CapTransferError, CapTransferSpec, transfer_capabilities},
         endpoint::{
-            self, CapItem, ClaimResult, HEADER_WORDS, IPC_WAIT_ANY, MAILBOX_SLOTS, MAX_CAPS,
-            MAX_MSG, PendingDelivery, ReadyEndpoint,
+            self, CapItem, HEADER_WORDS, MAX_CAPS, MAX_MSG,
         },
+        transport,
     },
+    task::ipc_state::{RecvSpec, SendSpec},
     task::tcb::GTcb,
     traits::{
         ArchImplementation,
+        memory::MemoryInterfaceUserspace,
         scheduller::WaitModel,
         syscall::{SyscallDomain, syscall_result as res},
     },
@@ -57,13 +72,17 @@ pub struct SyscallIPCSend {
     /// ВА массива дескрипторов пересылки (3×u64 на capability) или 0.
     caps_ptr: u64,
     caps_count: u64,
+    /// Абсолютный дедлайн в тиках stats::global_ticks (0 — ждать
+    /// вечно). По истечении E_TIMEOUT; сообщение, доставленное в тот же
+    /// тик, старше таймаута (доставка побеждает).
+    deadline: u64,
 }
 
 #[derive(SyscallArguments)]
 pub struct SyscallIPCWait {
     /// Слот с TaskTCB отправителя (closed wait) или IPC_WAIT_ANY.
-    from_slot: u64,
-    /// ВА буфера приёма: [заголовок 3 слова][слоты caps][payload].
+    target: u64,
+    /// ВА буфера приёма: [заголовок 3 слова][слоты caps][тело].
     tgt_ptr: u64,
     /// Ёмкость буфера в байтах.
     tgt_capacity: u64,
@@ -71,10 +90,7 @@ pub struct SyscallIPCWait {
     recv_base: u64,
     /// Размер приёмного окна в слотах (0 — capability не принимать).
     recv_count: u64,
-    /// Абсолютный дедлайн в тиках stats::global_ticks (0 — ждать
-    /// вечно). По истечении WAIT возвращает E_TIMEOUT; сообщение,
-    /// доставленное в тот же тик, старше таймаута. Дедлайн в БУДУЩЕМ
-    /// обязателен: прошедший — мгновенный E_TIMEOUT.
+    /// Абсолютный дедлайн (0 — ждать вечно); E_TIMEOUT по истечении.
     deadline: u64,
 }
 
@@ -109,6 +125,68 @@ fn transfer_code(e: CapTransferError) -> u64 {
 
 /// Результат резолва слота cspace: глобальный id задачи-цели + её GTcb.
 type ResolvedTask<Umap> = (u64, core::ptr::NonNull<GTcb<Umap>>);
+
+/// Цель IPC-операции по слоту cspace: прямая отправка задаче (TaskTCB-
+/// капа, право Send) или отправка в гейт (IpcGate-капа, право Send).
+pub(crate) enum IpcTarget<Umap: MemoryInterfaceUserspace> {
+    Task(u64, core::ptr::NonNull<GTcb<Umap>>),
+    Gate(u64),
+}
+
+/// Разрешение слота cspace в цель SEND: TaskTCB (право Send) или
+/// IpcGate (право Send). Гейт-вариант — seL4-стиль: клиент шлёт В
+/// КАНАЛ, а не задаче.
+pub(crate) fn resolve_send_target<A: ArchImplementation>(
+    tasks: &crate::task::TaskManager<A::Umap>,
+    current_gtcb: &GTcb<A::Umap>,
+    slot: u64,
+) -> Result<IpcTarget<A::Umap>, u64> {
+    let resolved = {
+        let caps = current_gtcb.capspace().lock();
+        let record = caps.get(&slot).ok_or(res::E_SLOT_EMPTY)?;
+        let sendable = record.check_send().map_err(|_| res::E_CAP_REVOKED)?;
+        if !sendable.contains(crate::access::capability::DirectCapabilityRights::Send) {
+            return Err(res::E_RIGHTS_DENIED);
+        }
+        let (object, _) = record.resolve().map_err(|_| res::E_CAP_REVOKED)?;
+        // Гейт: вернуть id немедленно (копия id — u64).
+        if let Some(gate_id) = object.resolve_ipc_gate() {
+            return Ok(IpcTarget::Gate(gate_id));
+        }
+        object.resolve_task_tcb().ok_or(res::E_INVALID_ARG)?
+    };
+    let task_cap = tasks
+        .task_cap_id_by_gtcb(resolved)
+        .ok_or(res::E_NOT_FOUND)?;
+    Ok(IpcTarget::Task(task_cap, resolved))
+}
+
+/// Разрешение слота cspace в цель WAIT: IPC_WAIT_ANY (уже отфильтровано
+/// вызывающим), TaskTCB (closed wait; право Send — резолв пира) или
+/// IpcGate (ожидание НА ГЕЙТЕ; право Recv — приём из канала).
+pub(crate) fn resolve_wait_target<A: ArchImplementation>(
+    tasks: &crate::task::TaskManager<A::Umap>,
+    current_gtcb: &GTcb<A::Umap>,
+    slot: u64,
+) -> Result<(Option<u64>, Option<u64>), u64> {
+    // Возврат: (from-фильтр, gate-id).
+    let caps = current_gtcb.capspace().lock();
+    let record = caps.get(&slot).ok_or(res::E_SLOT_EMPTY)?;
+    let (object, rights) = record.resolve().map_err(|_| res::E_CAP_REVOKED)?;
+    if let Some(gate_id) = object.resolve_ipc_gate() {
+        if !rights.contains(crate::access::capability::DirectCapabilityRights::Recv) {
+            return Err(res::E_RIGHTS_DENIED);
+        }
+        return Ok((None, Some(gate_id)));
+    }
+    // TaskTCB — closed wait: право Send (как в resolve_task_slot).
+    if !rights.contains(crate::access::capability::DirectCapabilityRights::Send) {
+        return Err(res::E_RIGHTS_DENIED);
+    }
+    let gtcb = object.resolve_task_tcb().ok_or(res::E_INVALID_ARG)?;
+    let task_cap = tasks.task_cap_id_by_gtcb(gtcb).ok_or(res::E_NOT_FOUND)?;
+    Ok((Some(task_cap), None))
+}
 
 /// Разрешение слота cspace текущей задачи в TaskTCB-цель.
 /// pub(crate): используется и фолт-доменом (FAULT_SET_ENDPOINT адресует
@@ -177,13 +255,16 @@ fn read_cap_items<A: ArchImplementation>(
 /// сообщения, пропускается (дубли исключены).
 ///
 /// Возвращает Err(E_SLOT_OCCUPIED), если свободных слотов окна не хватает.
-fn assign_recv_slots<A: ArchImplementation>(
+fn assign_recv_slots_window<A: ArchImplementation>(
     access: &crate::access::AccessManager<A::Umap>,
     receiver_task_cap: u64,
     caps_count: usize,
     recv_base: u64,
     recv_count: usize,
 ) -> Result<HVec<u64, MAX_CAPS>, u64> {
+    if caps_count == 0 {
+        return Ok(HVec::new());
+    }
     let receiver_ptr = access
         .get_task_tcb(receiver_task_cap)
         .ok_or(res::E_NOT_FOUND)?;
@@ -215,25 +296,25 @@ fn assign_recv_slots<A: ArchImplementation>(
 /// заголовка), ошибка — код сисколла.
 ///
 /// Слоты получателя назначает ЯДРО из приёмного окна получателя
-/// ([`assign_recv_slots`], «первый свободный»): поле dst_slot
+/// ([`assign_recv_slots_window`], «первый свободный»): поле dst_slot
 /// дескриптора отправителя не адресует cspace получателя.
 fn transfer_delivery_caps<A: ArchImplementation>(
     access: &crate::access::AccessManager<A::Umap>,
     sender_task_cap: u64,
     receiver_task_cap: u64,
-    delivery: &PendingDelivery,
+    caps: &[CapItem],
     recv_base: u64,
     recv_count: usize,
 ) -> Result<HVec<u64, MAX_CAPS>, u64> {
-    let chosen = assign_recv_slots::<A>(
+    let chosen = assign_recv_slots_window::<A>(
         access,
         receiver_task_cap,
-        delivery.caps_count,
+        caps.len(),
         recv_base,
         recv_count,
     )?;
     let mut specs: HVec<CapTransferSpec, MAX_CAPS> = HVec::new();
-    for (i, c) in delivery.caps.iter().take(delivery.caps_count).enumerate() {
+    for (i, c) in caps.iter().enumerate() {
         let _ = specs.push(CapTransferSpec {
             src_slot: c.src_slot,
             dst_slot: chosen[i],
@@ -249,48 +330,211 @@ fn transfer_delivery_caps<A: ArchImplementation>(
     }
 }
 
-/// Патчит RAX спящего отправителя и будит его (ошибка доставки).
+/// Патчит RAX спящего отправителя, ставит отметку для гонки «не успел
+/// уснуть» и будит его (ошибка доставки). Вызывать с УЖЕ захваченным
+/// task_manager-локом (guard передаётся ссылкой — повторный захват
+/// внутри означал бы дедлок).
 fn wake_sender_error<A: ArchImplementation>(
-    kctl: &'static KernelCTL<A>,
+    tasks: &crate::task::TaskManager<A::Umap>,
     sender_task_cap: u64,
-    wait_object: usize,
     code: u64,
+    resume_word: usize,
     lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
 ) {
-    let tasks = kctl.task_manager().lock();
     if let Some(tcb) = tasks.get_tcb(sender_task_cap) {
-        tcb.patch_resume_result(A::RESUME_RESULT_WORD, code);
+        tcb.patch_resume_result(resume_word, code);
     }
-    drop(tasks);
-    lctl.scheduler_release_object(wait_object);
+    transport::fail_sender(tasks, sender_task_cap, code);
+    lctl.scheduler_release_object(endpoint::sender_wait_object(sender_task_cap));
 }
 
 /// Будит отправителя успешной доставки (слово результата в его кадре
-/// уже ОК) и учитывает статистику доставки. Для ФОЛТ-доставок не
-/// звать: отправитель (упавшая задача) спит на fault-объекте (см.
-/// fault::mark_fault_delivered).
+/// уже ОК — патчить нечего; для гонки «не успел уснуть» send_rax
+/// остаётся None = успех) и учитывает статистику доставки. Для ФОЛТ-
+/// доставок не звать: отправитель (упавшая задача) спит на fault-
+/// объекте (см. fault::mark_fault_delivered).
 fn wake_sender_ok<A: ArchImplementation>(
-    kctl: &'static KernelCTL<A>,
+    tasks: &crate::task::TaskManager<A::Umap>,
     sender_task_cap: u64,
     lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
-    wait_object: usize,
 ) {
-    {
-        let tasks = kctl.task_manager().lock();
-        crate::task::stats::count_ipc_sent_id(&tasks, sender_task_cap);
-    }
-    lctl.scheduler_release_object(wait_object);
+    crate::task::stats::count_ipc_sent_id(tasks, sender_task_cap);
+    lctl.scheduler_release_object(endpoint::sender_wait_object(sender_task_cap));
 }
 
-/// Обрабатывает отброшенные (негабарит/неотображаемые) сообщения:
-/// авторам — ошибка в кадр и пробуждение.
-fn handle_dropped<A: ArchImplementation>(
-    kctl: &'static KernelCTL<A>,
-    dropped: &HVec<(u64, usize), MAILBOX_SLOTS>,
+/// Исход изъятия кандидата из очереди (быстрый путь WAIT).
+enum TakeOutcome {
+    /// Обычное сообщение доставлено в буфер получателя.
+    Delivered,
+    /// Фолт-сообщение доставлено (отправителя не будить).
+    DeliveredFault,
+    /// Кандидатов (под фильтр) больше нет.
+    Empty,
+}
+
+/// Быстрый путь WAIT: разбирает очередь отправителей текущей задачи-
+/// получателя. Вызывать с УЖЕ захваченным task_manager-локом (tasks —
+/// deref guard'а; wakeup-хелперы локов НЕ берут). Каждый кандидат:
+/// изъятие SendSpec (или фолт-слота) → проверка вместимости →
+/// пересылка capability → копия тела из буфера ОТПРАВИТЕЛЯ (его умап;
+/// буфер стабильна, пока он спит) → wake. Негабарит/
+/// неудачная пересылка — ошибка отправителю (патч RAX + wake), цикл
+/// продолжается со следующим.
+fn take_next<A: ArchImplementation>(
     lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
-) {
-    for (sender, wait_object) in dropped.iter() {
-        wake_sender_error(kctl, *sender, *wait_object, res::E_INVALID_ARG, lctl);
+    access: &crate::access::AccessManager<A::Umap>,
+    tasks: &crate::task::TaskManager<A::Umap>,
+    me: u64,
+    my_umap: &A::Umap,
+    from: Option<u64>,
+    gate: Option<u64>,
+    tgt_va: usize,
+    tgt_capacity: usize,
+    recv_base: u64,
+    recv_count: usize,
+    resume_word: usize,
+) -> TakeOutcome {
+    loop {
+        // Кандидат — изъятие: гейт-очередь (waiting НА ГЕЙТЕ) или
+        // собственная очередь отправителей (прямой эндпоинт).
+        let candidate = if let Some(gate_id) = gate {
+            crate::ipc::gate::gate_pop_sender(gate_id)
+                .map(|id| (id, false))
+                .or_else(|| transport::pop_next_candidate(tasks, me, from))
+        } else {
+            transport::pop_next_candidate(tasks, me, from)
+        };
+        let Some((sender_id, is_fault)) = candidate else {
+            return TakeOutcome::Empty;
+        };
+        if is_fault {
+            // Фолт-кандидат: тело — в слоте активного фолта (ядро),
+            // НЕ в userspace упавшей задачи. Отправителя не будим —
+            // он спит на fault-объекте до FAULT_REPLY.
+            let Some(msg) = crate::ipc::fault::take_pending_fault(tasks, sender_id, me) else {
+                // Слот уже нет (обработчик перезаписан/фолт снят) —
+                // запись очереди протухла, кандидат пропускается.
+                continue;
+            };
+            let need = endpoint::delivery_bytes(0, msg.len());
+            if need > tgt_capacity
+                || !endpoint::check_user_region(my_umap, tgt_va, need)
+            {
+                // Буфер мал: фолт НЕ отбрасывается никогда (потеря =
+                // вечное зависание упавшей) — вернём кандидата в голову
+                // очереди и выйдем: подойдёт следующий wait с большим
+                // буфером (см. ipc::fault).
+                crate::ipc::fault::untake_pending_fault(tasks, sender_id, me);
+                if let Some(gate_id) = gate {
+                    let _ = crate::ipc::gate::gate_push_sender(gate_id, sender_id);
+                } else {
+                    transport::requeue_candidate(tasks, me, sender_id, true);
+                }
+                return TakeOutcome::Empty;
+            }
+            if !endpoint::write_delivery_header_and_body(
+                my_umap,
+                tgt_va,
+                sender_id,
+                &msg,
+                &[],
+            ) {
+                // Отображение схлопнулось между проверкой и записью —
+                // фолт возвращается в слот (см. выше — не теряем).
+                crate::ipc::fault::untake_pending_fault(tasks, sender_id, me);
+                if let Some(gate_id) = gate {
+                    let _ = crate::ipc::gate::gate_push_sender(gate_id, sender_id);
+                } else {
+                    transport::requeue_candidate(tasks, me, sender_id, true);
+                }
+                return TakeOutcome::Empty;
+            }
+            crate::ipc::fault::mark_fault_delivered(sender_id);
+            crate::task::stats::count_ipc_recv_id(tasks, me);
+            return TakeOutcome::DeliveredFault;
+        }
+        // Обычный отправитель: изъять его SendSpec (он спит — параметры
+        // стабильны; изъятие делает его «в обработке»).
+        let Some(spec) = transport::take_send_state(tasks, sender_id) else {
+            // Защита: запись без SendSpec (уже изъят другим SMP-путём —
+            // невозможно по построению, но не зависаем) — пропуск.
+            continue;
+        };
+        let need = endpoint::delivery_bytes(spec.caps_count, spec.msg_len);
+        if need > tgt_capacity || !endpoint::check_user_region(my_umap, tgt_va, need) {
+            // Негабарит/неотображаемо — НЕ доставимо никогда (буфер не
+            // вырастет в этом wait): отправителю ошибка, следующий
+            // кандидат.
+            wake_sender_error::<A>(tasks, sender_id, res::E_INVALID_ARG, resume_word, lctl);
+            continue;
+        }
+        // Пересылка capability (слоты — из МОЕГО приёмного окна).
+        let caps: &[CapItem] = &spec.caps[..spec.caps_count];
+        let dst_slots = match transfer_delivery_caps::<A>(
+            access,
+            sender_id,
+            me,
+            caps,
+            recv_base,
+            recv_count,
+        ) {
+            Ok(slots) => slots,
+            Err(code) => {
+                kernel_log!(
+                    "ipc: пересылка caps от {} не удалась ({:#x})\n",
+                    sender_id,
+                    code
+                );
+                wake_sender_error::<A>(tasks, sender_id, code, resume_word, lctl);
+                continue;
+            }
+        };
+        // Копия тела из буфера ОТПРАВИТЕЛЯ (его умап) → ядро → мой буфер.
+        let sender_umap = match access.get_task_tcb(sender_id) {
+            Some(ptr) => unsafe { ptr.as_ref().userspace_map() },
+            // Отправитель исчез между изъятием и копией (уничтожение под
+            // task_manager-локом невозможно; защита от иных путей).
+            None => {
+                wake_sender_error::<A>(tasks, sender_id, res::E_NOT_FOUND, resume_word, lctl);
+                continue;
+            }
+        };
+        let mut body = [0u8; MAX_MSG];
+        if spec.msg_len > MAX_MSG
+            || !endpoint::copy_body_from_sender(
+                sender_umap,
+                spec.msg_va,
+                spec.msg_len,
+                &mut body,
+            )
+        {
+            // Буфер отправителя не читается (дыра в его умапе —
+            // некорректный msg_va): ошибка отправителю.
+            wake_sender_error::<A>(tasks, sender_id, res::E_INVALID_ARG, resume_word, lctl);
+            continue;
+        }
+        if !endpoint::write_delivery_header_and_body(
+            my_umap,
+            tgt_va,
+            sender_id,
+            &body[..spec.msg_len],
+            &dst_slots,
+        ) {
+            // Мой буфер схлопнулся между проверкой и записью
+            // (многопоточный umap): capability уже в моём cspace —
+            // фиксируем в логе; отправителю — ошибка.
+            kernel_log!(
+                "ipc: доставка в буфер {:#x} не удалась после пересылки caps\n",
+                tgt_va
+            );
+            wake_sender_error::<A>(tasks, sender_id, res::E_INTERNAL, resume_word, lctl);
+            continue;
+        }
+        // Доставка состоялась: rendezvous завершён.
+        transport::finish_delivery(tasks, me, sender_id, false);
+        wake_sender_ok::<A>(tasks, sender_id, lctl);
+        crate::task::stats::count_ipc_recv_id(tasks, me);
+        return TakeOutcome::Delivered;
     }
 }
 
@@ -328,257 +572,421 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
         };
         // SAFETY: под permission_backend-локом уничтожение невозможно.
         let sender = unsafe { sender_ptr.as_ref() };
+        let sender_umap = sender.userspace_map();
 
-        // Тело сообщения и дескрипторы — из userspace отправителя.
-        let mut msg = [0u8; MAX_MSG];
-        if !endpoint::read_from_user(sender.userspace_map(), args.msg_ptr as usize, &mut msg[..msg_size])
-        {
-            return res::E_INVALID_ARG;
-        }
-        let cap_items = match read_cap_items::<A>(sender.userspace_map(), args.caps_ptr, caps_count)
-        {
+        // Дескрипторы пересылки — валидируются СРАЗУ (права на слоты);
+        // само тело остаётся в userspace отправителя (L4: без копии до
+        // rendezvous).
+        let cap_items = match read_cap_items::<A>(sender_umap, args.caps_ptr, caps_count) {
             Ok(items) => items,
             Err(code) => return code,
         };
 
-        // Адресат: слот → TaskTCB → глобальный id + GTcb.
-        let (receiver_task_cap, receiver_ptr) = {
+        // Адресат: слот → TaskTCB (прямая отправка) | IpcGate (гейт).
+        let target = {
             let tasks = self.0.task_manager().lock();
-            match resolve_task_slot::<A>(&tasks, sender, args.slot) {
-                Ok(pair) => pair,
+            match resolve_send_target::<A>(&tasks, sender, args.slot) {
+                Ok(t) => t,
                 Err(code) => return code,
             }
         };
-        if receiver_task_cap == current {
-            return res::E_INVALID_ARG; // самому себе — вечный блок
-        }
-        // SAFETY: под permission_backend-локом.
-        let receiver = unsafe { receiver_ptr.as_ref() };
-        let need = endpoint::delivery_bytes(caps_count, msg_size);
-
-        match endpoint::claim_ready(receiver_task_cap, current, need, caps_count) {
-            ClaimResult::TooSmall => res::E_INVALID_ARG,
-            // Приёмное окно получателя не вмещает capability сообщения:
-            // слоты получателя выбирает получатель в IPC_WAIT (seL4-стиль),
-            // навязать свои — нельзя. Получатель продолжает ждать.
-            ClaimResult::CapsRejected => res::E_INVALID_ARG,
-            ClaimResult::NotWaiting => {
-                // Медленный путь: ящик + сон отправителя.
-                match endpoint::enqueue_pending(
-                    receiver_task_cap,
+        match target {
+            IpcTarget::Gate(gate_id) => {
+                match send_to_gate::<A>(
+                    self.0,
+                    lctl,
+                    &access,
                     current,
-                    &msg[..msg_size],
+                    sender_umap,
+                    gate_id,
+                    args.msg_ptr as usize,
+                    msg_size,
                     &cap_items,
+                    args.deadline,
                 ) {
-                    Ok(mailbox_idx) => {
-                        let _ = lctl.scheduler_block_on_object(
-                            endpoint::sender_wait_object(mailbox_idx),
-                            WaitModel::OneShot,
-                        );
-                        res::OK
-                        // Доставка произойдёт в IPC_WAIT получателя
-                        // (или ошибка — патчем RAX до пробуждения).
-                    }
-                    Err(_) => res::E_SLAB,
+                    SendOutcome::Done(code) => code,
+                    SendOutcome::AwaitReply => res::OK,
                 }
             }
-            ClaimResult::Claimed(ep_idx, ep) => {
-                // Быстрый путь: получатель спит в wait. Буфер обязан
-                // отображаться ЦЕЛИКОМ до пересылки capability.
-                if !endpoint::check_user_region(
-                    receiver.userspace_map(),
-                    ep.tgt_va,
-                    need,
-                ) {
-                    endpoint::restore_ready(ep_idx, ep);
-                    return res::E_INVALID_ARG;
+            IpcTarget::Task(receiver_task_cap, receiver_ptr) => {
+                if receiver_task_cap == current {
+                    return res::E_INVALID_ARG; // самому себе — вечный блок
                 }
-                // Слоты ПОЛУЧАТЕЛЯ назначает ядро из ЕГО приёмного окна
-                // («первый свободный»): поле dst_slot дескриптора
-                // отправителя не адресует cspace получателя (занятость
-                // чужих слотов больше не прощупывается ошибками доставки,
-                // дубли внутри сообщения исключены).
-                let dst_slots = match assign_recv_slots::<A>(
+                // SAFETY: под permission_backend-локом.
+                let receiver = unsafe { receiver_ptr.as_ref() };
+                match send_to_task::<A>(
+                    self.0,
+                    lctl,
                     &access,
+                    current,
+                    sender_umap,
                     receiver_task_cap,
-                    caps_count,
-                    ep.recv_base,
-                    ep.recv_count,
+                    receiver.userspace_map(),
+                    args.msg_ptr as usize,
+                    msg_size,
+                    &cap_items,
+                    args.deadline,
                 ) {
-                    Ok(slots) => slots,
-                    Err(code) => {
-                        endpoint::restore_ready(ep_idx, ep);
-                        return code;
-                    }
-                };
-                let mut specs: HVec<CapTransferSpec, MAX_CAPS> = HVec::new();
-                for (i, c) in cap_items.iter().enumerate() {
-                    let _ = specs.push(CapTransferSpec {
-                        src_slot: c.src_slot,
-                        dst_slot: dst_slots[i],
-                        rights: crate::access::capability::DirectCapabilityRights::from_bits_truncate(
-                            c.rights,
-                        ),
-                    });
-                }
-                match transfer_capabilities(&access, current, receiver_task_cap, &specs) {
-                    Ok(()) => {
-                        if endpoint::deliver_to_claimed(
-                            receiver.userspace_map(),
-                            &ep,
-                            current,
-                            &msg[..msg_size],
-                            &dst_slots,
-                        ) {
-                            // Слот израсходован, получатель просыпается
-                            // с сообщением. Статистика: отправитель —
-                            // текущая задача; получатель — по id.
-                            crate::task::stats::count_ipc_sent(lctl);
-                            {
-                                let tasks = self.0.task_manager().lock();
-                                crate::task::stats::count_ipc_recv_id(
-                                    &tasks,
-                                    receiver_task_cap,
-                                );
-                            }
-                            endpoint::consume_ready(ep_idx);
-                            lctl.scheduler_release_object(endpoint::endpoint_wait_object(ep_idx));
-                            res::OK
-                        } else {
-                            // Отображение схлопнулось между проверкой и
-                            // записью (кооперативная модель — почти
-                            // невозможно); откатываемся,Capability уже
-                            // доставлены — фиксируем в логе.
-                            kernel_log!(
-                                "ipc: доставка в буфер {:#x} не удалась после пересылки caps\n",
-                                ep.tgt_va
-                            );
-                            endpoint::restore_ready(ep_idx, ep);
-                            res::E_INTERNAL
-                        }
-                    }
-                    Err((_, e)) => {
-                        // Пересылка не состоялась (валидация — без
-                        // мутаций). Эндпоинт: вернуть ЛИБО отдать
-                        // ждущему отправителю из ящика.
-                        let code = transfer_code(e);
-                        recover_endpoint_after_failure(
-                            self.0,
-                            lctl,
-                            &access,
-                            ep_idx,
-                            ep,
-                            receiver_task_cap,
-                            receiver.userspace_map(),
-                            ep.recv_base,
-                            ep.recv_count,
-                        );
-                        code
-                    }
+                    SendOutcome::Done(code) => code,
+                    SendOutcome::AwaitReply => res::OK,
                 }
             }
         }
     }
 }
 
-/// Откат неудачной пересылки на ЗАХВАЧЕННОМ эндпоинте: инвариант —
-/// получатель либо снова готов (restore), либо просыпается с
-/// сообщением из ящика (ждущий отправитель не должен зависнуть вместе
-/// с ним).
-fn recover_endpoint_after_failure<A: ArchImplementation>(
+/// Доставка ЗАХВАЧЕННОМУ (клеймнутому) получателю: валидация буфера →
+/// слоты из приёмного окна → пересылка capability → копия тела из
+/// буфера отправителя → finish (reply_to) → wake получателя.
+/// Общий механизм быстрого пути send_to_task и гейт-маршрута.
+/// При неудаче получатель возвращается в Receiving (restore).
+#[allow(clippy::too_many_arguments)]
+fn deliver_claimed<A: ArchImplementation>(
     kctl: &'static KernelCTL<A>,
     lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
     access: &crate::access::AccessManager<A::Umap>,
-    ep_idx: usize,
-    ep: ReadyEndpoint,
+    current: u64,
+    sender_umap: &A::Umap,
     receiver_task_cap: u64,
     receiver_umap: &A::Umap,
-    recv_base: u64,
-    recv_count: usize,
-) {
-    loop {
-        let mut dropped: HVec<(u64, usize), MAILBOX_SLOTS> = HVec::new();
-        match endpoint::take_pending(
-            receiver_task_cap,
-            None,
-            receiver_umap,
-            ep.tgt_va,
-            ep.tgt_capacity,
-            recv_base,
-            recv_count,
-            &mut dropped,
-        ) {
-            Some(delivery) => {
-                if delivery.is_fault {
-                    // Фолт-ящик: отправитель спит до FAULT_REPLY —
-                    // только пометить доставку (см. SyscallIPCWait).
-                    crate::ipc::fault::mark_fault_delivered(delivery.sender_task_cap);
-                    handle_dropped(kctl, &dropped, lctl);
-                    {
-                        let tasks = kctl.task_manager().lock();
-                        crate::task::stats::count_ipc_recv_id(&tasks, receiver_task_cap);
+    rspec: crate::task::ipc_state::RecvSpec,
+    msg_va: usize,
+    msg_len: usize,
+    caps: &[CapItem],
+) -> Result<(), u64> {
+    let caps_count = caps.len();
+    let need = endpoint::delivery_bytes(caps_count, msg_len);
+    let tasks = kctl.task_manager().lock();
+    if !endpoint::check_user_region(receiver_umap, rspec.tgt_va, need) {
+        transport::restore_receiver(&tasks, receiver_task_cap, rspec);
+        return Err(res::E_INVALID_ARG);
+    }
+    let dst_slots = match assign_recv_slots_window::<A>(
+        access,
+        receiver_task_cap,
+        caps_count,
+        rspec.recv_base,
+        rspec.recv_count,
+    ) {
+        Ok(slots) => slots,
+        Err(code) => {
+            transport::restore_receiver(&tasks, receiver_task_cap, rspec);
+            return Err(code);
+        }
+    };
+    let specs: HVec<CapTransferSpec, MAX_CAPS> = {
+        let mut s: HVec<CapTransferSpec, MAX_CAPS> = HVec::new();
+        for (i, c) in caps.iter().enumerate() {
+            let _ = s.push(CapTransferSpec {
+                src_slot: c.src_slot,
+                dst_slot: dst_slots[i],
+                rights: crate::access::capability::DirectCapabilityRights::
+                    from_bits_truncate(c.rights),
+            });
+        }
+        s
+    };
+    match transfer_capabilities(access, current, receiver_task_cap, &specs) {
+        Ok(()) => {}
+        Err((_, e)) => {
+            transport::restore_receiver(&tasks, receiver_task_cap, rspec);
+            return Err(transfer_code(e));
+        }
+    }
+    // Тело: буфер отправителя → ядро → буфер получателя.
+    let mut body = [0u8; MAX_MSG];
+    if msg_len > MAX_MSG
+        || !endpoint::copy_body_from_sender(sender_umap, msg_va, msg_len, &mut body)
+    {
+        transport::restore_receiver(&tasks, receiver_task_cap, rspec);
+        return Err(res::E_INVALID_ARG);
+    }
+    if !endpoint::write_delivery_header_and_body(
+        receiver_umap,
+        rspec.tgt_va,
+        current,
+        &body[..msg_len],
+        &dst_slots,
+    ) {
+        kernel_log!(
+            "ipc: доставка в буфер {:#x} не удалась после пересылки caps\n",
+            rspec.tgt_va
+        );
+        transport::restore_receiver(&tasks, receiver_task_cap, rspec);
+        return Err(res::E_INTERNAL);
+    }
+    transport::finish_delivery(&tasks, receiver_task_cap, current, false);
+    drop(tasks);
+    crate::task::stats::count_ipc_sent(lctl);
+    {
+        let tasks = kctl.task_manager().lock();
+        crate::task::stats::count_ipc_recv_id(&tasks, receiver_task_cap);
+    }
+    lctl.scheduler_release_object(endpoint::endpoint_wait_object(receiver_task_cap));
+    Ok(())
+}
+
+/// Результат фазы отправки (общий для SEND/CALL/REPLY-фаз).
+enum SendOutcome {
+    /// Отправка завершена с кодом (OK — доставлено; ошибка — иначе).
+    Done(u64),
+    /// CALL: сообщение доставлено/поставлено в очередь; клиент уже
+    /// зарегистрировал Receiving — продолжает фазу ожидания ответа.
+    AwaitReply,
+}
+
+/// Фаза отправки сообщения задаче `receiver_task_cap` (общий механизм
+/// IPC_SEND и reply-фаз REPLY/REPLY_WAIT; CALL оркестрирует фазы сам —
+/// см. await_reply_phase/call_via_gate). Тело сообщения живёт в
+/// userspace ОТПРАВИТЕЛЯ (текущей задачи) по `msg_va` — быстрый путь
+/// копирует через ядерный буфер, медленный оставляет до доставки
+/// (классический L4: без буферизации в ядре).
+///
+/// Требует захваченного permission_backend-лока (кап-трансфер);
+/// task_manager-лок берётся на атомарные секции внутри.
+#[allow(clippy::too_many_arguments)]
+fn send_to_task<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    access: &crate::access::AccessManager<A::Umap>,
+    current: u64,
+    sender_umap: &A::Umap,
+    receiver_task_cap: u64,
+    receiver_umap: &A::Umap,
+    msg_va: usize,
+    msg_len: usize,
+    caps: &[CapItem],
+    deadline: u64,
+) -> SendOutcome {
+    let caps_count = caps.len();
+    let need = endpoint::delivery_bytes(caps_count, msg_len);
+
+    // ── Быстрый путь: получатель ждёт — клейм. ──
+    let claim = {
+        let tasks = kctl.task_manager().lock();
+        transport::claim_receiver(&tasks, receiver_task_cap, current, None, need, caps_count)
+    };
+    match claim {
+        transport::ClaimResult::TooSmall | transport::ClaimResult::CapsRejected => {
+            SendOutcome::Done(res::E_INVALID_ARG)
+        }
+        transport::ClaimResult::Claimed(rspec) => {
+            // ── Быстрый путь: получатель спит в wait. ──
+            if let Err(code) = deliver_claimed::<A>(
+                kctl, lctl, access, current, sender_umap, receiver_task_cap,
+                receiver_umap, rspec, msg_va, msg_len, caps,
+            ) {
+                return SendOutcome::Done(code);
+            }
+            SendOutcome::Done(res::OK)
+        }
+        transport::ClaimResult::NotWaiting => {
+            // ── Медленный путь: SendSpec + очередь получателя. ──
+            let spec = SendSpec {
+                to: receiver_task_cap,
+                gate: None,
+                msg_va,
+                msg_len,
+                caps: {
+                    let mut c = [CapItem { src_slot: 0, dst_slot: 0, rights: 0 }; MAX_CAPS];
+                    for (d, s) in c.iter_mut().zip(caps.iter()) {
+                        *d = *s;
                     }
-                    endpoint::consume_ready(ep_idx);
-                    lctl.scheduler_release_object(endpoint::endpoint_wait_object(ep_idx));
-                    return;
+                    c
+                },
+                caps_count,
+                is_fault: false,
+            };
+            {
+                let tasks = kctl.task_manager().lock();
+                if let Some(tcb) = tasks.get_tcb(current) {
+                    let mut ipc = tcb.ipc().lock();
+                    ipc.send = Some(spec);
+                    ipc.send_rax = None;
                 }
-                match transfer_delivery_caps::<A>(
-                    access,
-                    delivery.sender_task_cap,
-                    receiver_task_cap,
-                    &delivery,
-                    recv_base,
-                    recv_count,
-                ) {
-                    Ok(chosen) => {
-                        // Слова слотов в заголовке буфера: фактические
-                        // слоты приёмного окна (назначены выше).
-                        if !endpoint::write_cap_slot_headers(receiver_umap, ep.tgt_va, &chosen) {
-                            kernel_log!(
-                                "ipc: слоты заголовка не записаны ({:#x})\n",
-                                ep.tgt_va
-                            );
-                        }
-                        wake_sender_ok::<A>(
-                            kctl,
-                            delivery.sender_task_cap,
-                            lctl,
-                            endpoint::sender_wait_object(delivery.mailbox_idx),
-                        );
-                        handle_dropped(kctl, &dropped, lctl);
-                        // Сообщение доставлено: получатель просыпается,
-                        // эндпоинт израсходован.
-                        {
-                            let tasks = kctl.task_manager().lock();
-                            crate::task::stats::count_ipc_recv_id(&tasks, receiver_task_cap);
-                        }
-                        endpoint::consume_ready(ep_idx);
-                        lctl.scheduler_release_object(endpoint::endpoint_wait_object(ep_idx));
-                        return;
+                if transport::enqueue_sender(&tasks, receiver_task_cap, current, false).is_err() {
+                    if let Some(tcb) = tasks.get_tcb(current) {
+                        tcb.ipc().lock().send = None;
                     }
-                    Err(code) => {
-                        // Этому отправителю не повезло — ошибка в кадр,
-                        // пробуем следующее сообщение.
-                        wake_sender_error(
-                            kctl,
-                            delivery.sender_task_cap,
-                            endpoint::sender_wait_object(delivery.mailbox_idx),
-                            code,
-                            lctl,
-                        );
-                        handle_dropped(kctl, &dropped, lctl);
-                        continue;
-                    }
+                    return SendOutcome::Done(res::E_SLAB);
                 }
             }
-            None => {
-                handle_dropped(kctl, &dropped, lctl);
-                // Ждущих отправителей нет: получатель продолжает ждать.
-                endpoint::restore_ready(ep_idx, ep);
-                return;
+
+            // ── Обычная SEND: сон на СВОЁМ объекте отправителя. ──
+            let object = endpoint::sender_wait_object(current);
+            let mut slept = true;
+            if deadline > 0 {
+                if crate::task::stats::global_ticks() >= deadline {
+                    let tasks = kctl.task_manager().lock();
+                    let _ = transport::sender_timeout_pending(&tasks, current);
+                    return SendOutcome::Done(res::E_TIMEOUT);
+                }
+                if crate::task::deadline::register(current, object, deadline).is_err() {
+                    let tasks = kctl.task_manager().lock();
+                    let _ = transport::sender_timeout_pending(&tasks, current);
+                    return SendOutcome::Done(res::E_SLAB);
+                }
+            }
+            {
+                let tasks = kctl.task_manager().lock();
+                slept = lctl.scheduler_block_on_object_if(
+                    object,
+                    WaitModel::OneShot,
+                    transport::sender_pred(&tasks, current),
+                );
+            }
+            if deadline > 0 {
+                let fired = crate::task::deadline::cancel(current);
+                if fired && !slept {
+                    let tasks = kctl.task_manager().lock();
+                    let _ = transport::sender_timeout_pending(&tasks, current);
+                    return SendOutcome::Done(res::E_TIMEOUT);
+                }
+            }
+            if !slept {
+                let tasks = kctl.task_manager().lock();
+                return SendOutcome::Done(transport::take_send_result(&tasks, current).unwrap_or(res::OK));
+            }
+            // Истинный сон: кадр сохранён с RAX = OK; исход решит
+            // будильщик (доставка — OK; таймаут — патч E_TIMEOUT
+            // резолвером тика; смерть получателя — патч E_NOT_FOUND).
+            SendOutcome::Done(res::OK)
+        }
+    }
+}
+
+/// Отправка В ГЕЙТ (seL4-эндпоинт): FIFO-клейм зарегистрированных
+/// ожидателей гейта; никого — очередь гейта + сон на СВОЁМ объекте
+/// (data — в SendSpec с gate=Some(id); сервер-обработчик изымает через
+/// take_next/gate_pop_sender). Результат изъятия ошибки — send_rax.
+#[allow(clippy::too_many_arguments)]
+fn send_to_gate<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    access: &crate::access::AccessManager<A::Umap>,
+    current: u64,
+    sender_umap: &A::Umap,
+    gate_id: u64,
+    msg_va: usize,
+    msg_len: usize,
+    caps: &[CapItem],
+    deadline: u64,
+) -> SendOutcome {
+    let caps_count = caps.len();
+    let need = endpoint::delivery_bytes(caps_count, msg_len);
+
+    // ── Быстрый путь: клейм FIFO-получателя гейта. ──
+    loop {
+        let Some(candidate) = crate::ipc::gate::gate_pop_receiver(gate_id) else {
+            break;
+        };
+        let claim = {
+            let tasks = kctl.task_manager().lock();
+            transport::claim_receiver(&tasks, candidate, current, Some(gate_id), need, caps_count)
+        };
+        match claim {
+            // Затухшая запись (получатель уже не ждёт) — следующий.
+            transport::ClaimResult::NotWaiting => continue,
+            // Буфер/окно получателя не вмещают: получатель продолжает
+            // ждать (возвращаем в голову очереди), отправителю — ошибка.
+            transport::ClaimResult::TooSmall | transport::ClaimResult::CapsRejected => {
+                crate::ipc::gate::gate_unpop_receiver(gate_id, candidate);
+                return SendOutcome::Done(res::E_INVALID_ARG);
+            }
+            transport::ClaimResult::Claimed(rspec) => {
+                let receiver_umap = {
+                    let tasks = kctl.task_manager().lock();
+                    match tasks.get_tcb(candidate) {
+                        Some(tcb) => unsafe {
+                            // SAFETY: под task_manager-локом TCB жив.
+                            tcb.gtcb_owner().as_ref().userspace_map()
+                        },
+                        None => {
+                            transport::restore_receiver(&tasks, candidate, rspec);
+                            continue;
+                        }
+                    }
+                };
+                let result = deliver_claimed::<A>(
+                    kctl, lctl, access, current, sender_umap, candidate,
+                    receiver_umap, rspec, msg_va, msg_len, caps,
+                );
+                if let Err(code) = result {
+                    return SendOutcome::Done(code);
+                }
+                return SendOutcome::Done(res::OK);
             }
         }
     }
+
+    // ── Медленный путь: очередь гейта + сон на своём объекте. ──
+    let spec = SendSpec {
+        to: 0, // гейт-маршрут: адресат определяется сервером при изъятии
+        gate: Some(gate_id),
+        msg_va,
+        msg_len,
+        caps: {
+            let mut c = [CapItem { src_slot: 0, dst_slot: 0, rights: 0 }; MAX_CAPS];
+            for (d, s) in c.iter_mut().zip(caps.iter()) {
+                *d = *s;
+            }
+            c
+        },
+        caps_count,
+        is_fault: false,
+    };
+    {
+        let tasks = kctl.task_manager().lock();
+        if let Some(tcb) = tasks.get_tcb(current) {
+            let mut ipc = tcb.ipc().lock();
+            ipc.send = Some(spec);
+            ipc.send_rax = None;
+        }
+        if crate::ipc::gate::gate_push_sender(gate_id, current).is_err() {
+            if let Some(tcb) = tasks.get_tcb(current) {
+                tcb.ipc().lock().send = None;
+            }
+            return SendOutcome::Done(res::E_SLAB);
+        }
+    }
+
+    let object = endpoint::sender_wait_object(current);
+    let mut slept = true;
+    if deadline > 0 {
+        if crate::task::stats::global_ticks() >= deadline {
+            let tasks = kctl.task_manager().lock();
+            let _ = transport::sender_timeout_pending(&tasks, current);
+            return SendOutcome::Done(res::E_TIMEOUT);
+        }
+        if crate::task::deadline::register(current, object, deadline).is_err() {
+            let tasks = kctl.task_manager().lock();
+            let _ = transport::sender_timeout_pending(&tasks, current);
+            return SendOutcome::Done(res::E_SLAB);
+        }
+    }
+    {
+        let tasks = kctl.task_manager().lock();
+        slept = lctl.scheduler_block_on_object_if(
+            object,
+            WaitModel::OneShot,
+            transport::sender_pred(&tasks, current),
+        );
+    }
+    if deadline > 0 {
+        let fired = crate::task::deadline::cancel(current);
+        if fired && !slept {
+            let tasks = kctl.task_manager().lock();
+            let _ = transport::sender_timeout_pending(&tasks, current);
+            return SendOutcome::Done(res::E_TIMEOUT);
+        }
+    }
+    if !slept {
+        let tasks = kctl.task_manager().lock();
+        return SendOutcome::Done(transport::take_send_result(&tasks, current).unwrap_or(res::OK));
+    }
+    // Истинный сон: исход решит будильщик (сервер изымет сообщение и
+    // разбудит / таймаут-резолвер патчит E_TIMEOUT с самоочисткой).
+    SendOutcome::Done(res::OK)
 }
 
 impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, SyscallIPCWait> {
@@ -600,9 +1008,8 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
             return res::E_INVALID_ARG;
         }
         // Приёмное окно capability: recv_count > MAX_CAPS бессмысленно
-        // (сообщение несёт максимум MAX_CAPS дескрипторов) — ограничиваем
-        // для тigth-арифметики; recv_base+recv_count обязан не переполнять
-        // u64 (слоты recv_base+i вычисляются сложением при доставке).
+        // (сообщение несёт максимум MAX_CAPS дескрипторов); recv_base+
+        // recv_count обязан не переполнять u64.
         let recv_count = args.recv_count as usize;
         if recv_count > MAX_CAPS || args.recv_base.checked_add(args.recv_count).is_none() {
             return res::E_INVALID_ARG;
@@ -623,139 +1030,819 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
             return res::E_INVALID_ARG;
         }
 
-        // Closed-wait фильтр: слот отправителя → его task_cap_id.
-        let from = if args.from_slot == IPC_WAIT_ANY {
+        // Цель ожидания: ANY (open), TaskTCB (closed) или IpcGate
+        // (ожидание НА ГЕЙТЕ, право Recv).
+        let (from, gate) = if args.target == endpoint::IPC_WAIT_ANY {
+            (None, None)
+        } else {
+            let tasks = self.0.task_manager().lock();
+            match resolve_wait_target::<A>(&tasks, receiver, args.target) {
+                Ok(pair) => pair,
+                Err(code) => return code,
+            }
+        };
+
+        wait_loop::<A>(
+            self.0,
+            lctl,
+            &access,
+            current,
+            umap,
+            from,
+            gate,
+            tgt_va,
+            tgt_capacity,
+            recv_base,
+            recv_count,
+            args.deadline,
+        )
+    }
+}
+
+/// Цикл ожидания WAIT (общий для IPC_WAIT и IPC_REPLY_WAIT): fast path
+/// (очередь) → регистрация Receiving → сон под предикатом → перепроверка.
+/// `gate` — ожидание на гейте (commit IPC-гейтов); None — собственный
+/// эндпоинт. Блокировка/таймауты — см. модульный комментарий.
+#[allow(clippy::too_many_arguments)]
+fn wait_loop<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    access: &crate::access::AccessManager<A::Umap>,
+    current: u64,
+    umap: &A::Umap,
+    from: Option<u64>,
+    gate: Option<u64>,
+    tgt_va: usize,
+    tgt_capacity: usize,
+    recv_base: u64,
+    recv_count: usize,
+    deadline: u64,
+) -> u64 {
+    let spec = RecvSpec {
+        from,
+        gate,
+        tgt_va,
+        tgt_capacity,
+        recv_base,
+        recv_count,
+    };
+
+    // Цикл ожидания: fast path (очередь) → регистрация → сон →
+    // перепроверка. См. модульный комментарий про lost-wakeup.
+    loop {
+        // task_manager-лок держится на весь шаг: take_next и wake-
+        // хелперы локов НЕ берут (deref guard'а).
+        let tasks = kctl.task_manager().lock();
+        match take_next::<A>(
+            lctl,
+            access,
+            &tasks,
+            current,
+            umap,
+            from,
+            gate,
+            tgt_va,
+            tgt_capacity,
+            recv_base,
+            recv_count,
+            A::RESUME_RESULT_WORD,
+        ) {
+            TakeOutcome::Delivered | TakeOutcome::DeliveredFault => {
+                crate::task::stats::count_ipc_recv(lctl);
+                return res::OK;
+            }
+            TakeOutcome::Empty => {}
+        }
+
+        // Дедлайн уже прошёл (вернулись сюда после пробуждения по
+        // таймауту, доставки нет) — спать больше нельзя.
+        if deadline > 0 && crate::task::stats::global_ticks() >= deadline {
+            if let Some(gate_id) = gate {
+                crate::ipc::gate::gate_remove_receiver(gate_id, current);
+            }
+            transport::unregister_wait(&tasks, current);
+            return res::E_TIMEOUT;
+        }
+
+        // Регистрация ожидания (Claimed = доставка в полёте —
+        // перепроверка циклом; завершение увидит seq/быстрый путь).
+        // Для гейта — встать в очередь ожидателей гейта (отправители
+        // клеймят FIFO-получателей оттуда).
+        let snap = match transport::register_wait(&tasks, current, spec) {
+            Ok(snap) => snap,
+            Err(()) => continue,
+        };
+        if let Some(gate_id) = gate {
+            let _ = crate::ipc::gate::gate_push_receiver(gate_id, current);
+        }
+
+        // Дедлайн (абсолютный тик): регистрация до сна.
+        let object = endpoint::endpoint_wait_object(current);
+        if deadline > 0 && crate::task::deadline::register(current, object, deadline).is_err() {
+            // Реестр дедлайнов полон: регистрацию снять (спать без
+            // будильщика нельзя).
+            if let Some(gate_id) = gate {
+                crate::ipc::gate::gate_remove_receiver(gate_id, current);
+            }
+            transport::unregister_wait(&tasks, current);
+            return res::E_SLAB;
+        }
+
+        // Сон под предикатом (lost-wakeup guard): доставка, случившаяся
+        // до постановки в очередь, отменяет сон.
+        let slept = lctl.scheduler_block_on_object_if(
+            object,
+            WaitModel::OneShot,
+            transport::receiver_pred(&tasks, current, snap, from),
+        );
+        // ВАЖНО: сисколл-хендлер выполняется ДО фактического
+        // переключения (порт переключает после возврата dispatch, кадр
+        // сохраняется с RAX = возврату хендлера). После УСПЕШНОГО сна
+        // хендлер ОБЯЗАН вернуть OK: пробуждение решает исход — доставка
+        // (буфер заполнен клеймом отправителя) даёт OK; таймаут —
+        // резолвер тика патчит E_TIMEOUT; смерть — патч E_NOT_FOUND.
+        // Повторный block без возврата ставил бы задачу в очередь
+        // дважды и никогда не отдавал CPU.
+        if slept {
+            return res::OK;
+        }
+        // Предикат сработал ДО сна (событие уже случилось) — решаем
+        // немедленно; tasks-лок всё ещё захвачен (шаг цикла).
+        {
+            let delivered = {
+                let tcb = tasks.get_tcb(current).expect("собственный TCB жив");
+                let ipc = tcb.ipc().lock();
+                ipc.seq != snap || matches!(ipc.recv, crate::task::ipc_state::IpcRecv::Claimed(_))
+            };
+            if delivered {
+                // Кандидат в очереди — изымаем; очередь пуста, но seq
+                // изменился — доставка прошла КЛЕЙМОМ (буфер заполнен).
+                match take_next::<A>(
+                    lctl,
+                    access,
+                    &tasks,
+                    current,
+                    umap,
+                    from,
+                    gate,
+                    tgt_va,
+                    tgt_capacity,
+                    recv_base,
+                    recv_count,
+                    A::RESUME_RESULT_WORD,
+                ) {
+                    TakeOutcome::Delivered | TakeOutcome::DeliveredFault => {
+                        crate::task::stats::count_ipc_recv(lctl);
+                        return res::OK;
+                    }
+                    TakeOutcome::Empty => {
+                        crate::task::stats::count_ipc_recv(lctl);
+                        return res::OK;
+                    }
+                }
+            }
+            // Таймаут: слот дедлайна выстрелил без доставки (гонка «тик
+            // в окне [регистрация .. сон]»).
+            let fired = deadline > 0 && crate::task::deadline::cancel(current);
+            if fired {
+                if let Some(gate_id) = gate {
+                    crate::ipc::gate::gate_remove_receiver(gate_id, current);
+                }
+                transport::unregister_wait(&tasks, current);
+                return res::E_TIMEOUT;
+            }
+        }
+        // Клейм в полёте (Claimed, доставка завершается на другом ядре):
+        // цикл повторит блок — предикат увидит завершение по seq.
+    }
+}
+
+// ─── RPC: IPC_REPLY / IPC_CALL / IPC_REPLY_WAIT ─────────────────────────────
+
+#[derive(SyscallArguments)]
+pub struct SyscallIPCReply {
+    /// ВА тела ответа (уходит клиенту, от которого получен последний
+    /// запрос).
+    msg_ptr: u64,
+    msg_size: u64,
+    /// ВА массива дескрипторов пересылки (например, передача результата
+    /// клиенту) или 0.
+    caps_ptr: u64,
+    caps_count: u64,
+}
+
+#[derive(SyscallArguments)]
+pub struct SyscallIPCCall {
+    /// Слот cspace с TaskTCB-капабилити сервера (право Send).
+    slot: u64,
+    /// ВА тела запроса; ОТВЕТ доставляется В ТОТ ЖЕ БУФЕР (seL4-стиль:
+    /// сообщение-буфер двунаправлен).
+    msg_ptr: u64,
+    msg_size: u64,
+    caps_ptr: u64,
+    caps_count: u64,
+    /// ВА дескриптора приёма ответа (4×u64: capacity, recv_base,
+    /// recv_count, deadline). 0 запрещён — CALL обязан ждать ответ с
+    /// явными параметрами буфера.
+    desc_ptr: u64,
+}
+
+#[derive(SyscallArguments)]
+pub struct SyscallIPCReplyWait {
+    /// ВА тела ответа (клиенту последнего запроса).
+    msg_ptr: u64,
+    msg_size: u64,
+    caps_ptr: u64,
+    caps_count: u64,
+    /// Цель следующего ожидания: IPC_WAIT_ANY или слот TaskTCB
+    /// (closed wait) — семантика IPC_WAIT (IpcGate добавит свой вариант).
+    wait_target: u64,
+    /// Дедлайн ожидания следующего запроса (0 — вечно).
+    wait_deadline: u64,
+}
+
+/// IPC_REPLY(12): ответ клиенту, от которого получен последний запрос.
+/// Адресат — неявный reply_to из TCB сервера (классический L4 reply):
+/// TaskTCB-капа на клиента не нужна, адресат заверен ядром; namespace-
+/// право IPC_SEND остаётся обязательным.
+impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, SyscallIPCReply> {
+    const SYSCALL_ID: usize = 12;
+    type Args = SyscallIPCReply;
+    type Umap = A::Umap;
+
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+        let msg_size = args.msg_size as usize;
+        let caps_count = args.caps_count as usize;
+        if msg_size > MAX_MSG || caps_count > MAX_CAPS {
+            return res::E_INVALID_ARG;
+        }
+
+        let access = self.0.permission_backend.lock();
+        if access
+            .check_task_rights(current, crate::access::namespace::NamespaceRights::IPC_SEND)
+            .is_err()
+        {
+            return res::E_RIGHTS_DENIED;
+        }
+        let Some(sender_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом.
+        let sender = unsafe { sender_ptr.as_ref() };
+        let sender_umap = sender.userspace_map();
+
+        let cap_items = match read_cap_items::<A>(sender_umap, args.caps_ptr, caps_count) {
+            Ok(items) => items,
+            Err(code) => return code,
+        };
+        let reply_to = {
+            let tasks = self.0.task_manager().lock();
+            match transport::take_reply_to(&tasks, current) {
+                Some(t) => t,
+                None => return res::E_NOT_FOUND,
+            }
+        };
+        let Some(receiver_ptr) = access.get_task_tcb(reply_to) else {
+            // Адресат исчез после приёма запроса.
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом.
+        let receiver = unsafe { receiver_ptr.as_ref() };
+
+        match send_to_task::<A>(
+            self.0,
+            lctl,
+            &access,
+            current,
+            sender_umap,
+            reply_to,
+            receiver.userspace_map(),
+            args.msg_ptr as usize,
+            msg_size,
+            &cap_items,
+            0,
+        ) {
+            SendOutcome::Done(code) => code,
+            SendOutcome::AwaitReply => res::OK,
+        }
+    }
+}
+
+/// Фаза ожидания ответа CALL (клиент уже зарегистрировал Receiving —
+/// `snap` её seq-снимок). Успешный сон → Done(OK): исход решит будильщик
+/// (ответ = клейм+finish → кадр OK; отказ сервера → патч RAX; таймаут →
+/// резолвер). Предикат сработал до сна → немедленный разбор исхода.
+#[allow(clippy::too_many_arguments)]
+fn await_reply_phase<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    current: u64,
+    snap: u64,
+    from: Option<u64>,
+    deadline: u64,
+) -> SendOutcome {
+    let object = endpoint::endpoint_wait_object(current);
+    if deadline > 0
+        && crate::task::deadline::register(current, object, deadline).is_err()
+    {
+        let tasks = kctl.task_manager().lock();
+        let _ = transport::receiver_timeout_pending(&tasks, current);
+        return SendOutcome::Done(res::E_SLAB);
+    }
+    let slept = {
+        let tasks = kctl.task_manager().lock();
+        lctl.scheduler_block_on_object_if(
+            object,
+            WaitModel::OneShot,
+            transport::call_pred(&tasks, current, snap, from),
+        )
+    };
+    if slept {
+        return SendOutcome::Done(res::OK);
+    }
+    // Предикат сработал ДО сна — событие уже случилось.
+    loop {
+        let tasks = kctl.task_manager().lock();
+        if let Some(code) = transport::take_send_result(&tasks, current) {
+            let _ = transport::receiver_timeout_pending(&tasks, current);
+            return SendOutcome::Done(code);
+        }
+        let (seq_changed, claimed) = {
+            let tcb = tasks.get_tcb(current).expect("собственный TCB жив");
+            let ipc = tcb.ipc().lock();
+            (
+                ipc.seq != snap,
+                matches!(ipc.recv, crate::task::ipc_state::IpcRecv::Claimed(_)),
+            )
+        };
+        if !claimed && seq_changed {
+            crate::task::stats::count_ipc_recv(lctl);
+            return SendOutcome::Done(res::OK);
+        }
+        let fired = deadline > 0 && crate::task::deadline::cancel(current);
+        if fired {
+            let _ = transport::receiver_timeout_pending(&tasks, current);
+            return SendOutcome::Done(res::E_TIMEOUT);
+        }
+        drop(tasks);
+        // Claimed в полёте — короткий ре-блок; предикат увидит
+        // завершение по seq и не уснёт.
+        {
+            let tasks = kctl.task_manager().lock();
+            lctl.scheduler_block_on_object_if(
+                object,
+                WaitModel::OneShot,
+                transport::call_pred(&tasks, current, snap, from),
+            );
+        }
+    }
+}
+
+/// CALL через гейт: клейм FIFO-получателя гейта (как send_to_gate) —
+/// при неудаче клейма отправителю ошибка; никого — очередь гейта БЕЗ
+/// сна (клиент далее ждёт ответ в await_reply_phase).
+#[allow(clippy::too_many_arguments)]
+fn call_via_gate<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    access: &crate::access::AccessManager<A::Umap>,
+    current: u64,
+    sender_umap: &A::Umap,
+    gate_id: u64,
+    msg_va: usize,
+    msg_len: usize,
+    caps: &[CapItem],
+) -> Result<(), u64> {
+    let caps_count = caps.len();
+    let need = endpoint::delivery_bytes(caps_count, msg_len);
+    loop {
+        let Some(candidate) = crate::ipc::gate::gate_pop_receiver(gate_id) else {
+            break;
+        };
+        let claim = {
+            let tasks = kctl.task_manager().lock();
+            transport::claim_receiver(&tasks, candidate, current, Some(gate_id), need, caps_count)
+        };
+        match claim {
+            transport::ClaimResult::NotWaiting => continue,
+            transport::ClaimResult::TooSmall | transport::ClaimResult::CapsRejected => {
+                crate::ipc::gate::gate_unpop_receiver(gate_id, candidate);
+                return Err(res::E_INVALID_ARG);
+            }
+            transport::ClaimResult::Claimed(rspec) => {
+                let receiver_umap = {
+                    let tasks = kctl.task_manager().lock();
+                    match tasks.get_tcb(candidate) {
+                        Some(tcb) => unsafe {
+                            tcb.gtcb_owner().as_ref().userspace_map()
+                        },
+                        None => {
+                            transport::restore_receiver(&tasks, candidate, rspec);
+                            continue;
+                        }
+                    }
+                };
+                deliver_claimed::<A>(
+                    kctl, lctl, access, current, sender_umap, candidate,
+                    receiver_umap, rspec, msg_va, msg_len, caps,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    // Никого не ждёт: очередь гейта (без сна — клиент ждёт ОТВЕТ).
+    let spec = SendSpec {
+        to: 0,
+        gate: Some(gate_id),
+        msg_va,
+        msg_len,
+        caps: {
+            let mut c = [CapItem { src_slot: 0, dst_slot: 0, rights: 0 }; MAX_CAPS];
+            for (d, s) in c.iter_mut().zip(caps.iter()) {
+                *d = *s;
+            }
+            c
+        },
+        caps_count,
+        is_fault: false,
+    };
+    {
+        let tasks = kctl.task_manager().lock();
+        if let Some(tcb) = tasks.get_tcb(current) {
+            let mut ipc = tcb.ipc().lock();
+            ipc.send = Some(spec);
+            ipc.send_rax = None;
+        }
+        if crate::ipc::gate::gate_push_sender(gate_id, current).is_err() {
+            if let Some(tcb) = tasks.get_tcb(current) {
+                tcb.ipc().lock().send = None;
+            }
+            return Err(res::E_SLAB);
+        }
+    }
+    Ok(())
+}
+
+/// IPC_CALL(13): атомарные SEND+WAIT с неявным reply-путём (классический
+/// L4 call; seL4 call). Ответ сервера доставляется В БУФЕР ЗАПРОСА
+/// (двунаправленный буфер); сервер отвечает IPC_REPLY/IPC_REPLY_WAIT
+/// без TaskTCB-капы клиента. Параметры приёма ответа — через
+/// дескриптор в памяти вызывающего (лимит 6 арг-регистров ABI):
+/// desc = {capacity u64, recv_base u64, recv_count u64, deadline u64}.
+/// Цель — TaskTCB-капа сервера ИЛИ IpcGate (гейт-маршрут).
+impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, SyscallIPCCall> {
+    const SYSCALL_ID: usize = 13;
+    type Args = SyscallIPCCall;
+    type Umap = A::Umap;
+
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+        let msg_size = args.msg_size as usize;
+        let caps_count = args.caps_count as usize;
+        let tgt_va = args.msg_ptr as usize;
+        if msg_size > MAX_MSG || caps_count > MAX_CAPS {
+            return res::E_INVALID_ARG;
+        }
+        // Дескриптор приёма ответа (4×u64) — читается из userspace.
+        if args.desc_ptr == 0 || !args.desc_ptr.is_multiple_of(8) {
+            return res::E_INVALID_ARG;
+        }
+        let access = self.0.permission_backend.lock();
+        if access
+            .check_task_rights(current, crate::access::namespace::NamespaceRights::IPC_SEND)
+            .is_err()
+        {
+            return res::E_RIGHTS_DENIED;
+        }
+        let Some(sender_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом.
+        let sender = unsafe { sender_ptr.as_ref() };
+        let sender_umap = sender.userspace_map();
+
+        let rd = |k: usize| -> Option<u64> {
+            endpoint::read_user_u64(sender_umap, args.desc_ptr as usize + k * 8)
+        };
+        let (Some(capacity), Some(recv_base), Some(recv_count), Some(deadline)) =
+            (rd(0), rd(1), rd(2), rd(3))
+        else {
+            return res::E_INVALID_ARG;
+        };
+        let capacity = capacity as usize;
+        let recv_count = recv_count as usize;
+        if capacity < HEADER_WORDS * 8
+            || !tgt_va.is_multiple_of(8)
+            || recv_count > MAX_CAPS
+            || recv_base.checked_add(recv_count as u64).is_none()
+        {
+            return res::E_INVALID_ARG;
+        }
+        // Буфер запроса обязан быть R/W (в него же придёт ответ) и
+        // вмещать хотя бы заголовок доставки.
+        if !endpoint::check_user_region(
+            sender_umap,
+            tgt_va,
+            capacity.min(msg_size + (3 + MAX_CAPS) * 8).max(HEADER_WORDS * 8),
+        ) {
+            return res::E_INVALID_ARG;
+        }
+
+        let cap_items = match read_cap_items::<A>(sender_umap, args.caps_ptr, caps_count) {
+            Ok(items) => items,
+            Err(code) => return code,
+        };
+
+        // Регистрация ожидания ответа ДО отправки: буфер приёма готов,
+        // ответ сервера доставляется напрямую (клейм), не через очередь.
+        // Для гейт-цели from=None (сервер клиенту не известен); для
+        // прямой — from=Some(сервер).
+        // (target_server, target_gate): гейт-маршрут — Some(gate_id);
+        // прямой — Some(server). from-фильтр ответа = СЕРВЕР (не гейт!):
+        // reply_to устанавливается при доставке запроса.
+        let (target_server, target_gate) = {
+            let tasks = self.0.task_manager().lock();
+            match resolve_send_target::<A>(&tasks, sender, args.slot) {
+                Ok(IpcTarget::Gate(gate_id)) => (None, Some(gate_id)),
+                Ok(IpcTarget::Task(id, _)) => {
+                    if id == current {
+                        return res::E_INVALID_ARG;
+                    }
+                    (Some(id), None)
+                }
+                Err(code) => return code,
+            }
+        };
+        let recv_spec = RecvSpec {
+            from: target_server,
+            gate: None,
+            tgt_va,
+            tgt_capacity: capacity,
+            recv_base,
+            recv_count,
+        };
+        let snap = {
+            let tasks = self.0.task_manager().lock();
+            match transport::register_wait(&tasks, current, recv_spec) {
+                Ok(snap) => snap,
+                Err(()) => return res::E_INTERNAL, // собственный TCB в Claimed?
+            }
+        };
+
+        // ── Фаза отправки (без сна клиента как отправителя) ──
+        let send_result = match (target_server, target_gate) {
+            // Гейт-маршрут.
+            (None, Some(gate_id)) => call_via_gate::<A>(
+                self.0,
+                lctl,
+                &access,
+                current,
+                sender_umap,
+                gate_id,
+                tgt_va,
+                msg_size,
+                &cap_items,
+            ),
+            // Прямая отправка серверу.
+            (Some(server), None) => {
+                let claim = {
+                    let tasks = self.0.task_manager().lock();
+                    transport::claim_receiver(
+                        &tasks,
+                        server,
+                        current,
+                        None,
+                        endpoint::delivery_bytes(caps_count, msg_size),
+                        caps_count,
+                    )
+                };
+                match claim {
+                    transport::ClaimResult::Claimed(rspec) => {
+                        let server_ptr = access.get_task_tcb(server).expect("жив под локом");
+                        let server_umap =
+                            unsafe { server_ptr.as_ref().userspace_map() };
+                        deliver_claimed::<A>(
+                            self.0,
+                            lctl,
+                            &access,
+                            current,
+                            sender_umap,
+                            server,
+                            server_umap,
+                            rspec,
+                            tgt_va,
+                            msg_size,
+                            &cap_items,
+                        )
+                    }
+                    transport::ClaimResult::TooSmall
+                    | transport::ClaimResult::CapsRejected => Err(res::E_INVALID_ARG),
+                    transport::ClaimResult::NotWaiting => {
+                        // В очередь сервера (БЕЗ сна — клиент ждёт ответ).
+                        let spec = SendSpec {
+                            to: server,
+                            gate: None,
+                            msg_va: tgt_va,
+                            msg_len: msg_size,
+                            caps: {
+                                let mut c =
+                                    [CapItem { src_slot: 0, dst_slot: 0, rights: 0 }; MAX_CAPS];
+                                for (d, s) in c.iter_mut().zip(cap_items.iter()) {
+                                    *d = *s;
+                                }
+                                c
+                            },
+                            caps_count,
+                            is_fault: false,
+                        };
+                        let tasks = self.0.task_manager().lock();
+                        if let Some(tcb) = tasks.get_tcb(current) {
+                            let mut ipc = tcb.ipc().lock();
+                            ipc.send = Some(spec);
+                            ipc.send_rax = None;
+                        }
+                        match transport::enqueue_sender(&tasks, server, current, false) {
+                            Ok(()) => Ok(()),
+                            Err(()) => {
+                                if let Some(tcb) = tasks.get_tcb(current) {
+                                    tcb.ipc().lock().send = None;
+                                }
+                                Err(res::E_SLAB)
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return res::E_INTERNAL,
+        };
+        if let Err(code) = send_result {
+            // Откат регистрации (ответ не придёт) — отправка не состоялась.
+            let tasks = self.0.task_manager().lock();
+            let _ = transport::receiver_timeout_pending(&tasks, current);
+            return code;
+        }
+
+        // ── Фаза ожидания ответа ──
+        match await_reply_phase::<A>(
+            self.0,
+            lctl,
+            current,
+            snap,
+            target_server,
+            deadline,
+        ) {
+            SendOutcome::Done(code) => code,
+            SendOutcome::AwaitReply => res::OK,
+        }
+    }
+}
+
+/// IPC_REPLY_WAIT(15): reply + следующий wait одним сисколлом (классика
+/// L4 «reply and wait» — основной цикл RPC-сервера). Ответ доставляется
+/// как в IPC_REPLY; при успехе — wait (open/closed; гейт-цель добавит
+/// IpcGate-вариант). Ошибка reply прерывает операцию (явная семантика).
+impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, SyscallIPCReplyWait> {
+    const SYSCALL_ID: usize = 15;
+    type Args = SyscallIPCReplyWait;
+    type Umap = A::Umap;
+
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+        let msg_size = args.msg_size as usize;
+        let caps_count = args.caps_count as usize;
+        if msg_size > MAX_MSG || caps_count > MAX_CAPS {
+            return res::E_INVALID_ARG;
+        }
+
+        let access = self.0.permission_backend.lock();
+        if access
+            .check_task_rights(current, crate::access::namespace::NamespaceRights::IPC_SEND)
+            .is_err()
+        {
+            return res::E_RIGHTS_DENIED;
+        }
+        let Some(sender_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом.
+        let sender = unsafe { sender_ptr.as_ref() };
+        let sender_umap = sender.userspace_map();
+
+        // ── Фаза 1: reply ──
+        let cap_items = match read_cap_items::<A>(sender_umap, args.caps_ptr, caps_count) {
+            Ok(items) => items,
+            Err(code) => return code,
+        };
+        let reply_to = {
+            let tasks = self.0.task_manager().lock();
+            match transport::take_reply_to(&tasks, current) {
+                Some(t) => t,
+                None => return res::E_NOT_FOUND,
+            }
+        };
+        let Some(receiver_ptr) = access.get_task_tcb(reply_to) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом.
+        let receiver = unsafe { receiver_ptr.as_ref() };
+
+        let reply_code = match send_to_task::<A>(
+            self.0,
+            lctl,
+            &access,
+            current,
+            sender_umap,
+            reply_to,
+            receiver.userspace_map(),
+            args.msg_ptr as usize,
+            msg_size,
+            &cap_items,
+            0,
+        ) {
+            SendOutcome::Done(code) => code,
+            SendOutcome::AwaitReply => res::OK,
+        };
+        if reply_code != res::OK {
+            return reply_code;
+        }
+
+        // ── Фаза 2: wait на следующий запрос ──
+        let tgt_va = args.msg_ptr as usize; // сервер переиспользует буфер
+        if !tgt_va.is_multiple_of(8) {
+            return res::E_INVALID_ARG;
+        }
+        let recv_count = 0usize; // окно задаётся СЛЕДУЮЩИМ wait'ом явно:
+        let _ = recv_count;      // REPLY_WAIT принимает без окна — caps-
+        // сообщения отклоняются отправителям (совместимо с RECV_NONE).
+        // Ёмкость буфера: та же, что у ответа — сервер знает размер
+        // своего буфера только через аргумент msg_size; для приёма
+        // используем минимально достаточный резерв заголовка+тела
+        // лимита транспорта (ядро всё равно отклонит негабарит).
+        let capacity = (HEADER_WORDS + MAX_CAPS) * 8 + MAX_MSG;
+
+        let from = if args.wait_target == endpoint::IPC_WAIT_ANY {
             None
         } else {
             let tasks = self.0.task_manager().lock();
-            match resolve_task_slot::<A>(&tasks, receiver, args.from_slot) {
+            match resolve_task_slot::<A>(&tasks, sender, args.wait_target) {
                 Ok((sender_task_cap, _)) => Some(sender_task_cap),
                 Err(code) => return code,
             }
         };
 
-        // Быстрый путь: забрать ждущее сообщение (циклом — неудачные
-        // пересылки capability не должны съедать сообщение получателя).
-        loop {
-            let mut dropped: HVec<(u64, usize), MAILBOX_SLOTS> = HVec::new();
-            match endpoint::take_pending(
-                current,
-                from,
-                umap,
-                tgt_va,
-                tgt_capacity,
-                recv_base,
-                recv_count,
-                &mut dropped,
-            ) {
-                Some(delivery) => {
-                    if delivery.is_fault {
-                        // Фолт-сообщение (отправитель — упавшая задача,
-                        // см. ipc::fault): payload уже в буфере,
-                        // capability в нём нет. Отправителя НЕ будим — он
-                        // спит на fault-объекте до FAULT_REPLY; помечаем
-                        // доставку (после этого REPLY валиден).
-                        crate::ipc::fault::mark_fault_delivered(delivery.sender_task_cap);
-                        handle_dropped(self.0, &dropped, lctl);
-                        crate::task::stats::count_ipc_recv(lctl);
-                        return res::OK;
-                    }
-                    match transfer_delivery_caps::<A>(
-                        &access,
-                        delivery.sender_task_cap,
-                        current,
-                        &delivery,
-                        recv_base,
-                        recv_count,
-                    ) {
-                        Ok(chosen) => {
-                            // Слова слотов в заголовке буфера: фактические
-                            // слоты приёмного окна (назначены выше).
-                            if !endpoint::write_cap_slot_headers(umap, tgt_va, &chosen) {
-                                kernel_log!(
-                                    "ipc: слоты заголовка не записаны ({:#x})\n",
-                                    tgt_va
-                                );
-                            }
-                            wake_sender_ok::<A>(
-                                self.0,
-                                delivery.sender_task_cap,
-                                lctl,
-                                endpoint::sender_wait_object(delivery.mailbox_idx),
-                            );
-                            handle_dropped(self.0, &dropped, lctl);
-                            // Сообщение уже в буфере получателя (он —
-                            // текущая задача): статистика приёма здесь.
-                            crate::task::stats::count_ipc_recv(lctl);
-                            return res::OK;
-                        }
-                        Err(code) => {
-                            kernel_log!(
-                                "ipc: пересылка caps от {} не удалась ({:#x})\n",
-                                delivery.sender_task_cap,
-                                code
-                            );
-                            wake_sender_error(
-                                self.0,
-                                delivery.sender_task_cap,
-                                endpoint::sender_wait_object(delivery.mailbox_idx),
-                                code,
-                                lctl,
-                            );
-                            handle_dropped(self.0, &dropped, lctl);
-                            continue; // следующее сообщение
-                        }
-                    }
-                }
-                None => {
-                    handle_dropped(self.0, &dropped, lctl);
-                    // Дедлайн уже прошёл (вернулись сюда после пробуждения
-                    // по таймауту, сообщения нет) — спать больше нельзя.
-                    if args.deadline > 0 && crate::task::stats::global_ticks() >= args.deadline {
-                        return res::E_TIMEOUT;
-                    }
-                    // Медленный путь: готовность + сон получателя.
-                    match endpoint::register_ready(
-                        current,
-                        umap,
-                        tgt_va,
-                        tgt_capacity,
-                        from,
-                        recv_base,
-                        recv_count,
-                    ) {
-                        Ok(ep_idx) => {
-                            let wait_obj = endpoint::endpoint_wait_object(ep_idx);
-                            if args.deadline > 0
-                                && crate::task::deadline::register(current, wait_obj, args.deadline)
-                                    .is_err()
-                            {
-                                // Реестр дедлайнов полон: готовность снять,
-                                // чтобы не висел над спящей-не-уснувшей задачей.
-                                endpoint::unregister_ready(current);
-                                return res::E_SLAB;
-                            }
-                            let _ = lctl.scheduler_block_on_object(wait_obj, WaitModel::OneShot);
-                            // Пробуждение: либо доставка (буфер уже заполнен
-                            // отправителем), либо дедлайн. cancel снимает слот
-                            // в ЛЮБОМ случае — иначе тик выстрелит повторно.
-                            if args.deadline > 0 && crate::task::deadline::cancel(current) {
-                                // Сообщение могло прийти в тот же тик, что и
-                                // срок: цикл перепроверит pending — доставка
-                                // старше таймаута; без сообщения верх медленного
-                                // пути вернёт E_TIMEOUT (ticks >= deadline).
-                                continue;
-                            }
-                            return res::OK;
-                            // Доставка — в IPC_SEND отправителя (быстрый
-                            // путь): буфер заполнится, RAX уже OK.
-                        }
-                        Err(endpoint::IpcError::EndpointsFull) => return res::E_SLAB,
-                        Err(endpoint::IpcError::BadBuffer) => return res::E_INVALID_ARG,
-                        Err(endpoint::IpcError::MailboxFull) => return res::E_SLAB,
-                    }
-                }
-            }
-        }
+        wait_loop::<A>(
+            self.0,
+            lctl,
+            &access,
+            current,
+            sender_umap,
+            from,
+            None,
+            tgt_va,
+            capacity,
+            0,
+            0,
+            args.wait_deadline,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Параметры валидации IPC-аргументов (чистые функции — без ядра).
+    use super::*;
+
+    #[test]
+    fn delivery_bytes_matches_wire_format() {
+        // Заголовок 3 слова + по слову на cap + тело.
+        assert_eq!(endpoint::delivery_bytes(0, 0), 24);
+        assert_eq!(endpoint::delivery_bytes(1, 16), 48);
+        assert_eq!(endpoint::delivery_bytes(MAX_CAPS, MAX_MSG), (3 + MAX_CAPS) * 8 + MAX_MSG);
+    }
+
+    #[test]
+    fn queue_capacity_is_reasonable() {
+        // Очередь на задачу — замена глобального пула ящиков.
+        assert!(crate::task::ipc_state::MAX_IPC_QUEUE >= 8);
+        assert!(MAX_CAPS <= 8);
     }
 }

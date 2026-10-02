@@ -185,6 +185,47 @@ impl<UMAP: MemoryInterfaceUserspace> LocalKernelCTL<UMAP> {
             .map(|scheduler| scheduler.assign_current_task_to_wait(object_id, model))
     }
 
+    /// Вариант [`Self::scheduler_block_on_object`] с ПРЕДИКАТОМ-проверкой
+    /// под тем же WAKE_LOCK (lost-wakeup guard для rendezvous-транспорта).
+    ///
+    /// Гонка, которую закрывает: доставляющий успевает ОБРАБОТАТЬ событие
+    /// (изъять сообщение, снять готовность) в окне между проверкой
+    /// вызывающего и фактической постановкой в очередь — пробуждение
+    /// уходит в пустоту, спящий остаётся навсегда. Здесь проверка
+    /// `pred` выполняется ПОД WAKE_LOCK, то есть АТОМИРОВАННО с очередями
+    /// пробуждения: если событие уже случилось — задача НЕ засыпает
+    /// (возврат false), если случится после — waker дренит очередь под
+    /// тем же локом и будит её.
+    ///
+    /// `pred` обязан быть коротким (листовые локи ipc/гейтов — см.
+    /// task::ipc_state: порядок WAKE_LOCK → ipc → gate) и НЕ должен
+    /// звать планировщик/копировать userspace.
+    ///
+    /// Возврат: true — задача ушла в сон (проснется release'ем объекта);
+    /// false — предикат сработал до сна, вызов немедленно возвращается.
+    pub fn scheduler_block_on_object_if(
+        &mut self,
+        object_id: usize,
+        model: WaitModel,
+        pred: impl FnOnce() -> bool,
+    ) -> bool {
+        let _protocol = WAKE_LOCK.lock();
+        if pred() {
+            // Событие уже произошло (доставка/изъятие/отмена) — спать
+            // нельзя: проснуться было бы нечем.
+            return false;
+        }
+        match self.scheduler_ref() {
+            Some(scheduler) => {
+                scheduler.assign_current_task_to_wait(object_id, model);
+                true
+            }
+            // Планировщика нет (ранний бут/тесты): спать некуда —
+            // считаем "не уснул" (вызывающий перепроверит состояние).
+            None => false,
+        }
+    }
+
     /// Пробуждение ждущих объекта: локальный планировщик + ВСЕ чужие ядра
     /// (task::wake::release_object_global) + Resched-IPI разбуженным.
     /// Единая точка для ВСЕХ wake-сайтов ядра (IPC/фолты/IRQ/дедлайны/

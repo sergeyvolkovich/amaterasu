@@ -191,6 +191,9 @@ pub unsafe fn init_from_madt(
         let mut count = 0usize;
         let mut wired = 0u32;
         for (phys, gsi_base) in descs {
+            // MMIO-окно IO-APIC: как LAPIC — может быть дырой в HHDM
+            // (см. paging::device_window_ensure).
+            let _ = crate::paging::device_window_ensure(phys);
             if count >= MAX_IOAPICS {
                 break;
             }

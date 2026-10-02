@@ -2,12 +2,15 @@
 //!
 //! Сценарий (serial-лог через DBG_LOG_WRITE):
 //!   1. Находит ipc_receiver в ростере (argv → слот peer).
-//!   2. Посылает PING (label + payload «ping-N», N — счётчик попыток)
-//!      С capability-дескриптором: пересылает свой слот 1
-//!      (capability неймспейса) в слот 4 получателя (L4 map item).
-//!      Send блокируется, пока получатель не войдёт в wait — rendezvous.
-//!   3. Ждёт PONG (closed wait на получателя), логирует payload.
-//!   4. Self-exit.
+//!   2. Посылает PING С capability-дескриптором: пересылает свой слот 1
+//!      (capability неймспейса) получателю (L4 map item). Send
+//!      блокируется, пока получатель не войдёт в wait — rendezvous.
+//!   3. Ждёт PONG (closed wait на получателя) С ОКНОМ ПРИЁМА: в PONG
+//!      приходит Send-копия IPC-гейта сервера (map item от reply).
+//!   4. Гейт-фаза: атомарный IPC_CALL через гейт (GATE_REQ) — клиент
+//!      не использует TaskTCB-капу сервера вообще; ответ (GATE_RESP)
+//!      приходит в тот же буфер (двунаправленный call).
+//!   5. Self-exit.
 
 #![no_std]
 
@@ -39,14 +42,46 @@ fn main() {
         }
     }
 
-    // 2. Ждём PONG строго от получателя (closed wait на его слот).
+    // 2. Ждём PONG строго от получателя (closed wait) С ОКНОМ ПРИЁМА:
+    //    в PONG приходит Send-копия IPC-гейта сервера.
     let mut buf = ipc::recv_buffer();
-    match ipc::wait(ipc::WaitFrom::Slot(receiver_slot), ipc::RECV_NONE, &mut buf) {
+    let gate_slot = match ipc::wait(
+        ipc::WaitFrom::Slot(receiver_slot),
+        ipc::recv_window(ipc::TRANSFER_SLOT, 4),
+        &mut buf,
+    ) {
         Ok(r) => {
             log_code("ipc_sender: label=", r.label);
             log_bytes("ipc_sender: payload=", r.payload);
+            if r.caps_len == 0 {
+                dlog::log("ipc_sender: no gate cap in pong\n");
+                return;
+            }
+            r.cap_slots[0]
         }
-        Err(e) => log_code("ipc_sender: wait err ", code_of(e)),
+        Err(e) => {
+            log_code("ipc_sender: wait err ", code_of(e));
+            return;
+        }
+    };
+    log_code("ipc_sender: gate cap in slot ", gate_slot.raw());
+
+    // 3. Гейт-фаза: атомарный IPC_CALL через гейт — TaskTCB-капа сервера
+    //    не нужна вообще. Ответ приходит В ТОТ ЖЕ буфер (seL4-стиль).
+    match ipc::call(
+        gate_slot,
+        LABEL_GATE_REQ,
+        b"gate-ping",
+        &[],
+        ipc::RECV_NONE,
+        0,
+        &mut buf,
+    ) {
+        Ok(r) => {
+            log_code("ipc_sender: [gate] label=", r.label);
+            log_bytes("ipc_sender: [gate] payload=", r.payload);
+        }
+        Err(e) => log_code("ipc_sender: gate call err ", code_of(e)),
     }
 
     dlog::log("ipc_sender: done, self-exit\n");
@@ -55,6 +90,9 @@ fn main() {
 
 pub const LABEL_PING: u64 = 0xC1A0_0001;
 pub const LABEL_PONG: u64 = 0xC1A0_0002;
+/// Гейт-фаза: запрос через IPC_CALL и ответ сервера.
+pub const LABEL_GATE_REQ: u64 = 0xC1A0_0003;
+pub const LABEL_GATE_RESP: u64 = 0xC1A0_0004;
 
 // ─── Логирование (поверх dlog::Line — без fmt/аллокаций) ────────────────────
 
