@@ -178,6 +178,12 @@ pub fn destroy_task_full<A: ArchImplementation>(
     // деаллокации) — квота группы обязана их отпустить. Считаем и
     // списываем ДО транзакции (после destroy задача недоступна); при
     // неудаче транзакции — best-effort компенсация (см. ветки Err).
+    // Заодно — РЕФКАУНТ ГЕЙТОВ: живые гейт-капы погибшей держат ссылки
+    // в реестре ipc::gate; снимаем их здесь же (последняя ссылка
+    // автоуничтожает гейт: alive=false + gen++ + id в пул). Порядок
+    // корректен: purge гейт-очередей выполнен ВЫШЕ, так что умирающая
+    // вне очередей, а снимаемые ссылки принадлежат ТОЛЬКО ей —
+    // очереди чужих гейтов она уже покинула.
     let released_cap_objects = {
         let access = kctl.permission_backend.lock();
         let mut count = 0usize;
@@ -186,7 +192,14 @@ pub fn destroy_task_full<A: ArchImplementation>(
         {
             // SAFETY: под permission_backend-локом уничтожение невозможно.
             let gtcb = unsafe { gtcb_ptr.as_ref() };
-            gtcb.capspace().lock().for_each(|_| count += 1);
+            gtcb.capspace().lock().for_each(|record| {
+                count += 1;
+                if record.is_live()
+                    && let Some((gate_id, generation)) = record.gate_route_of()
+                {
+                    crate::ipc::gate::gate_cap_release(gate_id, generation);
+                }
+            });
             gtcb.cap_list().lock().for_each(|_| count += 1);
             for _ in 0..count {
                 ns.release_cap_object();
@@ -274,18 +287,22 @@ pub fn destroy_task_full<A: ArchImplementation>(
         }
         Err(crate::task::DestroyTaskManagerError::NotFound) => {
             restore_cap_object_quota::<A>(kctl, task_cap_id, released_cap_objects);
+            restore_gate_refs::<A>(kctl, task_cap_id);
             res::E_NOT_FOUND
         }
         Err(crate::task::DestroyTaskManagerError::NotTask) => {
             restore_cap_object_quota::<A>(kctl, task_cap_id, released_cap_objects);
+            restore_gate_refs::<A>(kctl, task_cap_id);
             res::E_NOT_FOUND
         }
         Err(crate::task::DestroyTaskManagerError::InvariantBroken) => {
             restore_cap_object_quota::<A>(kctl, task_cap_id, released_cap_objects);
+            restore_gate_refs::<A>(kctl, task_cap_id);
             res::E_INTERNAL
         }
         Err(crate::task::DestroyTaskManagerError::Access(_)) => {
             restore_cap_object_quota::<A>(kctl, task_cap_id, released_cap_objects);
+            restore_gate_refs::<A>(kctl, task_cap_id);
             res::E_INTERNAL
         }
     }
@@ -309,6 +326,32 @@ fn restore_cap_object_quota<A: ArchImplementation>(
         for _ in 0..count {
             let _ = ns.try_reserve_cap_object();
         }
+    }
+}
+
+/// Best-effort компенсация РЕФКАУНТА ГЕЙТОВ: транзакция destroy не
+/// состоялась — задача жива, её живые гейт-капы снова владеют ссылками.
+/// Повторный retain по тем же записям точен; единственное окно — между
+/// снятием ссылок (обход capspace) и компенсацией лок permission_backend
+/// отпускался: чужой CAP_MINT/CAP_TRANSFER в cspace умирающей мог
+/// добавить записи со своим retain'ом — тогда компенсация даст лишнюю
+/// ссылку. Направление безопасное: призрачная ссылка лишь удерживает
+/// гейт в живых (недо-освобождение, не польза-после-смерти).
+fn restore_gate_refs<A: ArchImplementation>(
+    kctl: &'static crate::KernelCTL<A>,
+    task_cap_id: u64,
+) {
+    let access = kctl.permission_backend.lock();
+    if let Some(gtcb_ptr) = access.get_task_tcb(task_cap_id) {
+        // SAFETY: под permission_backend-локом уничтожение невозможно.
+        let gtcb = unsafe { gtcb_ptr.as_ref() };
+        gtcb.capspace().lock().for_each(|record| {
+            if record.is_live()
+                && let Some((gate_id, generation)) = record.gate_route_of()
+            {
+                crate::ipc::gate::gate_cap_retain(gate_id, generation);
+            }
+        });
     }
 }
 

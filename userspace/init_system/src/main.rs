@@ -10,5 +10,7 @@ use cintos_user::{
 pub mod file_server;
 
 fn main() {
-    dlog::log("init: start\n");
+    dlog::log("System INIT service started\n");
+    
+
 }

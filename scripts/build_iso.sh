@@ -27,8 +27,15 @@ cd "$ROOT"
 # shellcheck disable=SC1091
 . "$HOME/.cargo/env"
 
-echo "==> [1/5] cargo build ($TARGET, $PROFILE)"
-cargo build --target "$TARGET"
+# INIT_ONLY=1: ядро на бутe стартует только init; остальные модули
+# по-прежнему лежат в limine.conf (реестр TaskImage строится из них).
+FEATURES=()
+if [ "${INIT_ONLY:-0}" = "1" ]; then
+    FEATURES=(--features kernel_limine/init-only)
+fi
+
+echo "==> [1/5] cargo build ($TARGET, $PROFILE${INIT_ONLY:+, init-only})"
+cargo build --target "$TARGET" ${FEATURES[@]+"${FEATURES[@]}"}
 
 USERSPACE="$ROOT/target/$TARGET/$PROFILE"
 KERNEL="$USERSPACE/cintos_kernel"

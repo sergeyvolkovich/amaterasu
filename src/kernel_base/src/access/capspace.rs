@@ -33,6 +33,14 @@
 //! revoke_slot, фаза отправителя в ipc::cap_transfer); cap_list без
 //! удерживаемого capspace берут только install_root/ensure_slot_membrane.
 //! Обратного порядка нигде нет, поэтому циклов в порядке локов не возникает.
+//!
+//! РЕФКАУНТ КАП ГЕЙТА (ipc::gate): установка записи с прямой ссылкой на
+//! зиготу IpcGate (install_root_capability / put_linked_record) берёт
+//! ссылку (gate_cap_retain), снятие (take_slot) возвращает её
+//! (gate_cap_release — последняя автоматически уничтожает гейт). Лок
+//! шарда гейта — под локами capspace (permission_backend → gate —
+//! порядок шапки ipc::gate); цепочки (Chained, mint в пределах одного
+//! cspace) ссылок не берут — их жизнь ограничена tombstone родителя.
 
 use core::ptr::NonNull;
 
@@ -117,18 +125,42 @@ pub fn install_root_capability<UMAP: MemoryInterfaceUserspace>(
             return Err(CapspaceError::SlotOccupied);
         }
         existing.recycle_as_root(zygote, membrane_ptr, rights);
+        // РЕФКАУНТ ГЕЙТОВ: новая живая запись — новая ссылка на гейт
+        // (последняя снятая ссылка уничтожает гейт — см. ipc::gate).
+        retain_gate_of(zygote);
         return Ok(());
     }
     // НОВОЯ запись: зарядить квоту (при отказе аллокации — вернуть учёт).
     reserve_cap_object(ns)?;
     let record = LinkedRecord::new_root(zygote, membrane_ptr, rights);
+    // Маршрут гейта снимается ДО вставки: после неё тело записи
+    // принадлежит slab-дереву, а владение ссылкой начинается только с
+    // успешной установки (при Slab-откате ссылка не берётся вовсе).
+    let gate_route = unsafe { zygote.as_ref() }.gate_route();
     if let Err(e) = caps.insert(slot, record) {
         if let Some(ns) = ns {
             ns.release_cap_object();
         }
         return Err(CapspaceError::Slab(e));
     }
+    if let Some((gate_id, generation)) = gate_route {
+        crate::ipc::gate::gate_cap_retain(gate_id, generation);
+    }
     Ok(())
+}
+
+/// Рефкаунт гейтов для переиспользованной (recycle) записи: маршрут
+/// снимается с зиготы, на которую заново смотрит запись. Отказ retain
+/// (гейт уже мёртв) — не ошибка установки: капа протухшая, все операции
+/// по ней ответят E_CAP_REVOKED (resolve_ipc_gate не резолвит мёртвый
+/// слот). Зиготы не переезжают и не освобождаются — разыменование
+/// безопасно под permission_backend-локом (контракт модуля).
+fn retain_gate_of<UMAP: MemoryInterfaceUserspace>(
+    zygote: NonNull<crate::access::capability::CapabilityZygote<UMAP>>,
+) {
+    if let Some((gate_id, generation)) = unsafe { zygote.as_ref() }.gate_route() {
+        crate::ipc::gate::gate_cap_retain(gate_id, generation);
+    }
 }
 
 /// Кладёт ГОТОВУЮ запись (mint/clone/transfer_flattened) в слот-приёмник.
@@ -141,6 +173,11 @@ pub fn put_linked_record<UMAP: MemoryInterfaceUserspace>(
     record: LinkedRecord<UMAP>,
     ns: Option<&Namespace>,
 ) -> Result<(), CapspaceError> {
+    // РЕФКАУНТ ГЕЙТОВ: маршрут гейта (если запись — flatten-копия
+    // гейт-капы: передача по IPC, кросс-задачный mint/clone) снимается
+    // ДО вставки. Chained-записи дают None — собственных ссылок они не
+    // берут (их жизнь ограничена tombstone родителя).
+    let gate_route = record.gate_route_of();
     let mut caps = gtcb.capspace().lock();
     if let Some(existing) = caps.get(&slot) {
         // Живой слот — занят; затумбстоуненный — recycle на месте телом
@@ -149,6 +186,9 @@ pub fn put_linked_record<UMAP: MemoryInterfaceUserspace>(
             return Err(CapspaceError::SlotOccupied);
         }
         existing.recycle_as(&record);
+        if let Some((gate_id, generation)) = gate_route {
+            crate::ipc::gate::gate_cap_retain(gate_id, generation);
+        }
         return Ok(());
     }
     // НОВОЯ запись: зарядить квоту (при отказе аллокации — вернуть учёт).
@@ -158,6 +198,11 @@ pub fn put_linked_record<UMAP: MemoryInterfaceUserspace>(
             ns.release_cap_object();
         }
         return Err(CapspaceError::Slab(e));
+    }
+    // Вставка удалась — запись владеет ссылкой; при Slab-откате ссылка
+    // не берётся (владение начинается с успешной установки).
+    if let Some((gate_id, generation)) = gate_route {
+        crate::ipc::gate::gate_cap_retain(gate_id, generation);
     }
     Ok(())
 }
@@ -240,6 +285,19 @@ pub fn take_slot<UMAP: MemoryInterfaceUserspace>(
             .get(&slot)
             .expect("собственная мембрана слота не может исчезнуть")
             .revoke();
+    }
+
+    // РЕФКАУНТ ГЕЙТОВ: запись умирает — вернуть её ссылку (если это была
+    // гейт-капа). Последняя ссылка уничтожает гейт автоматически
+    // (ipc::gate::gate_cap_release: alive=false + gen++ + id в пул).
+    // Маршрут снимается ДО tombstone; мембраны сознательно не
+    // проверяются (идентичность, не авторитет — см.
+    // LinkedRecord::gate_route_of): мембранно-ревокнутая, но живая
+    // запись всё ещё владеет ссылкой. Протухшие записи (зигота
+    // переиспользована) дают None — ссылкой на текущую жизнь слота они
+    // не владеют.
+    if let Some((gate_id, generation)) = record.gate_route_of() {
+        crate::ipc::gate::gate_cap_release(gate_id, generation);
     }
 
     // Tombstone на месте: потомки обнаружат смерть по live/generation.

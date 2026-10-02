@@ -62,14 +62,34 @@
 //! сериализованы task_manager-локом. Мутации очередей — ТОЛЬКО под
 //! task_manager-локом.
 //!
+//! РЕФКАУНТ КАП (автоуничтожение): каждая ЖИВАЯ кап-запись с прямой
+//! ссылкой на зиготу гейта (корень IPC_CREATE_GATE, flatten-копии —
+//! передача по IPC, кросс-задачный mint/clone — все они ссылаются на
+//! зиготу напрямую, см. access::capability) держит ссылку в слоте
+//! (`caps`). Снятие записи (CAP_DESTROY слота) и смерть задачи (обход
+//! capspace в destroy_task_full) ссылки возвращают; последняя —
+//! уничтожает гейт АВТОМАТИЧЕСКИ (та же секвенция alive=false + gen++ +
+//! возврат id в пул, что у IPC_DESTROY_GATE). Очереди к этому моменту
+//! пусты ПО ПОСТРОЕНИЮ: стоящий в очереди участник держит свою капу
+//! гейта, а живых кап нет — инвариант проверяется защитно.
+//! Chained-записи (mint в ПРЕДЕЛАХ одного cspace) ссылок НЕ берут: их
+//! жизнь ограничена tombstone родителя (потомок протухает вместе с ним
+//! — отдельный учёт дал бы вечные призраки). IPC_DESTROY_GATE остаётся
+//! явным административным путём (держатель Recv-капы) — теперь это
+//! ранний уничтожение при живых капах, а не единственный способ
+//! освободить слот.
+//!
 //! ЖИЗНЕННЫЙ ЦИКЛ: слот выделяется при создании capability
-//! (IPC_CREATE_GATE) вместе с генерацией в капе. Откат неудачного
-//! создания — gate_free (кап ещё нет — gen не трогаем). Явное
-//! уничтожение — IPC_DESTROY_GATE (держатель Recv-капы): alive=false,
-//! gen++ (все прежние маршруты невалидны), очереди дренируются с
-//! E_CAP_REVOKED всем блокированным (партиями, wake вне локов), id
-//! возвращается в пул. Переиспользованный слот получает новый gen —
-//! старые капы/маршруты не «переезжают» на новый гейт.
+//! (IPC_CREATE_GATE) вместе с генерацией в капе; счётчик ссылок — с
+//! нуля. Откат неудачного создания — gate_free (кап ещё нет — gen не
+//! трогаем). Ссылки кап живут в слоте и сбрасываются при
+//! переиспользовании id (протухшие капы релизятся мимо — по
+//! несоответствию поколений). Явное уничтожение — IPC_DESTROY_GATE
+//! (держатель Recv-капы): alive=false, gen++ (все прежние маршруты
+//! невалидны), очереди дренируются с E_CAP_REVOKED всем блокированным
+//! (партиями, wake вне локов), id возвращается в пул.
+//! Переиспользованный слот получает новый gen — старые капы/маршруты
+//! не «переезжают» на новый гейт.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -125,7 +145,8 @@ pub struct GateVictim {
 /// Слот реестра гейтов. Живёт вечно после первой аллокации id (узел
 /// slab-таблицы не удаляется): gen — счётчик поколений для ABA-защиты
 /// кап, alive — признак живого гейта, head/tail — интрузивные FIFO
-/// (task_cap_id узлов, [`NO_TASK`] — пусто).
+/// (task_cap_id узлов, [`NO_TASK`] — пусто), caps — число живых
+/// кап-записей, держащих ссылку на гейт (рефкаунт автоуничтожения).
 ///
 /// Всё состояние — атомарные поля: RBSlabIO отдаёт только &V (get_mut
 /// принципиально отсутствует — см. collection.rs); когерентность
@@ -143,6 +164,17 @@ pub struct GateSlot {
     /// Интрузивная FIFO ожидателей: head/tail.
     receivers_head: AtomicU64,
     receivers_tail: AtomicU64,
+    /// Рефкаунт кап: сколько живых кап-записей (корень + flatten-копии)
+    /// держат ссылку на гейт. Увеличивается при установке записи
+    /// (capspace::install_root_capability / put_linked_record),
+    /// уменьшается при снятии (take_slot) и при смерти задачи (обход
+    /// capspace). Ноль на ЖИВОМ гейте возможен только транзитно — между
+    /// gate_alloc и установкой корневой капы; ноль, полученный
+    /// fetch_sub'ом, означает «последняя капа умерла» → гейт
+    /// автоуничтожается (см. gate_cap_release). Chained-записи (mint в
+    /// пределах одного cspace) не учитываются: их жизнь ограничена
+    /// родителем.
+    caps: AtomicU32,
 }
 
 impl GateSlot {
@@ -155,6 +187,7 @@ impl GateSlot {
             senders_tail: AtomicU64::new(NO_TASK),
             receivers_head: AtomicU64::new(NO_TASK),
             receivers_tail: AtomicU64::new(NO_TASK),
+            caps: AtomicU32::new(0),
         }
     }
 
@@ -270,6 +303,15 @@ pub fn gate_alloc() -> Result<(u64, u32), GateAllocError> {
             ID_POOL.release(raw);
             return Err(GateAllocError::Slab);
         }
+    } else {
+        // Переиспользование узла: сброс ссылок кап прошлой жизни.
+        // Протухшие капы прошлой жизни релизятся МИМО нового счётчика —
+        // по несоответствию поколений (gen бампнут destroy'ем); сброс —
+        // страховка от призрачного недо-освобождения id (например,
+        // откат gate_free, где gen не бампился, но кап и не было).
+        if let Some(slot) = table.0.get(&gate_id) {
+            slot.caps.store(0, Ordering::Release);
+        }
     }
     let Some(slot) = table.0.get(&gate_id) else {
         drop(table);
@@ -306,6 +348,88 @@ pub fn gate_live(gate_id: u64, generation: u32) -> bool {
         Some(slot) => slot.is_alive() && slot.generation() == generation,
         None => false,
     }
+}
+
+// ─── Рефкаунт кап (автоуничтожение последней ссылкой) ───────────────────────
+
+/// Берёт ссылку гейта под кап-запись (install/flatten-копия). Вызывается
+/// ПОД permission_backend (все точки — capspace) сразу после успешной
+/// установки записи. false — гейт уже мёртв или поколение разошлось:
+/// ссылки нет, капа остаётся установленной, но все операции по ней
+/// ответят E_CAP_REVOKED (resolve_ipc_gate не резолвит мёртвый слот).
+///
+/// Порядок локов: permission_backend → gate (лок шарда — самый
+/// внутренний, см. шапку модуля).
+pub fn gate_cap_retain(gate_id: u64, generation: u32) -> bool {
+    let Some(slots) = shard_slots(shard_of(gate_id)) else {
+        return false;
+    };
+    let table = slots.lock();
+    let Some(slot) = table.0.get(&gate_id) else {
+        return false;
+    };
+    if !slot.matches(&GateRoute { id: gate_id, generation }) {
+        return false;
+    }
+    slot.caps.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// Возвращает ссылку гейта (tombstone записи в take_slot или смерть
+/// задачи — обход capspace в destroy_task_full). true — это была
+/// ПОСЛЕДНЯЯ ссылка: гейт автоуничтожен (alive=false, gen++, id в пул).
+/// Снятие протухшей капы (поколение разошлось) — false, без эффектов:
+/// протухшая запись никогда не держала ссылку на ТЕКУЩУЮ жизнь слота.
+///
+/// ИНВАРИАНТ: стоящий в очереди гейта участник держит свою капу, поэтому
+/// к моменту обнуления счётчика очереди пусты — дренировать нечего, ни
+/// task_manager-лок, ни wake-механика здесь не нужны (это и позволяет
+/// освобождать гейты из take_slot/обхода capspace, где планировщика нет).
+/// Нарушение инварианта невозможно по построению; защитная проверка
+/// громко логирует и НЕ возвращает id в пул (оставшиеся в очередях узлы
+/// никогда не проснутся — лучше потерять id, чем повредить чужие TCB).
+pub fn gate_cap_release(gate_id: u64, generation: u32) -> bool {
+    let Some(slots) = shard_slots(shard_of(gate_id)) else {
+        return false;
+    };
+    let (senders, receivers) = {
+        let table = slots.lock();
+        let Some(slot) = table.0.get(&gate_id) else {
+            return false;
+        };
+        if !slot.matches(&GateRoute { id: gate_id, generation }) {
+            return false;
+        }
+        let prev = slot.caps.fetch_sub(1, Ordering::AcqRel);
+        if prev != 1 {
+            return false;
+        }
+        // Последняя ссылка умерла — автоуничтожение (под локом шарда,
+        // как первая фаза gate_destroy: мгновенная смерть для всех новых
+        // операций, которые после разблокировки увидят gen-несоответствие).
+        let senders = slot.head(GateQueueSide::Senders);
+        let receivers = slot.head(GateQueueSide::Receivers);
+        slot.alive.store(false, Ordering::Release);
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        (senders, receivers)
+    };
+    if senders != NO_TASK || receivers != NO_TASK {
+        // Инвариант «очереди пусты при нуле ссылок» нарушен. Не
+        // возвращаем id в пул: переиспользование слота стёрло бы очереди,
+        // в которых всё ещё стоят живые TCB (их сняло бы только
+        // оглушение по таймауту). Гейт навсегда мёртв, id потерян —
+        // громкая диагностика вместо тихой порчи.
+        crate::kernel_log!(
+            "ipc: gate {} auto-freed with non-empty queues ({} / {} heads) — id leaked, invariant broken\n",
+            gate_id,
+            senders,
+            receivers
+        );
+        return true;
+    }
+    crate::kernel_log!("ipc: gate {} auto-freed: last cap released\n", gate_id);
+    ID_POOL.release(gate_id as u32);
+    true
 }
 
 // ─── Чистая алгебра head/tail (unit-тесты без TCB) ─────────────────────────
@@ -1199,5 +1323,49 @@ mod tests {
         assert_eq!(gate_peek_receiver(route), None);
         assert_eq!(gate_pop_sender(tasks, route), None);
         gate_free(gate_id);
+    }
+
+    /// Рефкаунт кап: retain/release, автоуничтожение последней ссылкой,
+    /// мимо-релизы протухших кап, чистота счётчика при переиспользовании.
+    #[test]
+    fn cap_refcount_lifecycle() {
+        let _guard = crate::test_guard::GLOBAL.lock();
+        ensure_slab();
+
+        let (id, generation) = gate_alloc().expect("alloc");
+        assert!(gate_live(id, generation));
+
+        // Две «записи» держат ссылки (корень + flatten-копия).
+        assert!(gate_cap_retain(id, generation));
+        assert!(gate_cap_retain(id, generation));
+
+        // Мимо: чужое поколение и несуществующий id — ссылок нет.
+        assert!(!gate_cap_retain(id, generation.wrapping_add(1)));
+        assert!(!gate_cap_retain(id.wrapping_add(1_000_000), generation));
+        assert!(!gate_cap_release(id, generation.wrapping_add(1)));
+
+        // Первое снятие — гейт ещё жив (осталась одна ссылка).
+        assert!(!gate_cap_release(id, generation));
+        assert!(gate_live(id, generation));
+
+        // Последнее снятие — автоуничтожение (очереди пусты: id в пул).
+        assert!(gate_cap_release(id, generation));
+        assert!(!gate_live(id, generation));
+        assert_eq!(gate_status(GateRoute { id, generation: generation }), (false, false));
+
+        // Мимо-релиз после смерти — без эффектов, не портит пул id.
+        assert!(!gate_cap_release(id, generation));
+
+        // Переиспользование: тот же id, generation+1 (бампнут автоуничтожением),
+        // счётчик с нуля — старые ссылки нового не трогают.
+        let (id2, gen2) = gate_alloc().expect("realloc");
+        assert_eq!(id2, id);
+        assert_eq!(gen2, generation + 1, "автоуничтожение бампит поколение на 1");
+        // Протухшая капа прошлого поколения мимо: retain/release по generation.
+        assert!(!gate_cap_retain(id2, generation));
+        assert!(!gate_cap_release(id2, generation));
+        assert!(gate_cap_retain(id2, gen2));
+        assert!(gate_cap_release(id2, gen2));
+        assert!(!gate_live(id2, gen2));
     }
 }

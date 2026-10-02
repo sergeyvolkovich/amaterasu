@@ -15,6 +15,11 @@ test = false
 doctest = false
 bench = false
 
+[features]
+# Ядро на бутe поднимает ТОЛЬКО init (остальные модули остаются образами
+# для TASK_CREATE). Без фичи — все модули (демо-стенд).
+init-only = []
+
 [dependencies]
 kernel_base = { path = "../kernel_base" }
 kernel_x86 = { path = "../kernel_x86" }

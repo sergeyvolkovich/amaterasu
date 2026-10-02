@@ -34,6 +34,7 @@ const FAULT_ROUNDS: usize = 2;
 
 fn main() {
     log(b"fault_keeper: creating fault endpoint (slot 17)\n");
+
     if let Err(e) = fault::create_endpoint(FAULT_EP_SLOT) {
         log_code(b"fault_keeper: create err ", code_of(e));
         crt0::exit(1);
@@ -44,8 +45,10 @@ fn main() {
         log(b"fault_keeper: fault_child not in roster\n");
         crt0::exit(1);
     };
+
     match fault::set_endpoint(FAULT_EP_SLOT, child_slot) {
         Ok(()) => log(b"fault_keeper: endpoint bound to fault_child\n"),
+
         Err(e) => {
             log_code(b"fault_keeper: bind err ", code_of(e));
             crt0::exit(1);

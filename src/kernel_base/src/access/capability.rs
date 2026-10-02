@@ -125,6 +125,15 @@ pub enum CapabilityObject<UMAP: MemoryInterfaceUserspace> {
     /// резолвиться → E_CAP_REVOKED; tombstone-записи cspace от мёртвых
     /// кап протухают сами, слот безопасно возвращается пулу. Приём тот
     /// же, что у FaultEndpoint/TaskTCB.
+    ///
+    /// РЕФКАУНТ: каждая живая кап-запись с ПРЯМОЙ ссылкой на зиготу
+    /// гейта (корень, flatten-копии — передача по IPC, кросс-задачный
+    /// mint/clone) держит ссылку в слоте реестра; снятие записи
+    /// (CAP_DESTROY) и смерть задачи (обход capspace) её возвращают,
+    /// последняя — уничтожает гейт автоматически (ipc::gate:
+    /// gate_cap_release). Chained-записи (mint в пределах одного
+    /// cspace) ссылок не берут — их жизнь ограничена tombstone
+    /// родителя.
     IpcGate {
         gate_id: u64,
         /// Поколение слота на момент создания капы (снято gate_alloc).
@@ -416,6 +425,20 @@ impl<UMAP: MemoryInterfaceUserspace> CapabilityZygote<UMAP> {
             *self.object.get() = Some(object);
         }
     }
+
+    /// Маршрут IpcGate, объектом которого является эта зигота, или None
+    /// (не гейт / затумбстоунена). Для рефкаунта кап гейта
+    /// (ipc::gate::gate_cap_retain): install_root_capability вызывает
+    /// сразу после установки корневой записи.
+    pub(crate) fn gate_route(&self) -> Option<(u64, u32)> {
+        match self.object()? {
+            CapabilityObject::IpcGate {
+                gate_id,
+                generation,
+            } => Some((*gate_id, *generation)),
+            _ => None,
+        }
+    }
 }
 
 /// Граница авторитета. Единственная точка правды о том, жив ли
@@ -659,6 +682,38 @@ impl<UMAP: MemoryInterfaceUserspace> LinkedRecord<UMAP> {
     /// корневой слот от слота-приёмника clone).
     pub fn membrane_ptr(&self) -> NonNull<CapabilityMembrane> {
         self.body().membrane
+    }
+
+    /// Маршрут IpcGate, на который напрямую ссылается ЭТА запись, или
+    /// None. Для рефкаунта кап гейта (ipc::gate::gate_cap_retain /
+    /// gate_cap_release): точки вызова — capspace (install/put/take) и
+    /// обход capspace при смерти задачи.
+    ///
+    /// ИДЕНТИЧНОСТЬ, НЕ АВТОРИТЕТ: проверяются только поколение зиготы и
+    /// класс объекта. Проверок мембран/прав НЕТ сознательно — снятие
+    /// мембранно-ревокнутой, но ещё живой записи обязано вернуть ссылку
+    /// (иначе она утекла бы до смерти задачи). Цепочки (Chained — mint в
+    /// пределах одного cspace) — None: потомок не держит собственной
+    /// ссылки на гейт, его время жизни ограничено tombstone родителя
+    /// (revoke-семантика цепочек), отдельный учёт дал бы вечные призраки
+    /// (потомок переживает родителя только юридически — резолвиться он
+    /// после смерти родителя всё равно не может).
+    pub(crate) fn gate_route_of(&self) -> Option<(u64, u32)> {
+        match self.body().target {
+            LinkTarget::Zygote(z, gen_at_mint) => {
+                // SAFETY: зиготы не переезжают и не освобождаются
+                // (AccessManager tombstone/recycle на месте); контракт
+                // чтения — под permission_backend-локом, как у resolve().
+                let zygote = unsafe { z.as_ref() };
+                if zygote.generation() != gen_at_mint {
+                    // Слот зиготы переиспользован под другой объект —
+                    // капа протухла, ссылки на текущую жизнь нет.
+                    return None;
+                }
+                zygote.gate_route()
+            }
+            LinkTarget::Chained(_) => None,
+        }
     }
 
     /// Итеративный обход цепочки до зиготы: (зигота, поколение зиготы,

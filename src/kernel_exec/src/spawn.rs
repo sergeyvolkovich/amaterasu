@@ -98,6 +98,20 @@ pub const BOOT_SLOT_IMAGE_BASE: u64 = 32;
 /// с полными правами, но TaskImage-капы раздаём уже по минимуму).
 pub const INIT_MODULE_NAME: &str = "init";
 
+/// Политика бут-спавна: какие boot-модули ядро поднимает САМО.
+///
+/// В обоих режимах реестр образов (TASK_CREATE) содержит ВСЕ модули —
+/// отличается только то, что стартует на бутe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootSpawnPolicy {
+    /// Все модули (демо-стенд: ростер + peer-капы между всеми серверами).
+    All,
+    /// Только `INIT_MODULE_NAME`. Остальное init поднимает сам через
+    /// TASK_CREATE по TaskImage-капам (слоты 32+j); ростер состоит из
+    /// одного init, peer-капы остальным не выдаются.
+    InitOnly,
+}
+
 /// Basename пути модуля Limine ("boot():/boot/modules/init" -> "init").
 fn basename(path: &str) -> &str {
     match path.rfind('/') {
@@ -539,6 +553,9 @@ pub struct SpawnedServer {
 ///      получает РОСТЕР в argv: argv[0] = своё имя, argv[1+i] = имя
 ///      i-го сервера (слот peer = 2 + i).
 ///
+/// `policy` выбирает, какие модули стартуют на бутe (см. [`BootSpawnPolicy`]);
+/// в режиме `InitOnly` без модуля init вернётся `SpawnError::NoServers`.
+///
 /// Отказ ОДНОГО модуля (битый образ, OOM) не срывает остальные: плохой
 /// модуль пропускается, ошибка сохраняется; Err возвращается только
 /// если не поднялся ни один сервер.
@@ -546,6 +563,7 @@ pub fn spawn_boot_servers<A: ArchImplementation>(
     kctl: &'static KernelCTL<A>,
     boot: &BootInfo,
     frames: &'static (dyn FrameAllocator + Sync),
+    policy: BootSpawnPolicy,
 ) -> Result<heapless::Vec<SpawnedServer, 12>, SpawnError> {
     if exec_registry().is_empty() {
         return Err(SpawnError::NoFormats);
@@ -600,6 +618,10 @@ pub fn spawn_boot_servers<A: ArchImplementation>(
 
     for module in boot.boot_modules() {
         let name = module.name().to_str().unwrap_or("server");
+        // InitOnly: образ уже в реестре (выше) — просто не стартуем его.
+        if policy == BootSpawnPolicy::InitOnly && basename(name) != INIT_MODULE_NAME {
+            continue;
+        }
         match spawn_one_server::<A>(
             kctl,
             frames,

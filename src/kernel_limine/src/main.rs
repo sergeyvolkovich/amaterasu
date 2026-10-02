@@ -666,6 +666,13 @@ fn kernel_up(
     kctl
 }
 
+/// Что ядро стартует само: cargo feature `init-only` -> только init.
+const BOOT_SPAWN_POLICY: kernel_exec::BootSpawnPolicy = if cfg!(feature = "init-only") {
+    kernel_exec::BootSpawnPolicy::InitOnly
+} else {
+    kernel_exec::BootSpawnPolicy::All
+};
+
 /// 9-10. Реестр форматов + системные серверы + диспетчеризация.
 fn exec_up(
     kctl: &'static KernelCTL<X86Backend>,
@@ -678,7 +685,7 @@ fn exec_up(
         registry.register(&ELF_FORMAT);
         kernel_exec::spawn::set_exec_registry(&*registry);
     }
-    match kernel_exec::spawn_boot_servers(kctl, boot_info, fm) {
+    match kernel_exec::spawn_boot_servers(kctl, boot_info, fm, BOOT_SPAWN_POLICY) {
         Ok(servers) => {
             for s in &servers {
                 kernel_log!(

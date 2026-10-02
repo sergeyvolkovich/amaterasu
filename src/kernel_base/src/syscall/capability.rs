@@ -263,7 +263,10 @@ impl<A: ArchImplementation> DomainCapability<A, SyscallCapCreateNamespace> {
             return res::E_INTERNAL;
         };
 
-        let cap_id = match access.create_new_object(CapabilityObject::new_task_group_namespace(namespace_ptr, namespace_id)) {
+        let cap_id = match access.create_new_object(CapabilityObject::new_task_group_namespace(
+            namespace_ptr,
+            namespace_id,
+        )) {
             Ok(id) => id,
             Err(crate::access::AccessError::Slab(_)) => {
                 rollback(access);
@@ -298,12 +301,18 @@ impl<A: ArchImplementation> DomainCapability<A, SyscallCapCreateNamespace> {
     }
 }
 
-impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallCapCreateNamespace> {
+impl<A: ArchImplementation + 'static> SyscallDomain
+    for DomainCapability<A, SyscallCapCreateNamespace>
+{
     const SYSCALL_ID: usize = 16;
     type Args = SyscallCapCreateNamespace;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         // Без текущей задачи сисколл не авторизуем (bootstrap создаёт
         // неймспейсы напрямую через AccessManager, минуя сисколлы).
         let Some(current) = lctl.current_task_cap_id() else {
@@ -314,7 +323,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 
         // Групповой потолок: создавать неймспейсы может только носитель
         // CAP_MANAGE — независимо от того, что написано в его капабилити.
-        if access.check_task_rights(current, NamespaceRights::CAP_MANAGE).is_err() {
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MANAGE)
+            .is_err()
+        {
             return res::E_RIGHTS_DENIED;
         }
 
@@ -380,12 +392,18 @@ pub(crate) fn create_descriptor_capability<A: ArchImplementation>(
     cap_id
 }
 
-impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallCapCreateIpcPool> {
+impl<A: ArchImplementation + 'static> SyscallDomain
+    for DomainCapability<A, SyscallCapCreateIpcPool>
+{
     const SYSCALL_ID: usize = 17;
     type Args = SyscallCapCreateIpcPool;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -394,7 +412,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 
         // Оперирование памятью группы (пул IPC — память) + управление капами.
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::MEMORY_ALLOC)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::MEMORY_ALLOC,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -432,7 +453,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapCreateMmio;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -465,7 +490,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         let mut access = self.0.permission_backend.lock();
 
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::MMIO_MAP)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::MMIO_MAP,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -501,25 +529,32 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 /// в датапути). Физику резолвит ядро (VmapRegion::lookup): юзерспейс
 /// не знает физических адресов. Права — те же, что у MMIO-создания:
 /// получателю для монтажа понадобится MMIO_MAP у группы.
-impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallCapCreateShared> {
+impl<A: ArchImplementation + 'static> SyscallDomain
+    for DomainCapability<A, SyscallCapCreateShared>
+{
     const SYSCALL_ID: usize = 25;
     type Args = SyscallCapCreateShared;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
-        if args.pages == 0
-            || args.src_vaddr % crate::traits::memory::PAGE_SIZE as u64 != 0
-        {
+        if args.pages == 0 || args.src_vaddr % crate::traits::memory::PAGE_SIZE as u64 != 0 {
             return res::E_INVALID_ARG;
         }
 
         let mut access = self.0.permission_backend.lock();
 
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::MMIO_MAP)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::MMIO_MAP,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -557,7 +592,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapCreateIrq;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -573,7 +612,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         let mut access = self.0.permission_backend.lock();
 
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::IRQ_BIND)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::IRQ_BIND,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -650,12 +692,18 @@ fn hw_result_code(e: crate::traits::irq::IrqHwError) -> u64 {
     }
 }
 
-impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallCapCreateFaultEndpoint> {
+impl<A: ArchImplementation + 'static> SyscallDomain
+    for DomainCapability<A, SyscallCapCreateFaultEndpoint>
+{
     const SYSCALL_ID: usize = 26;
     type Args = SyscallCapCreateFaultEndpoint;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -665,7 +713,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         // Фолт-домен (создание капабилити класса) + компетенция
         // обработки чужих фолтов.
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::FAULT_HANDLE)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::FAULT_HANDLE,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -701,7 +752,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallIpcCreateGate;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -709,7 +764,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         let mut access = self.0.permission_backend.lock();
 
         if access
-            .check_task_rights(current, NamespaceRights::CAP_MANAGE | NamespaceRights::IPC_SEND)
+            .check_task_rights(
+                current,
+                NamespaceRights::CAP_MANAGE | NamespaceRights::IPC_SEND,
+            )
             .is_err()
         {
             return res::E_RIGHTS_DENIED;
@@ -757,7 +815,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallIpcDestroyGate;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -848,7 +910,11 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapMint;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
@@ -860,7 +926,10 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
 
         let access = self.0.permission_backend.lock();
 
-        if access.check_task_rights(current, NamespaceRights::CAP_MINT).is_err() {
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MINT)
+            .is_err()
+        {
             return res::E_RIGHTS_DENIED;
         }
 
@@ -882,7 +951,12 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         let dst = unsafe { dst_ptr.as_ref() };
 
         // Мембрана слота получателя — до минта (mint снимает с неё эпоху).
-        let membrane = match capspace::ensure_slot_membrane(dst, args.dst_slot, requested, access.task_namespace(args.dst_task_cap)) {
+        let membrane = match capspace::ensure_slot_membrane(
+            dst,
+            args.dst_slot,
+            requested,
+            access.task_namespace(args.dst_task_cap),
+        ) {
             Ok(membrane) => membrane,
             Err(e) => return capspace_result_code(Err(e)),
         };
@@ -904,13 +978,17 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
                 match record.mint(requested, membrane) {
                     Ok(minted) => minted,
                     Err(crate::access::capability::CapFault::Revoked) => return res::E_CAP_REVOKED,
-                    Err(crate::access::capability::CapFault::RightsExceeded) => return res::E_RIGHTS_EXCEEDED,
+                    Err(crate::access::capability::CapFault::RightsExceeded) => {
+                        return res::E_RIGHTS_EXCEEDED;
+                    }
                 }
             } else {
                 match record.mint_flattened(requested, membrane) {
                     Ok(minted) => minted,
                     Err(crate::access::capability::CapFault::Revoked) => return res::E_CAP_REVOKED,
-                    Err(crate::access::capability::CapFault::RightsExceeded) => return res::E_RIGHTS_EXCEEDED,
+                    Err(crate::access::capability::CapFault::RightsExceeded) => {
+                        return res::E_RIGHTS_EXCEEDED;
+                    }
                 }
             }
         };
@@ -929,14 +1007,21 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapClone;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
 
         let access = self.0.permission_backend.lock();
 
-        if access.check_task_rights(current, NamespaceRights::CAP_MINT).is_err() {
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MINT)
+            .is_err()
+        {
             return res::E_RIGHTS_DENIED;
         }
 
@@ -969,7 +1054,9 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
                 match record.clone_cap() {
                     Ok(cloned) => cloned,
                     Err(crate::access::capability::CapFault::Revoked) => return res::E_CAP_REVOKED,
-                    Err(crate::access::capability::CapFault::RightsExceeded) => return res::E_RIGHTS_EXCEEDED,
+                    Err(crate::access::capability::CapFault::RightsExceeded) => {
+                        return res::E_RIGHTS_EXCEEDED;
+                    }
                 }
             } else {
                 // Потолок мембраны приёмника — фактические права записи
@@ -977,16 +1064,25 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
                 let ceiling = match record.resolve() {
                     Ok((_, r)) => r,
                     Err(crate::access::capability::CapFault::Revoked) => return res::E_CAP_REVOKED,
-                    Err(crate::access::capability::CapFault::RightsExceeded) => return res::E_RIGHTS_EXCEEDED,
+                    Err(crate::access::capability::CapFault::RightsExceeded) => {
+                        return res::E_RIGHTS_EXCEEDED;
+                    }
                 };
-                let membrane = match capspace::ensure_slot_membrane(dst, args.dst_slot, ceiling, access.task_namespace(args.dst_task_cap)) {
+                let membrane = match capspace::ensure_slot_membrane(
+                    dst,
+                    args.dst_slot,
+                    ceiling,
+                    access.task_namespace(args.dst_task_cap),
+                ) {
                     Ok(m) => m,
                     Err(e) => return capspace_result_code(Err(e)),
                 };
                 match record.clone_flattened(membrane) {
                     Ok(cloned) => cloned,
                     Err(crate::access::capability::CapFault::Revoked) => return res::E_CAP_REVOKED,
-                    Err(crate::access::capability::CapFault::RightsExceeded) => return res::E_RIGHTS_EXCEEDED,
+                    Err(crate::access::capability::CapFault::RightsExceeded) => {
+                        return res::E_RIGHTS_EXCEEDED;
+                    }
                 }
             }
         };
@@ -1005,14 +1101,21 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapRevoke;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
 
         let access = self.0.permission_backend.lock();
 
-        if access.check_task_rights(current, NamespaceRights::CAP_MANAGE).is_err() {
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MANAGE)
+            .is_err()
+        {
             return res::E_RIGHTS_DENIED;
         }
 
@@ -1038,14 +1141,21 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
     type Args = SyscallCapDestroy;
     type Umap = A::Umap;
 
-    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+    fn handle(
+        &'static self,
+        lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>,
+        args: Self::Args,
+    ) -> u64 {
         let Some(current) = lctl.current_task_cap_id() else {
             return res::E_NO_CURRENT_TASK;
         };
 
         let access = self.0.permission_backend.lock();
 
-        if access.check_task_rights(current, NamespaceRights::CAP_MANAGE).is_err() {
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MANAGE)
+            .is_err()
+        {
             return res::E_RIGHTS_DENIED;
         }
 

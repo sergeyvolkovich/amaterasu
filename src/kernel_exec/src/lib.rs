@@ -33,7 +33,7 @@ pub use registry::{
 // (орфан-правила соблюдены: тип локальный, трейт чужой).
 pub use kernel_base::traits;
 pub use spawn::{
-    build_initial_stack, load_image, spawn_boot_servers, AuxEntry, SpawnedServer, SpawnError,
+    build_initial_stack, load_image, spawn_boot_servers, AuxEntry, BootSpawnPolicy, SpawnedServer, SpawnError,
     StackSetup, TaskArgs, AT_NOMAD_ACPI_RSDP, AT_NOMAD_FB_ADDR, AT_NOMAD_FB_BPP,
     AT_NOMAD_FB_HEIGHT, AT_NOMAD_FB_PITCH, AT_NOMAD_FB_WIDTH, AT_NOMAD_NS_CAP,
     AT_NOMAD_SELF_CAP, AT_ENTRY, AT_NULL, AT_PAGESZ, BOOT_SLOT_IMAGE_BASE, BOOT_SLOT_NAMESPACE,
