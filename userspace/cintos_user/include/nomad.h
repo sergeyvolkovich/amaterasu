@@ -336,3 +336,19 @@ uint64_t nomad_fault_is(const uint8_t *buf, uint64_t buf_len);
  * NOMAD_E_INVALID_ARG — не фолт/плохой буфер. */
 uint64_t nomad_fault_parse(const uint8_t *buf, uint64_t buf_len,
                           NomadFaultInfo *out_info);
+
+/* ── FUTEX (предикатный сон на слове разделяемой памяти) ───────────── */
+
+/* Спать на ключе key, пока 4-байтовое слово по uaddr (в shm-регионе
+ * ВЫЗЫВАЮЩЕЙ задачи) равно expected: проверка в ядре атомарна с
+ * постановкой в очередь (syscall 53) — закрывает lost-wakeup окно
+ * безусловного BLOCK_ON_OBJECT (syscall 3). key — публичный wait-ключ
+ * ВНЕ резервов ядра: не < 64, вне [0x10000..0x13000), [0x3000..0x3010),
+ * 0x20000; рекомендуется NOMAD_FUTEX_KEY_BASE (0x1000000+), договорённость
+ * сторон протокола. 0 — возврат («спал и разбужен» / «предикат сработал
+ * до сна»); спурийные пробуждения — контракт: перепроверяйте значение. */
+#define NOMAD_FUTEX_KEY_BASE 0x1000000ull
+uint64_t nomad_futex_wait(uint64_t key, uint64_t uaddr, uint32_t expected);
+
+/* Разбудить до count ждущих ключа key (syscall 54; OneShot на вызов). */
+uint64_t nomad_futex_wake(uint64_t key, uint32_t count);

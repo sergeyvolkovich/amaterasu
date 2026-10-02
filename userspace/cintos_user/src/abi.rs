@@ -167,6 +167,17 @@ pub mod nr {
     /// записи реестра + тумбстоун капы в слоте slot).
     pub const IRQ_RELEASE: u64 = 52;
 
+    /// FUTEX (v1): предикатный сон на 4-байтовом слове разделяемой
+    /// памяти: (key, uaddr, expected). Проверка *uaddr == expected
+    /// выполняется ядром ПОД WAKE_LOCK атомарно с постановкой в очередь —
+    /// закрывает lost-wakeup окно безусловного BLOCK_ON_OBJECT.
+    /// key — публичный wait-ключ вне резервов ядра (см. dekker::KEY_BASE).
+    /// Спурийные пробуждения — контракт; вызывающий перепроверяет значение.
+    pub const FUTEX_WAIT: u64 = 53;
+
+    /// FUTEX (v1): разбудить до nr ждущих ключа (OneShot-пробуждения).
+    pub const FUTEX_WAKE: u64 = 54;
+
     /// Статистика: снапшот счётчиков задачи + глобальные тики/частота
     /// (перенос статистики в юзерспейс; самоинспекция — без прав).
     pub const TASK_STATS: u64 = 29;
@@ -179,7 +190,8 @@ pub mod nr {
 
     // РАСКЛАД NR (зеркало ядра v2): sched/mem 0..8, ipc 10..15 + 31
     // (destroy gate), capability 16..26, fault 27/30, irq 28/51/52,
-    // stats 29, IOMMU 32..45 + MapDmaVa 50, log 46/47, exec 48/49.
+    // stats 29, IOMMU 32..45 + MapDmaVa 50, log 46/47, exec 48/49,
+    // futex 53/54.
 
     /// IOMMU: создать DMA-домен.
     pub const IOMMU_CREATE_DOMAIN: u64 = 32;

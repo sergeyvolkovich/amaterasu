@@ -46,6 +46,7 @@ pub mod cap;
 pub mod capi;
 pub mod crt0;
 pub mod dlog;
+pub mod dekker;
 pub mod fault;
 pub mod fb;
 pub mod handle;

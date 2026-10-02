@@ -62,6 +62,25 @@ pub extern "C" fn nomad_exit() -> u64 {
     unsafe { crate::syscall::syscall1(abi::nr::SCHED_DESTROY_TASK, self_cap) }
 }
 
+// ─── FUTEX (предикатный сон на слове разделяемой памяти; см. dekker.rs) ─────
+
+/// Спать на ключе key, пока 4-байтовое слово по uaddr (shm-регион
+/// ВЫЗЫВАЮЩЕЙ задачи) равно expected: проверка выполняется ядром ПОД
+/// WAKE_LOCK атомарно с постановкой в очередь (syscall 53) — закрывает
+/// lost-wakeup окно BLOCK_ON_OBJECT. 0 — возврат («спал и разбужен»
+/// или «предикат сработал до сна»); спурийные пробуждения — контракт.
+/// key обязан лежать вне резервов ядра (см. dekker::KEY_BASE).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_futex_wait(key: u64, uaddr: u64, expected: u32) -> u64 {
+    unsafe { crate::syscall::syscall3(abi::nr::FUTEX_WAIT, key, uaddr, expected as u64) }
+}
+
+/// Разбудить до count ждущих ключа key (syscall 54; OneShot на вызов).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_futex_wake(key: u64, count: u32) -> u64 {
+    unsafe { crate::syscall::syscall2(abi::nr::FUTEX_WAKE, key, count as u64) }
+}
+
 // ─── Память ─────────────────────────────────────────────────────────────────
 
 /// Выделить `pages` страниц; возврат — VA (старший бит = ошибка).

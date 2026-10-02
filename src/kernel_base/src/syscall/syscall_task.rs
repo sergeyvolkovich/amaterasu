@@ -75,7 +75,9 @@ pub struct SyscallReleaseObject {
 }
 
 pub struct DomainScheduler<A: ArchImplementation, Handler>(
-    &'static KernelCTL<A>,
+    // pub(crate): домен FUTEX (syscall::futex) реализует SyscallDomain
+    // над этим же доменом-маркером и читает kctl из обработчика.
+    pub(crate) &'static KernelCTL<A>,
     PhantomData<Handler>,
 );
 
@@ -426,7 +428,9 @@ impl<A: ArchImplementation> SyscallDomain for DomainScheduler<A, SyscallBlockOnO
 /// Резервированные ядром диапазоны wait-объектов (см. ipc::endpoint /
 /// ipc::fault / task::irq_wait): юзерспейс-блокировка/пробуждение на них
 /// запрещена — это механизмы доставки, а не публичные примитивы.
-fn is_kernel_wait_object(id: usize) -> bool {
+/// pub(crate): переиспользуется доменом FUTEX (syscall::futex) — там
+/// тот же контракт публичных ключей.
+pub(crate) fn is_kernel_wait_object(id: usize) -> bool {
     const IPC_BASE: usize = crate::ipc::endpoint::IPC_OBJECT_BASE;
     // Отправители: [BASE, BASE+0x1000); получатели: [BASE+0x1000,
     // BASE+0x2000); гейты: [BASE+0x2000, BASE+0x3000) — см. endpoint::

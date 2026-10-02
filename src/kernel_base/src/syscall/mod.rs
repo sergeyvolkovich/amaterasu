@@ -1,11 +1,12 @@
 use crate::{
     KernelCTL,
-    syscall::{capability::*, fault::*, ipc::*, irq::*, log::*, memory::*, syscall_task::*},
+    syscall::{capability::*, fault::*, futex::*, ipc::*, irq::*, log::*, memory::*, syscall_task::*},
     traits::ArchImplementation,
 };
 
 pub mod capability;
 pub mod fault;
+pub mod futex;
 pub mod ipc;
 pub mod iommu;
 pub mod irq;
@@ -20,6 +21,15 @@ pub fn init_syscalls<A: ArchImplementation + crate::traits::iommu::IommuTokenLay
     A::register_syscalls(DomainScheduler::<_, SyscallBlockOnObject>::new(kctl));
     A::register_syscalls(DomainScheduler::<_, SyscallReleaseObject>::new(kctl));
     A::register_syscalls(DomainScheduler::<_, SyscallTaskStats>::new(kctl));
+
+    // Домен FUTEX (v1): предикатный сон на слове разделяемой памяти.
+    // Закрывает гонку «проверка значения → приход в очередь» безусловного
+    // BLOCK_ON_OBJECT: проверка *uaddr == expected выполняется ПОД
+    // WAKE_LOCK атомарно с постановкой в очередь (см. syscall::futex и
+    // lctl::scheduler_block_on_object_if). Userspace-протокол Деккера —
+    // userspace/cintos_user/src/dekker.rs.
+    A::register_syscalls(DomainScheduler::<_, SyscallFutexWait>::new(kctl));
+    A::register_syscalls(DomainScheduler::<_, SyscallFutexWake>::new(kctl));
 
     A::register_syscalls(DomainMemory::<_, SyscallAllocPages>::new(kctl));
     A::register_syscalls(DomainMemory::<_, SyscallFreePages>::new(kctl));
