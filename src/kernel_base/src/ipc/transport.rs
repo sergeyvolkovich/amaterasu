@@ -22,7 +22,7 @@
 
 use heapless::Vec as HVec;
 
-use crate::task::ipc_state::{IpcRecv, RecvSpec, SendSpec};
+use crate::task::ipc_state::{GateRoute, IpcRecv, RecvSpec, SendSpec};
 use crate::task::tcb::TCB;
 use crate::task::TaskManager;
 use crate::traits::memory::MemoryInterfaceUserspace;
@@ -41,14 +41,16 @@ pub enum ClaimResult {
     CapsRejected,
 }
 
-/// Захват ждущего получателя (send, быстрый путь). `gate` — Some(id)
-/// для отправки через гейт (получатель обязан ждать ТОТ ЖЕ гейт), None
-/// для прямой отправки задаче (получатель с гейт-ожиданием не подходит).
+/// Захват ждущего получателя (send, быстрый путь). `gate` — Some(маршрут)
+/// для отправки через гейт (получатель обязан ждать ТОТ ЖЕ гейт —
+/// сравнение маршрутов включает поколение: ожидатель протухшего гейта
+/// не подходит), None для прямой отправки задаче (получатель с
+/// гейт-ожиданием не подходит).
 pub fn claim_receiver<Umap: MemoryInterfaceUserspace>(
     tasks: &TaskManager<Umap>,
     receiver: u64,
     sender: u64,
-    gate: Option<u64>,
+    gate: Option<GateRoute>,
     need_bytes: usize,
     caps_count: usize,
 ) -> ClaimResult {
@@ -248,7 +250,7 @@ pub fn cancel_send<Umap: MemoryInterfaceUserspace>(
     tasks: &TaskManager<Umap>,
     sender: u64,
     queue_owner: u64,
-    gate: Option<u64>,
+    gate: Option<GateRoute>,
 ) -> bool {
     // 1. Своя SendSpec.
     if let Some(tcb) = tasks.get_tcb(sender) {
@@ -263,9 +265,9 @@ pub fn cancel_send<Umap: MemoryInterfaceUserspace>(
         let mut ipc = tcb.ipc().lock();
         ipc.queue.retain(|(id, _)| *id != sender);
     }
-    // 3. Гейт-очередь (gateway-маршрут).
-    if let Some(gate_id) = gate {
-        crate::ipc::gate::gate_remove_sender(gate_id, sender);
+    // 3. Гейт-очередь (gateway-маршрут) — O(1) по собственным ссылкам.
+    if let Some(route) = gate {
+        crate::ipc::gate::gate_remove_task(tasks, route, sender);
     }
     true
 }
@@ -279,7 +281,7 @@ pub fn cancel_send<Umap: MemoryInterfaceUserspace>(
 pub fn sender_timeout_pending<Umap: MemoryInterfaceUserspace>(
     tasks: &TaskManager<Umap>,
     sender: u64,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<(u64, Option<GateRoute>)> {
     let tcb = tasks.get_tcb(sender)?;
     let spec = {
         let mut ipc = tcb.ipc().lock();
@@ -288,15 +290,15 @@ pub fn sender_timeout_pending<Umap: MemoryInterfaceUserspace>(
         ipc.send_rax = Some(crate::traits::syscall::syscall_result::E_TIMEOUT);
         spec
     };
-    // Самочистка очередей.
+    // Самочистка очередей (гейт — O(1) по собственным ссылкам).
     if spec.gate.is_none()
         && let Some(owner) = tasks.get_tcb(spec.to)
     {
         let mut ipc = owner.ipc().lock();
         ipc.queue.retain(|(id, _)| *id != sender);
     }
-    if let Some(gate_id) = spec.gate {
-        crate::ipc::gate::gate_remove_sender(gate_id, sender);
+    if let Some(route) = spec.gate {
+        crate::ipc::gate::gate_remove_task(tasks, route, sender);
     }
     Some((spec.to, spec.gate))
 }
@@ -322,8 +324,9 @@ pub fn receiver_timeout_pending<Umap: MemoryInterfaceUserspace>(
             _ => return false,
         }
     };
-    if let Some(gate_id) = gate {
-        crate::ipc::gate::gate_remove_receiver(gate_id, receiver);
+    if let Some(route) = gate {
+        // O(1) по собственным ссылкам; мёртвый гейт — дренаж уже всё снял.
+        crate::ipc::gate::gate_remove_task(tasks, route, receiver);
     }
     true
 }
@@ -431,11 +434,17 @@ pub fn receiver_pred<Umap: MemoryInterfaceUserspace>(
             {
                 return true;
             }
-            // Гейт-ожидание: у гейта появились отправители?
-            if let Some(gate_id) = spec.gate
-                && crate::ipc::gate::gate_has_senders(gate_id)
-            {
-                return true;
+            // Гейт-ожидание: у гейта появились отправители — ИЛИ гейт
+            // уже мёртв/переиспользован (маршрут невалиден). Предикат
+            // обязан разбудить и на смерть канала: иначе ожидатель спал
+            // бы на мёртвом гейте до дедлайна/вечно (wake от destroy
+            // терялся бы в гонке «не успел уснуть»); проснувшийся wait
+            // увидит невалидный маршрут и выйдет с E_CAP_REVOKED.
+            if let Some(route) = spec.gate {
+                let (valid, has_senders) = crate::ipc::gate::gate_status(route);
+                if !valid || has_senders {
+                    return true;
+                }
             }
         }
         false

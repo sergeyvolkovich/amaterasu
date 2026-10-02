@@ -52,7 +52,7 @@ use crate::{
         },
         transport,
     },
-    task::ipc_state::{RecvSpec, SendSpec},
+    task::ipc_state::{GateQueueSide, GateRoute, RecvSpec, SendSpec},
     task::tcb::GTcb,
     traits::{
         ArchImplementation,
@@ -130,7 +130,8 @@ type ResolvedTask<Umap> = (u64, core::ptr::NonNull<GTcb<Umap>>);
 /// капа, право Send) или отправка в гейт (IpcGate-капа, право Send).
 pub(crate) enum IpcTarget<Umap: MemoryInterfaceUserspace> {
     Task(u64, core::ptr::NonNull<GTcb<Umap>>),
-    Gate(u64),
+    /// ABA-защищённый маршрут гейта (id + поколение из капы).
+    Gate(GateRoute),
 }
 
 /// Разрешение слота cspace в цель SEND: TaskTCB (право Send) или
@@ -149,9 +150,11 @@ pub(crate) fn resolve_send_target<A: ArchImplementation>(
             return Err(res::E_RIGHTS_DENIED);
         }
         let (object, _) = record.resolve().map_err(|_| res::E_CAP_REVOKED)?;
-        // Гейт: вернуть id немедленно (копия id — u64).
-        if let Some(gate_id) = object.resolve_ipc_gate() {
-            return Ok(IpcTarget::Gate(gate_id));
+        // Гейт: вернуть маршрут немедленно (Copy; валидность сверена со
+        // слотом под локом шарда — мёртвый/переиспользованный слот не
+        // резолвится: E_CAP_REVOKED ещё здесь).
+        if let Some(route) = object.resolve_ipc_gate() {
+            return Ok(IpcTarget::Gate(route));
         }
         object.resolve_task_tcb().ok_or(res::E_INVALID_ARG)?
     };
@@ -168,16 +171,16 @@ pub(crate) fn resolve_wait_target<A: ArchImplementation>(
     tasks: &crate::task::TaskManager<A::Umap>,
     current_gtcb: &GTcb<A::Umap>,
     slot: u64,
-) -> Result<(Option<u64>, Option<u64>), u64> {
-    // Возврат: (from-фильтр, gate-id).
+) -> Result<(Option<u64>, Option<GateRoute>), u64> {
+    // Возврат: (from-фильтр, гейт-маршрут).
     let caps = current_gtcb.capspace().lock();
     let record = caps.get(&slot).ok_or(res::E_SLOT_EMPTY)?;
     let (object, rights) = record.resolve().map_err(|_| res::E_CAP_REVOKED)?;
-    if let Some(gate_id) = object.resolve_ipc_gate() {
+    if let Some(route) = object.resolve_ipc_gate() {
         if !rights.contains(crate::access::capability::DirectCapabilityRights::Recv) {
             return Err(res::E_RIGHTS_DENIED);
         }
-        return Ok((None, Some(gate_id)));
+        return Ok((None, Some(route)));
     }
     // TaskTCB — closed wait: право Send (как в resolve_task_slot).
     if !rights.contains(crate::access::capability::DirectCapabilityRights::Send) {
@@ -362,6 +365,47 @@ fn wake_sender_ok<A: ArchImplementation>(
     lctl.scheduler_release_object(endpoint::sender_wait_object(sender_task_cap));
 }
 
+/// Возврат гейт-ожидателя после НЕУДАЧНОЙ доставки (restore уже выполнен
+/// deliver_claimed'ом): если маршрут ещё валиден — снова в ГОЛОВУ
+/// очереди (FIFO-справедливость); если гейт уничтожен в окне
+/// клейм/доставка — отзыв ожидания: recv → Idle, патч кадра
+/// E_CAP_REVOKED + пробуждение. Без отзыва ожидатель спал бы вечно:
+/// очередь мёртвого гейта никого не пустит, а дренаж его уже не видит
+/// (узел отсоединён клейм-путём). Требует захваченного
+/// task_manager-лока — берёт сам.
+fn gate_reclaim_or_revoke<A: ArchImplementation>(
+    kctl: &'static KernelCTL<A>,
+    lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
+    route: GateRoute,
+    receiver: u64,
+    resume_word: usize,
+) {
+    let requeued = {
+        let tasks = kctl.task_manager().lock();
+        // После restore узел вне очереди (detach после клейма) —
+        // Ok означает «поставлен в голову»; Err — гейт мёртв/TCB нет.
+        crate::ipc::gate::gate_push(&tasks, route, receiver, GateQueueSide::Receivers, true)
+            .is_ok()
+    };
+    if requeued {
+        return;
+    }
+    {
+        let tasks = kctl.task_manager().lock();
+        if let Some(tcb) = tasks.get_tcb(receiver) {
+            let mut ipc = tcb.ipc().lock();
+            if matches!(
+                ipc.recv,
+                crate::task::ipc_state::IpcRecv::Receiving(s) if s.gate == Some(route)
+            ) {
+                ipc.recv = crate::task::ipc_state::IpcRecv::Idle;
+            }
+            tcb.patch_resume_result(resume_word, res::E_CAP_REVOKED);
+        }
+    }
+    lctl.scheduler_release_object(endpoint::endpoint_wait_object(receiver));
+}
+
 /// Исход изъятия кандидата из очереди (быстрый путь WAIT).
 enum TakeOutcome {
     /// Обычное сообщение доставлено в буфер получателя.
@@ -387,7 +431,7 @@ fn take_next<A: ArchImplementation>(
     me: u64,
     my_umap: &A::Umap,
     from: Option<u64>,
-    gate: Option<u64>,
+    gate: Option<GateRoute>,
     tgt_va: usize,
     tgt_capacity: usize,
     recv_base: u64,
@@ -395,10 +439,11 @@ fn take_next<A: ArchImplementation>(
     resume_word: usize,
 ) -> TakeOutcome {
     loop {
-        // Кандидат — изъятие: гейт-очередь (waiting НА ГЕЙТЕ) или
-        // собственная очередь отправителей (прямой эндпоинт).
-        let candidate = if let Some(gate_id) = gate {
-            crate::ipc::gate::gate_pop_sender(gate_id)
+        // Кандидат — изъятие: гейт-очередь (waiting НА ГЕЙТЕ; O(1)
+        // detach головы по его собственным ссылкам) или собственная
+        // очередь отправителей (прямой эндпоинт).
+        let candidate = if let Some(route) = gate {
+            crate::ipc::gate::gate_pop_sender(tasks, route)
                 .map(|id| (id, false))
                 .or_else(|| transport::pop_next_candidate(tasks, me, from))
         } else {
@@ -425,8 +470,19 @@ fn take_next<A: ArchImplementation>(
                 // очереди и выйдем: подойдёт следующий wait с большим
                 // буфером (см. ipc::fault).
                 crate::ipc::fault::untake_pending_fault(tasks, sender_id, me);
-                if let Some(gate_id) = gate {
-                    let _ = crate::ipc::gate::gate_push_sender(gate_id, sender_id);
+                if let Some(route) = gate {
+                    // Гейт мог быть уничтожен в окне изъятия: push
+                    // откажет (E_CAP_REVOKED-маршрут) — фолт остаётся в
+                    // СВОЁМ слоте фолтов (не в очереди гейта) и будет
+                    // доставлен через другой wait/маршрут; сам упавший
+                    // спит на фолт-объекте и не зависит от гейта.
+                    let _ = crate::ipc::gate::gate_push(
+                        tasks,
+                        route,
+                        sender_id,
+                        GateQueueSide::Senders,
+                        true,
+                    );
                 } else {
                     transport::requeue_candidate(tasks, me, sender_id, true);
                 }
@@ -442,8 +498,15 @@ fn take_next<A: ArchImplementation>(
                 // Отображение схлопнулось между проверкой и записью —
                 // фолт возвращается в слот (см. выше — не теряем).
                 crate::ipc::fault::untake_pending_fault(tasks, sender_id, me);
-                if let Some(gate_id) = gate {
-                    let _ = crate::ipc::gate::gate_push_sender(gate_id, sender_id);
+                if let Some(route) = gate {
+                    // См. выше: отказ push при мёртвом гейте безопасен.
+                    let _ = crate::ipc::gate::gate_push(
+                        tasks,
+                        route,
+                        sender_id,
+                        GateQueueSide::Senders,
+                        true,
+                    );
                 } else {
                     transport::requeue_candidate(tasks, me, sender_id, true);
                 }
@@ -591,14 +654,14 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
             }
         };
         match target {
-            IpcTarget::Gate(gate_id) => {
+            IpcTarget::Gate(route) => {
                 match send_to_gate::<A>(
                     self.0,
                     lctl,
                     &access,
                     current,
                     sender_umap,
-                    gate_id,
+                    route,
                     args.msg_ptr as usize,
                     msg_size,
                     &cap_items,
@@ -855,10 +918,15 @@ fn send_to_task<A: ArchImplementation>(
     }
 }
 
-/// Отправка В ГЕЙТ (seL4-эндпоинт): FIFO-клейм зарегистрированных
-/// ожидателей гейта; никого — очередь гейта + сон на СВОЁМ объекте
-/// (data — в SendSpec с gate=Some(id); сервер-обработчик изымает через
-/// take_next/gate_pop_sender). Результат изъятия ошибки — send_rax.
+/// Отправка В ГЕЙТ (seL4-эндпоинт): клейм FIFO-ожидателя (peek → claim
+/// → detach — узел отсоединяется ТОЛЬКО после успешного клейма: при
+/// отказе клейма он остаётся в очереди, а при уничтожении гейта в окне
+/// клейм/доставка его отсоединяет дренаж — потерянных спящих нет);
+/// никого — очередь гейта + сон на СВОЁМ объекте (data — в SendSpec с
+/// gate=Some(маршрут); сервер-обработчик изымает через take_next/
+/// gate_pop_sender). Результат изъятия ошибки — send_rax. Очередь БЕЗ
+/// ёмкости — E_SLAB не бывает; отказ push — только мёртвый гейт
+/// (E_CAP_REVOKED).
 #[allow(clippy::too_many_arguments)]
 fn send_to_gate<A: ArchImplementation>(
     kctl: &'static KernelCTL<A>,
@@ -866,7 +934,7 @@ fn send_to_gate<A: ArchImplementation>(
     access: &crate::access::AccessManager<A::Umap>,
     current: u64,
     sender_umap: &A::Umap,
-    gate_id: u64,
+    route: GateRoute,
     msg_va: usize,
     msg_len: usize,
     caps: &[CapItem],
@@ -875,25 +943,39 @@ fn send_to_gate<A: ArchImplementation>(
     let caps_count = caps.len();
     let need = endpoint::delivery_bytes(caps_count, msg_len);
 
-    // ── Быстрый путь: клейм FIFO-получателя гейта. ──
+    // ── Быстрый путь: peek → клейм → detach FIFO-ожидателя гейта. ──
     loop {
-        let Some(candidate) = crate::ipc::gate::gate_pop_receiver(gate_id) else {
-            break;
+        let candidate = match crate::ipc::gate::gate_peek_receiver(route) {
+            Some(c) => c,
+            None => break, // очередь пуста или гейт мёртв — медленный путь
         };
         let claim = {
             let tasks = kctl.task_manager().lock();
-            transport::claim_receiver(&tasks, candidate, current, Some(gate_id), need, caps_count)
+            transport::claim_receiver(&tasks, candidate, current, Some(route), need, caps_count)
         };
         match claim {
-            // Затухшая запись (получатель уже не ждёт) — следующий.
-            transport::ClaimResult::NotWaiting => continue,
-            // Буфер/окно получателя не вмещают: получатель продолжает
-            // ждать (возвращаем в голову очереди), отправителю — ошибка.
+            // Затухшая голова (уже не ждёт) — отсоединить (O(1)) и
+            // попробовать следующую.
+            transport::ClaimResult::NotWaiting => {
+                let tasks = kctl.task_manager().lock();
+                crate::ipc::gate::gate_detach_receiver(&tasks, route, candidate);
+                continue;
+            }
+            // Буфер/окно получателя не вмещают: он ОСТАЁТСЯ в очереди
+            // (detach не выполнялся — семантика прежнего unpop без
+            // окна потери), отправителю — ошибка.
             transport::ClaimResult::TooSmall | transport::ClaimResult::CapsRejected => {
-                crate::ipc::gate::gate_unpop_receiver(gate_id, candidate);
                 return SendOutcome::Done(res::E_INVALID_ARG);
             }
             transport::ClaimResult::Claimed(rspec) => {
+                // Клейм состоялся: изъятие из очереди. Гейт мог быть
+                // уничтожен в окне peek/claim — дренаж уже отсоединил
+                // узел (false); оба исхода оставляют узел вне очереди
+                // и в руках доставляющего.
+                {
+                    let tasks = kctl.task_manager().lock();
+                    crate::ipc::gate::gate_detach_receiver(&tasks, route, candidate);
+                }
                 let receiver_umap = {
                     let tasks = kctl.task_manager().lock();
                     match tasks.get_tcb(candidate) {
@@ -912,6 +994,15 @@ fn send_to_gate<A: ArchImplementation>(
                     receiver_umap, rspec, msg_va, msg_len, caps,
                 );
                 if let Err(code) = result {
+                    // Restore выполнен; вернуть ожидателя живому гейту
+                    // или отозвать его с E_CAP_REVOKED (мёртвый гейт).
+                    gate_reclaim_or_revoke::<A>(
+                        kctl,
+                        lctl,
+                        route,
+                        candidate,
+                        A::RESUME_RESULT_WORD,
+                    );
                     return SendOutcome::Done(code);
                 }
                 return SendOutcome::Done(res::OK);
@@ -922,7 +1013,7 @@ fn send_to_gate<A: ArchImplementation>(
     // ── Медленный путь: очередь гейта + сон на своём объекте. ──
     let spec = SendSpec {
         to: 0, // гейт-маршрут: адресат определяется сервером при изъятии
-        gate: Some(gate_id),
+        gate: Some(route),
         msg_va,
         msg_len,
         caps: {
@@ -942,11 +1033,16 @@ fn send_to_gate<A: ArchImplementation>(
             ipc.send = Some(spec);
             ipc.send_rax = None;
         }
-        if crate::ipc::gate::gate_push_sender(gate_id, current).is_err() {
+        // Очередь интрузивная — БЕЗ ёмкости: отказ = гейт уничтожен
+        // между resolve и постановкой (маршрут невалиден). Честный
+        // E_CAP_REVOKED вместо прежнего молчаливого `let _ =` с E_SLAB.
+        if crate::ipc::gate::gate_push(&tasks, route, current, GateQueueSide::Senders, false)
+            .is_err()
+        {
             if let Some(tcb) = tasks.get_tcb(current) {
                 tcb.ipc().lock().send = None;
             }
-            return SendOutcome::Done(res::E_SLAB);
+            return SendOutcome::Done(res::E_CAP_REVOKED);
         }
     }
 
@@ -1071,7 +1167,7 @@ fn wait_loop<A: ArchImplementation>(
     current: u64,
     umap: &A::Umap,
     from: Option<u64>,
-    gate: Option<u64>,
+    gate: Option<GateRoute>,
     tgt_va: usize,
     tgt_capacity: usize,
     recv_base: u64,
@@ -1117,8 +1213,8 @@ fn wait_loop<A: ArchImplementation>(
         // Дедлайн уже прошёл (вернулись сюда после пробуждения по
         // таймауту, доставки нет) — спать больше нельзя.
         if deadline > 0 && crate::task::stats::global_ticks() >= deadline {
-            if let Some(gate_id) = gate {
-                crate::ipc::gate::gate_remove_receiver(gate_id, current);
+            if let Some(route) = gate {
+                crate::ipc::gate::gate_remove_task(&tasks, route, current);
             }
             transport::unregister_wait(&tasks, current);
             return res::E_TIMEOUT;
@@ -1127,13 +1223,22 @@ fn wait_loop<A: ArchImplementation>(
         // Регистрация ожидания (Claimed = доставка в полёте —
         // перепроверка циклом; завершение увидит seq/быстрый путь).
         // Для гейта — встать в очередь ожидателей гейта (отправители
-        // клеймят FIFO-получателей оттуда).
+        // клеймят FIFO-получателей оттуда). Очередь БЕЗ ёмкости;
+        // отказ = гейт уничтожен/переиспользован (маршрут невалиден,
+        // например проснулись по смерти канала) — честный E_CAP_REVOKED
+        // вместо прежнего молчаливого `let _ =`, оставлявшего получателя
+        // ждать мёртвый канал.
         let snap = match transport::register_wait(&tasks, current, spec) {
             Ok(snap) => snap,
             Err(()) => continue,
         };
-        if let Some(gate_id) = gate {
-            let _ = crate::ipc::gate::gate_push_receiver(gate_id, current);
+        if let Some(route) = gate {
+            if crate::ipc::gate::gate_push(&tasks, route, current, GateQueueSide::Receivers, false)
+                .is_err()
+            {
+                transport::unregister_wait(&tasks, current);
+                return res::E_CAP_REVOKED;
+            }
         }
 
         // Дедлайн (абсолютный тик): регистрация до сна.
@@ -1141,8 +1246,8 @@ fn wait_loop<A: ArchImplementation>(
         if deadline > 0 && crate::task::deadline::register(current, object, deadline).is_err() {
             // Реестр дедлайнов полон: регистрацию снять (спать без
             // будильщика нельзя).
-            if let Some(gate_id) = gate {
-                crate::ipc::gate::gate_remove_receiver(gate_id, current);
+            if let Some(route) = gate {
+                crate::ipc::gate::gate_remove_task(&tasks, route, current);
             }
             transport::unregister_wait(&tasks, current);
             return res::E_SLAB;
@@ -1205,8 +1310,8 @@ fn wait_loop<A: ArchImplementation>(
             // в окне [регистрация .. сон]»).
             let fired = deadline > 0 && crate::task::deadline::cancel(current);
             if fired {
-                if let Some(gate_id) = gate {
-                    crate::ipc::gate::gate_remove_receiver(gate_id, current);
+                if let Some(route) = gate {
+                    crate::ipc::gate::gate_remove_task(&tasks, route, current);
                 }
                 transport::unregister_wait(&tasks, current);
                 return res::E_TIMEOUT;
@@ -1405,9 +1510,11 @@ fn await_reply_phase<A: ArchImplementation>(
     }
 }
 
-/// CALL через гейт: клейм FIFO-получателя гейта (как send_to_gate) —
-/// при неудаче клейма отправителю ошибка; никого — очередь гейта БЕЗ
-/// сна (клиент далее ждёт ответ в await_reply_phase).
+/// CALL через гейт: клейм FIFO-ожидателя гейта (peek → claim → detach,
+/// как send_to_gate) — при неудаче клейма отправителю ошибка; никого —
+/// очередь гейта БЕЗ сна (клиент далее ждёт ответ в await_reply_phase).
+/// Отказ push (мёртвый гейт) — E_CAP_REVOKED: call_pred увидит
+/// send_rax и хендлер раскрутит регистрацию ожидания ответа.
 #[allow(clippy::too_many_arguments)]
 fn call_via_gate<A: ArchImplementation>(
     kctl: &'static KernelCTL<A>,
@@ -1415,7 +1522,7 @@ fn call_via_gate<A: ArchImplementation>(
     access: &crate::access::AccessManager<A::Umap>,
     current: u64,
     sender_umap: &A::Umap,
-    gate_id: u64,
+    route: GateRoute,
     msg_va: usize,
     msg_len: usize,
     caps: &[CapItem],
@@ -1423,20 +1530,30 @@ fn call_via_gate<A: ArchImplementation>(
     let caps_count = caps.len();
     let need = endpoint::delivery_bytes(caps_count, msg_len);
     loop {
-        let Some(candidate) = crate::ipc::gate::gate_pop_receiver(gate_id) else {
-            break;
+        let candidate = match crate::ipc::gate::gate_peek_receiver(route) {
+            Some(c) => c,
+            None => break,
         };
         let claim = {
             let tasks = kctl.task_manager().lock();
-            transport::claim_receiver(&tasks, candidate, current, Some(gate_id), need, caps_count)
+            transport::claim_receiver(&tasks, candidate, current, Some(route), need, caps_count)
         };
         match claim {
-            transport::ClaimResult::NotWaiting => continue,
+            transport::ClaimResult::NotWaiting => {
+                let tasks = kctl.task_manager().lock();
+                crate::ipc::gate::gate_detach_receiver(&tasks, route, candidate);
+                continue;
+            }
+            // Голова остаётся в очереди (detach после клейма — см.
+            // send_to_gate); отправителю — ошибка.
             transport::ClaimResult::TooSmall | transport::ClaimResult::CapsRejected => {
-                crate::ipc::gate::gate_unpop_receiver(gate_id, candidate);
                 return Err(res::E_INVALID_ARG);
             }
             transport::ClaimResult::Claimed(rspec) => {
+                {
+                    let tasks = kctl.task_manager().lock();
+                    crate::ipc::gate::gate_detach_receiver(&tasks, route, candidate);
+                }
                 let receiver_umap = {
                     let tasks = kctl.task_manager().lock();
                     match tasks.get_tcb(candidate) {
@@ -1460,7 +1577,7 @@ fn call_via_gate<A: ArchImplementation>(
     // Никого не ждёт: очередь гейта (без сна — клиент ждёт ОТВЕТ).
     let spec = SendSpec {
         to: 0,
-        gate: Some(gate_id),
+        gate: Some(route),
         msg_va,
         msg_len,
         caps: {
@@ -1480,11 +1597,13 @@ fn call_via_gate<A: ArchImplementation>(
             ipc.send = Some(spec);
             ipc.send_rax = None;
         }
-        if crate::ipc::gate::gate_push_sender(gate_id, current).is_err() {
+        if crate::ipc::gate::gate_push(&tasks, route, current, GateQueueSide::Senders, false)
+            .is_err()
+        {
             if let Some(tcb) = tasks.get_tcb(current) {
                 tcb.ipc().lock().send = None;
             }
-            return Err(res::E_SLAB);
+            return Err(res::E_CAP_REVOKED);
         }
     }
     Ok(())
@@ -1570,13 +1689,13 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
         // ответ сервера доставляется напрямую (клейм), не через очередь.
         // Для гейт-цели from=None (сервер клиенту не известен); для
         // прямой — from=Some(сервер).
-        // (target_server, target_gate): гейт-маршрут — Some(gate_id);
+        // (target_server, target_gate): гейт-маршрут — Some(маршрут);
         // прямой — Some(server). from-фильтр ответа = СЕРВЕР (не гейт!):
         // reply_to устанавливается при доставке запроса.
         let (target_server, target_gate) = {
             let tasks = self.0.task_manager().lock();
             match resolve_send_target::<A>(&tasks, sender, args.slot) {
-                Ok(IpcTarget::Gate(gate_id)) => (None, Some(gate_id)),
+                Ok(IpcTarget::Gate(route)) => (None, Some(route)),
                 Ok(IpcTarget::Task(id, _)) => {
                     if id == current {
                         return res::E_INVALID_ARG;
@@ -1605,13 +1724,13 @@ impl<A: ArchImplementation + 'static> SyscallDomain for IPCSyscallDomain<A, Sysc
         // ── Фаза отправки (без сна клиента как отправителя) ──
         let send_result = match (target_server, target_gate) {
             // Гейт-маршрут.
-            (None, Some(gate_id)) => call_via_gate::<A>(
+            (None, Some(route)) => call_via_gate::<A>(
                 self.0,
                 lctl,
                 &access,
                 current,
                 sender_umap,
-                gate_id,
+                route,
                 tgt_va,
                 msg_size,
                 &cap_items,

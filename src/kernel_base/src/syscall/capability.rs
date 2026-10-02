@@ -136,11 +136,26 @@ pub struct SyscallCapCreateFaultEndpoint {
 /// IPC_CREATE_GATE(14):capability-объект «IPC-гейт» (seL4-эндпоинт) в
 /// слоте cspace ВЫЗЫВАЮЩЕГО. Корневые права — все (Clone|Mint|Send|Recv):
 /// сервер минтит клиентам Send-копии (Recv не выдаёт — клиенты не
-/// перехватывают чужие запросы), себе оставляет Recv для ожидания.
+/// перехватывают чужие запросы), себе оставляет Recv для ожидания И
+/// уничтожения (IPC_DESTROY_GATE).
 #[derive(syscall_macros::SyscallArguments)]
 pub struct SyscallIpcCreateGate {
     /// Слот cspace текущей задачи под корневую капу гейта.
     dst_slot: u64,
+}
+
+/// IPC_DESTROY_GATE(31): явное уничтожение гейта (держатель Recv-капы —
+/// сервер/владелец корня). Поколение слота инкрементируется: ВСЕ капы с
+/// прежним gen перестают резолвиться → E_CAP_REVOKED (tombstone-записи
+/// протухают сами); блокированные отправители/получатели отзываются —
+/// патч кадра E_CAP_REVOKED + wake по СВОИМ объектам (механизм
+/// резолвера таймаутов); id возвращается в пул — чурнинг сервисов
+/// больше не истощает таблицу. Права: Recv на гейт-капе (административ-
+/// ный авторитет над каналом) + CAP_MANAGE неймспейса.
+#[derive(SyscallArguments)]
+pub struct SyscallIpcDestroyGate {
+    /// Слот cspace текущей задачи с IpcGate-капой (право Recv).
+    slot: u64,
 }
 
 /// Mint: производная копия с правами ⊆ источника, под мембрану слота
@@ -707,23 +722,124 @@ impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, Sysc
         let creator = unsafe { creator_ptr.as_ref() };
 
         // 1. Слот таблицы гейтов (до капы — при отказе ничего не создано).
-        let Some(gate_id) = crate::ipc::gate::gate_alloc() else {
-            return res::E_IDS_EXHAUSTED;
+        //    Пул id исчерпан — E_IDS_EXHAUSTED; slab недоступен — E_SLAB
+        //    (честное различение вместо прежнего «всё в один код»).
+        let (gate_id, gate_gen) = match crate::ipc::gate::gate_alloc() {
+            Ok(pair) => pair,
+            Err(crate::ipc::gate::GateAllocError::Exhausted) => return res::E_IDS_EXHAUSTED,
+            Err(crate::ipc::gate::GateAllocError::Slab) => return res::E_SLAB,
         };
 
-        // 2. Объект + корневая капа (все права: Clone|Mint|Send|Recv).
+        // 2. Объект + корневая капа (все права: Clone|Mint|Send|Recv);
+        //    поколение слота — в капе (ABA-защита resolve_ipc_gate).
         let cap_id = create_descriptor_capability::<A>(
             &mut access,
             creator,
             current,
             args.dst_slot,
-            CapabilityObject::IpcGate { gate_id },
+            CapabilityObject::new_ipc_gate(gate_id, gate_gen),
         );
         if crate::traits::syscall::syscall_result::is_error(cap_id) {
             crate::ipc::gate::gate_free(gate_id);
             return cap_id;
         }
         cap_id
+    }
+}
+
+/// IPC_DESTROY_GATE(31): явное уничтожение гейта (см. SyscallIpcDestroyGate).
+/// Дренаж — под task_manager-локом (все мутации очередей — под ним);
+/// будильщик-колбэк патчит кадры (слово результата — знание порта) и
+/// будит ВНЕ локов шарда: дренаж идёт партиями, wake между ними
+/// (порядок WAKE_LOCK → ipc → gate не обращается).
+impl<A: ArchImplementation + 'static> SyscallDomain for DomainCapability<A, SyscallIpcDestroyGate> {
+    const SYSCALL_ID: usize = 31;
+    type Args = SyscallIpcDestroyGate;
+    type Umap = A::Umap;
+
+    fn handle(&'static self, lctl: &mut crate::lctl::LocalKernelCTL<Self::Umap>, args: Self::Args) -> u64 {
+        let Some(current) = lctl.current_task_cap_id() else {
+            return res::E_NO_CURRENT_TASK;
+        };
+
+        let access = self.0.permission_backend.lock();
+
+        if access
+            .check_task_rights(current, NamespaceRights::CAP_MANAGE)
+            .is_err()
+        {
+            return res::E_RIGHTS_DENIED;
+        }
+
+        let Some(holder_ptr) = access.get_task_tcb(current) else {
+            return res::E_NOT_FOUND;
+        };
+        // SAFETY: под permission_backend-локом GTcb не уничтожается.
+        let holder = unsafe { holder_ptr.as_ref() };
+
+        // Маршрут гейта + право Recv: административный авторитет над
+        // каналом у держателя Recv-капы (сервер; корень владеет всеми
+        // правами, минченные клиентам копии — обычно Send-only).
+        let route = {
+            let caps = holder.capspace().lock();
+            let Some(record) = caps.get(&args.slot) else {
+                return res::E_SLOT_EMPTY;
+            };
+            let (object, rights) = match record.resolve() {
+                Ok(pair) => pair,
+                Err(_) => return res::E_CAP_REVOKED,
+            };
+            if !rights.contains(DirectCapabilityRights::Recv) {
+                return res::E_RIGHTS_DENIED;
+            }
+            match object.resolve_ipc_gate() {
+                Some(route) => route,
+                // Слот уничтожен/переиспользован — капа протухла.
+                None => return res::E_CAP_REVOKED,
+            }
+        };
+        drop(access);
+
+        // Дренаж под task_manager-локом: alive=false + gen++ под локом
+        // шарда, затем партии detach+отзыв; каждая жертва — патч кадра
+        // (E_CAP_REVOKED) + wake по СВОИМ объектам. Отправителю — ОБА
+        // объекта (SEND-спящий — на sender-объекте; CALL-клиент в фазе
+        // ожидания ответа — на эндпоинт-объекте); лишний wake безобиден.
+        let stats = {
+            let tasks = self.0.task_manager().lock();
+            crate::ipc::gate::gate_destroy(&tasks, route, |victim| {
+                if let Some(tcb) = tasks.get_tcb(victim.task) {
+                    tcb.patch_resume_result(A::RESUME_RESULT_WORD, res::E_CAP_REVOKED);
+                }
+                if victim.is_sender {
+                    lctl.scheduler_release_object(crate::ipc::endpoint::sender_wait_object(
+                        victim.task,
+                    ));
+                    lctl.scheduler_release_object(crate::ipc::endpoint::endpoint_wait_object(
+                        victim.task,
+                    ));
+                } else {
+                    lctl.scheduler_release_object(crate::ipc::endpoint::endpoint_wait_object(
+                        victim.task,
+                    ));
+                }
+            })
+        };
+        match stats {
+            Ok((senders, receivers)) => {
+                if senders + receivers > 0 {
+                    crate::kernel_log!(
+                        "ipc: gate {} destroyed, {} senders + {} receivers revoked\n",
+                        route.id,
+                        senders,
+                        receivers
+                    );
+                }
+                res::OK
+            }
+            // Двойной destroy / гонка (маршрут уже невалиден).
+            Err(()) => res::E_CAP_REVOKED,
+        }
     }
 }
 

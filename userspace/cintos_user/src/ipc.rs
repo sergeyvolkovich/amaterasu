@@ -314,6 +314,17 @@ pub fn create_gate(slot: Slot) -> Result<u64, SyscallError> {
     syscall::check(code)
 }
 
+/// Уничтожить IPC-гейт (сисколл 31): `slot` — Recv-капа гейта (сервер/
+/// держатель корня). Поколение слота инкрементируется — все капы с
+/// прежним поколением перестают резолвиться (E_CAP_REVOKED);
+/// блокированные отправители/получатели отзываются (E_CAP_REVOKED в
+/// кадр + wake); id возвращается пулу — чурнинг сервисов не истощает
+/// таблицу. Возврат — id уничтоженной капы.
+pub fn destroy_gate(slot: Slot) -> Result<u64, SyscallError> {
+    let code = unsafe { syscall::syscall1(abi::nr::IPC_DESTROY_GATE, slot.raw()) };
+    syscall::check(code)
+}
+
 /// Атомарный L4-call: отправить запрос серверу и ждать ответ ОДНИМ
 /// сисколлом (IPC_CALL). Ответ доставляется В БУФЕР ЗАПРОСА (двунаправ-
 /// ленный буфер, seL4-стиль); сервер отвечает ipc::reply/reply_wait без

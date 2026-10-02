@@ -95,6 +95,7 @@ pub fn parse_initial_stack(stack: *mut u64) -> InitialStack {
         while *q != 0 {
             q = q.add(1);
         }
+
         InitialStack {
             argc,
             argv,
@@ -269,11 +270,7 @@ unsafe fn scan_auxv(auxv: *const u64) -> AuxValues {
 /// Позиция стартового стека (ячейка argc). None до `_start`.
 pub fn stack_base() -> Option<*const u64> {
     let p = STATE.stack.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
-    }
+    if p.is_null() { None } else { Some(p) }
 }
 
 /// argc/argv текущей задачи (None — до `_start` либо argc == 0).
@@ -303,11 +300,7 @@ pub fn argv_at(i: usize) -> Option<*const u8> {
 /// 2-арговая) — берите отсюда.
 pub fn envp() -> Option<*const *const u8> {
     let p = STATE.envp.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
-    }
+    if p.is_null() { None } else { Some(p) }
 }
 
 /// Значение auxv-тега (None — до `_start` либо тег отсутствует).

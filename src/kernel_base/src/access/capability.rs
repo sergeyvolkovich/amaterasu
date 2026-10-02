@@ -112,12 +112,23 @@ pub enum CapabilityObject<UMAP: MemoryInterfaceUserspace> {
     /// IPC-гейт (seL4-эндпоинт): точка мультиплексирования IPC.
     /// Сервер публикует гейт, клиенты шлют В ГЕЙТ (капа с правом Send —
     /// и ничего больше: ни TaskTCB сервера, ни его id), сервер ждёт на
-    /// гейте (капа с правом Recv). Состояние очередей — ipc::gate,
-    /// инвокации — IPC_SEND/IPC_WAIT с гейт-капой в слоте цели.
-    /// `gate_id` — слот таблицы ipc::gate (живёт до конца работы ядра —
-    /// как прочие descriptor-объекты).
+    /// гейте (капа с правом Recv; то же право — административный
+    /// авторитет на уничтожение, IPC_DESTROY_GATE). Состояние очередей —
+    /// ipc::gate, инвокации — IPC_SEND/IPC_WAIT с гейт-капой в слоте
+    /// цели.
+    ///
+    /// ABA-защита слота — поколением: `gate_id` — узел динамической
+    /// slab-таблицы ipc::gate (переиспользуется после уничтожения),
+    /// `gen` — снимок счётчика поколений на момент создания капы.
+    /// resolve_ipc_gate сверяет gen со слотом: уничтоженный
+    /// IPC_DESTROY_GATE (или переиспользованный) слот перестаёт
+    /// резолвиться → E_CAP_REVOKED; tombstone-записи cspace от мёртвых
+    /// кап протухают сами, слот безопасно возвращается пулу. Приём тот
+    /// же, что у FaultEndpoint/TaskTCB.
     IpcGate {
         gate_id: u64,
+        /// Поколение слота на момент создания капы (снято gate_alloc).
+        generation: u32,
     },
     /// Фолт-эндпоинт (стиль seL4 fault endpoint / KeyKOS keeper-ключ):
     /// фиксирует задачу-обработчика фолтов. Создаётся САМИМ обработчиком
@@ -210,12 +221,27 @@ impl<UMAP: MemoryInterfaceUserspace> CapabilityObject<UMAP> {
         }
     }
 
-    /// Живой IPC-гейт: Some(gate_id) — слот таблицы ipc::gate. Гейт-слот
-    /// валиден всегда (таблица статична), но резолв требуется под
-    /// permission_backend-локом — как у TaskTCB.
-    pub fn resolve_ipc_gate(&self) -> Option<u64> {
+    /// Единственный корректный способ завести IpcGate — gen приходит
+    /// из gate_alloc (нельзя «придумать» после создания слота).
+    pub fn new_ipc_gate(gate_id: u64, generation: u32) -> Self {
+        CapabilityObject::IpcGate { gate_id, generation }
+    }
+
+    /// Живой IPC-гейт: Some(GateRoute) — ABA-защищённый маршрут (id +
+    /// поколение) для всех дальнейших операций. Слот, уничтоженный
+    /// IPC_DESTROY_GATE или переиспользованный под новое поколение,
+    /// перестаёт резолвиться → вызывающий отвечает E_CAP_REVOKED.
+    /// Резолв берёт лок шарда (id % GATE_SHARDS) — самый внутренний в
+    /// порядке WAKE_LOCK → ipc → gate (краткая атомарная секция).
+    pub fn resolve_ipc_gate(&self) -> Option<crate::task::ipc_state::GateRoute> {
         match self {
-            CapabilityObject::IpcGate { gate_id } => Some(*gate_id),
+            CapabilityObject::IpcGate { gate_id, generation } => {
+                crate::ipc::gate::gate_live(*gate_id, *generation)
+                    .then_some(crate::task::ipc_state::GateRoute {
+                        id: *gate_id,
+                        generation: *generation,
+                    })
+            }
             _ => None,
         }
     }

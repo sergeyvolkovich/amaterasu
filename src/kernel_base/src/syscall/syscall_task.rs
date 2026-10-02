@@ -162,6 +162,17 @@ pub fn destroy_task_full<A: ArchImplementation>(
     lctl: &mut crate::lctl::LocalKernelCTL<A::Umap>,
     task_cap_id: u64,
 ) -> u64 {
+    // ГЕЙТ-ОЧЕРЕДИ (ipc::gate): O(1) отсоединение умирающей от FIFO по
+    // ЕЁ СОБСТВЕННЫМ ссылкам (gate_prev/next/queued — task::ipc_state).
+    // ДО транзакции: TCB ещё жив — соседей чиним под task_manager-локом;
+    // после смерти читать ссылки было бы нечего (прежний код сканировал
+    // ВСЕ гейты — O(N) — и всё равно после удаления TCB). Гонок с
+    // push/pop нет: все мутации очередей — под task_manager-локом.
+    {
+        let tasks = kctl.task_manager().lock();
+        crate::ipc::gate::gate_purge_task(&tasks, task_cap_id);
+    }
+
     // ВОЗВРАТ УЧЁТА cap-объектов неймспейсу: записи capspace + мембраны
     // cap_list возвращаются slab вместе с GTcb (SlabCache::drop → hook
     // деаллокации) — квота группы обязана их отпустить. Считаем и
@@ -212,7 +223,8 @@ pub fn destroy_task_full<A: ArchImplementation>(
             // нацеленные на умершего (их SendSpec.to == dead, в т.ч.
             // стоявшие в его очереди), получают E_NOT_FOUND в кадр ДО
             // пробуждения; записи об умершем в чужих очередях/reply_to
-            // чистятся; гейт-очереди пurge'ятся.
+            // чистятся. Гейт-очереди отсоединены выше (O(1) purge до
+            // транзакции — ссылки умирающей больше не нужны).
             {
                 let tasks = kctl.task_manager().lock();
                 for (sender, wait_object) in crate::ipc::transport::on_task_destroyed(&tasks, task_cap_id).iter()
@@ -223,7 +235,6 @@ pub fn destroy_task_full<A: ArchImplementation>(
                     lctl.scheduler_release_object(*wait_object);
                 }
             }
-            crate::ipc::gate::gate_purge_task(task_cap_id);
 
             // IRQ: реестр ожиданий не должен течь (мёртвая задача
             // никогда не перевызовет WaitIrq), линии владельца

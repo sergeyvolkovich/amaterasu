@@ -24,6 +24,15 @@
 //!     предикат засыпания сверяет снимок, см. lctl::
 //!     scheduler_block_on_object_if).
 //!
+//! ГЕЙТ-ЧЛЕНСТВО (интрузивные очереди ipc::gate): задача ждёт максимум
+//! в ОДНОЙ гейт-очереди, поэтому ссылки лежат ЗДЕСЬ (паттерн seL4
+//! tcbEPNext/Prev): `gate_prev`/`gate_next` — соседи по FIFO (task_cap_id
+//! узлов), `gate_queued` — Some((гейт, сторона)) для O(1) purge и
+//! самопроверок. Никаких аллокаций под постановку в очередь — никакой
+//! E_SLAB на «33-м блокированном клиенте». Мутации ссылок — под
+//! task_manager-локом (лок ipc-состояния узла/соседей — страховка:
+//! предикаты сна читают ipc-состояние под WAKE_LOCK).
+//!
 //! ПРАВИЛА БЛОКИРОВОК: IpcChan — ЛИСТОВОЙ лок (внутри его секции чужие
 //! локи не берутся; копирования userspace — только после снятия).
 //! Внешний порядок: permission_backend → task_manager → ipc-локи →
@@ -38,9 +47,36 @@ use spin::mutex::SpinMutex;
 
 use crate::ipc::endpoint::{CapItem, MAX_CAPS};
 
-/// Максимум отправителей в очереди одной задачи (медленный путь SEND).
-/// Переполнение — E_SLAB отправителю (ресурс задачи исчерпан).
+/// Максимум отправителей в очереди одной задачи (медленный путь SEND
+/// на ПРЯМОЙ эндпоинт; гейт-очереди НЕ ограничены — интрузивные, см.
+/// модульный комментарий). Переполнение — E_SLAB отправителю.
 pub const MAX_IPC_QUEUE: usize = 16;
+
+/// ABA-защищённая ссылка на IPC-гейт: id слота + поколение, снятое с
+/// капы в момент резолва ([`crate::ipc::gate::gate_live`]). После
+/// IPC_DESTROY_GATE id возвращается в пул и может быть выдан ЗАНОВО —
+/// расхождение gen делает все старые ссылки невалидными (push/pop/
+/// предикаты отказывают → E_CAP_REVOKED), клиент не может незаметно
+/// «переехать» на чужой гейт с тем же номером.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateRoute {
+    pub id: u64,
+    pub generation: u32,
+}
+
+/// Сторона интрузивной очереди гейта (в какой из двух FIFO стоит узел).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateQueueSide {
+    Senders,
+    Receivers,
+}
+
+/// Снимок гейт-членства задачи (для O(1) purge при её уничтожении):
+/// id гейта + сторона + соседи по FIFO. Поколение не нужно: purge
+/// структурный (защитные проверки соседей; после destroy очереди
+/// пусты — естественный no-op), а умирающая задача не может встать
+/// в очередь заново (push сверяет gen под локом шарда).
+pub type GateMembership = (u64, GateQueueSide, Option<u64>, Option<u64>);
 
 /// Параметры заблокированного отправителя (медленный путь).
 ///
@@ -54,7 +90,9 @@ pub struct SendSpec {
     /// Адресат: task_cap_id получателя (0 — отправка через гейт).
     pub to: u64,
     /// Гейт-маршрут (Some — отправка в очередь гейта, `to` не используется).
-    pub gate: Option<u64>,
+    /// ABA-защищён (generation из капы): уничтожение/переиспользование слота
+    /// делает маршрут невалидным — все операции с ним отказывают.
+    pub gate: Option<GateRoute>,
     /// VA тела сообщения (проволочный формат: {label, payload_len,
     /// payload}) в пространстве ОТПРАВИТЕЛЯ.
     pub msg_va: usize,
@@ -73,7 +111,8 @@ pub struct RecvSpec {
     /// Closed-wait фильтр: Some(cap) — принимать только от него.
     pub from: Option<u64>,
     /// Ожидание на гейте (Some) либо на собственном эндпоинте (None).
-    pub gate: Option<u64>,
+    /// ABA-защищён (generation из капы, см. SendSpec::gate).
+    pub gate: Option<GateRoute>,
     /// VA буфера приёма (заголовок + слоты caps + тело).
     pub tgt_va: usize,
     pub tgt_capacity: usize,
@@ -101,6 +140,13 @@ pub struct IpcChan {
     pub recv: IpcRecv,
     /// Очередь отправителей этой задачи: (task_cap_id, is_fault), FIFO.
     pub queue: HVec<(u64, bool), MAX_IPC_QUEUE>,
+    /// Интрузивные ссылки в гейт-очереди (см. шапку модуля): prev/next —
+    /// task_cap_id соседей, queued — членство (гейт + сторона). Не-None
+    /// ТОЛЬКО пока узел реально прошит в FIFO слота (инвариант держится
+    /// под локом шарда; постановка/снятие — под task_manager-локом).
+    pub gate_prev: Option<u64>,
+    pub gate_next: Option<u64>,
+    pub gate_queued: Option<(u64, GateQueueSide)>,
     /// Неявный адресат ответа (RPC, IPC_REPLY); снимается изъятием.
     pub reply_to: Option<u64>,
     /// Исход доставки заблокированного отправителя для гонки «не успел
@@ -119,10 +165,22 @@ impl IpcChan {
             send: None,
             recv: IpcRecv::Idle,
             queue: HVec::new(),
+            gate_prev: None,
+            gate_next: None,
+            gate_queued: None,
             reply_to: None,
             send_rax: None,
             seq: 0,
         }
+    }
+
+    /// Снимок гейт-членства (O(1) purge умирающей задачи: соседей и
+    /// сторону знает САМА задача — после снятия TCB читать будет
+    /// нечего). Вызывать под собственным ipc-локом (здесь — под
+    /// task_manager-локом дестроера).
+    pub fn gate_membership(&self) -> Option<GateMembership> {
+        let (gate_id, side) = self.gate_queued?;
+        Some((gate_id, side, self.gate_prev, self.gate_next))
     }
 
     /// Снимок счётчика событий (для предиката засыпания).
@@ -161,7 +219,7 @@ impl IpcCell {
 mod tests {
     use super::*;
 
-    /// Пустое состояние: работы нет, ответа нет.
+    /// Пустое состояние: работы нет, ответа нет, гейт-членства нет.
     #[test]
     fn fresh_chan_is_idle() {
         let c = IpcChan::new();
@@ -170,7 +228,25 @@ mod tests {
         assert_eq!(c.recv, IpcRecv::Idle);
         assert!(c.queue.is_empty());
         assert!(c.reply_to.is_none());
+        assert!(c.gate_queued.is_none());
+        assert!(c.gate_prev.is_none());
+        assert!(c.gate_next.is_none());
+        assert!(c.gate_membership().is_none());
         assert!(!c.has_work());
+    }
+
+    /// Гейт-членство: снимок отдаёт id/сторону/соседей как есть.
+    #[test]
+    fn gate_membership_snapshot() {
+        let mut c = IpcChan::new();
+        c.gate_prev = Some(7);
+        c.gate_next = Some(9);
+        c.gate_queued = Some((42, GateQueueSide::Senders));
+        let (gate_id, side, prev, next) = c.gate_membership().expect("queued");
+        assert_eq!(gate_id, 42);
+        assert_eq!(side, GateQueueSide::Senders);
+        assert_eq!(prev, Some(7));
+        assert_eq!(next, Some(9));
     }
 
     /// Очередь отправителей: FIFO-наполнение до предела.

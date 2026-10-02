@@ -123,6 +123,13 @@ uint64_t nomad_ipc_reply(uint64_t label,
  * (0 валиден — успех/ошибка по старшему биту, см. abi). */
 uint64_t nomad_ipc_create_gate(uint64_t dst_slot);
 
+/* IPC_DESTROY_GATE: уничтожить IPC-гейт (держатель Recv-капы — сервер).
+ * Поколение слота инкрементируется: все капы с прежним поколением
+ * перестают резолвиться (E_CAP_REVOKED); блокированные отправители/
+ * получатели отзываются (E_CAP_REVOKED в кадр + пробуждение); id
+ * возвращается пулу. Возврат: 0 — уничтожено; иначе код ошибки. */
+uint64_t nomad_ipc_destroy_gate(uint64_t slot);
+
 /* IPC_CALL: атомарные send+wait (L4 call). Запрос собирается в buf
  * ({label, payload_len, payload} — buf ДВУНАПРАВЛЕННЫЙ: туда же ядро
  * кладёт ответ), recv_base/recv_count — окно caps ответа, deadline —

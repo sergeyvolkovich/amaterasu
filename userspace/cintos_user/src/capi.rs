@@ -323,6 +323,15 @@ pub extern "C" fn nomad_ipc_create_gate(dst_slot: u64) -> u64 {
     }
 }
 
+/// Уничтожить IPC-гейт (IPC_DESTROY_GATE; см. nomad.h).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomad_ipc_destroy_gate(slot: u64) -> u64 {
+    match ipc::destroy_gate(Slot::new(slot)) {
+        Ok(id) => id,
+        Err(crate::syscall::SyscallError::Kernel(code)) => code,
+    }
+}
+
 /// Атомарный call (IPC_CALL; см. nomad.h) — буфер двунаправленный.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomad_ipc_call(

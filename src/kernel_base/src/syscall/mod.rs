@@ -60,6 +60,10 @@ pub fn init_syscalls<A: ArchImplementation + crate::traits::iommu::IommuTokenLay
     // Номер 24 зарезервирован.
     // IPC_CREATE_GATE(14): capability-объект «IPC-гейт» (seL4-эндпоинт).
     A::register_syscalls(DomainCapability::<_, SyscallIpcCreateGate>::new(kctl));
+    // IPC_DESTROY_GATE(31): явное уничтожение гейта (держатель Recv-капы):
+    // поколение вверх, все блокированные участники — E_CAP_REVOKED,
+    // id возвращается пулу (таблица больше не течёт при чурнинге).
+    A::register_syscalls(DomainCapability::<_, SyscallIpcDestroyGate>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateNamespace>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateIpcPool>::new(kctl));
     A::register_syscalls(DomainCapability::<_, SyscallCapCreateMmio>::new(kctl));

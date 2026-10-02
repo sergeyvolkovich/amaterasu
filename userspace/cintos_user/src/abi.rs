@@ -85,6 +85,10 @@ pub mod nr {
     /// Capability: создать IPC-гейт (seL4-эндпоинт) — (dst_slot);
     /// возврат — id капы.
     pub const IPC_CREATE_GATE: u64 = 14;
+    /// IPC: уничтожить гейт (держатель Recv-капы): поколение слота вверх
+    /// (все старые капы протухают — E_CAP_REVOKED), блокированные
+    /// участники отзываются, id возвращается пулу — (слот капы гейта).
+    pub const IPC_DESTROY_GATE: u64 = 31;
     /// IPC: reply + следующий wait (цикл RPC-сервера) — (msg, размер,
     /// caps, число caps, цель wait, дедлайн).
     pub const IPC_REPLY_WAIT: u64 = 15;
@@ -173,9 +177,9 @@ pub mod nr {
     /// Debug: чтение дельты лога ядра (для init-консоли).
     pub const DBG_LOG_READ: u64 = 46;
 
-    // РАСКЛАД NR (зеркало ядра v2): sched/mem 0..8, ipc 10/11,
-    // capability 16..26, fault 27/30, irq 28/51/52, stats 29, IOMMU
-    // 32..45 + MapDmaVa 50, log 46/47, exec 48/49.
+    // РАСКЛАД NR (зеркало ядра v2): sched/mem 0..8, ipc 10..15 + 31
+    // (destroy gate), capability 16..26, fault 27/30, irq 28/51/52,
+    // stats 29, IOMMU 32..45 + MapDmaVa 50, log 46/47, exec 48/49.
 
     /// IOMMU: создать DMA-домен.
     pub const IOMMU_CREATE_DOMAIN: u64 = 32;
